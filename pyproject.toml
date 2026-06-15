@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "Cython>=3.0", "numpy>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polyarray"
+version = "0.1.0"
+description = "Standalone symbolic-numeric array IR (Program/Stmt/SymArray/RationalFunction + poly backends), extracted from chartlib."
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [
+    { name = "teocollin1995", email = "teoc@mit.edu" },
+]
+dependencies = [
+    "numpy>=2.0",
+    "sympy>=1.13",
+]
+
+[project.optional-dependencies]
+# python-flint enables the fast exact-rational "flint" backend; it is
+# auto-detected at import time and falls back to sympy when absent.
+flint = ["python-flint>=0.8.0"]
+dev = [
+    "cython>=3.0",
+    "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# The Cython extension modules are built from setup.py (see the project
+# root). setuptools.build_meta picks up setup.py's ext_modules so wheels
+# ship the compiled .so files. Pure-Python source install / editable dev
+# can instead use `make cython`.
+[tool.setuptools.package-data]
+polyarray = ["*.pyx"]
+
+# ---------------------------------------------------------------------------
+# cibuildwheel — build binary wheels with the Cython cpp backends precompiled
+# so `pip install polyarray` needs no local C++ toolchain. The pure-Python
+# backends remain a working fallback if a wheel is absent.
+# ---------------------------------------------------------------------------
+[tool.cibuildwheel]
+build = "cp313-* cp314-*"
+build-frontend = "build"
+# numpy + Cython are in build-system.requires, so the isolated build env has
+# them; nothing extra needed before build.
+test-requires = ["pytest", "numpy", "sympy"]
+test-command = "pytest {project}/tests -q"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+# manylinux images ship a modern gcc; -O3 -ffast-math come from setup_cython.
+
+[tool.cibuildwheel.macos]
+archs = ["arm64", "x86_64"]

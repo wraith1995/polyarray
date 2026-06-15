@@ -1,0 +1,12 @@
+# Cython build artifacts
+src/polyarray/_poly_native_cpp_*.c
+src/polyarray/_poly_native_cpp_*.cpp
+src/polyarray/*.so
+build/
+*.egg-info/
+
+# venv / caches
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
