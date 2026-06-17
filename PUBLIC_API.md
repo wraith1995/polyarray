@@ -106,6 +106,16 @@ class SvdOp:                     # -> (U, S, Vh, rank); 4-output
     full_matrices: bool = False  # rank is the thresholded numerical rank (δ_f)
 
 @dataclass(frozen=True)
+class GSvdOp:                    # metric-aware GSVD of A:V->W; -> (U, UI, V, VI, S, rank); 6-output
+    rcond: float | None = None   # rank threshold on the *whitened* singular values
+    # __call__(A, M_V, M_W) with SPD domain/codomain metrics.
+    #   U  = image basis in W  (Uᵀ M_W U = I);  UI = coker basis (M_W-⊥ complement)
+    #   V  = coimg basis in V  (Vᵀ M_V V = I);  VI = ker  basis  (A·VI ≈ 0)
+    #   full factors are [U|UI], [V|VI]; reconstruction:
+    #       A = [U|UI] · Sfull · [V|VI]ᵀ · M_V    (trailing M_V; contravariant coords)
+    #   M_V = M_W = I  ⇒  reduces to SvdOp (A = U diag(S) Vᵀ, same S/rank).
+
+@dataclass(frozen=True)
 class QrOp:                      # -> (Q, R); 2-output
     mode: str = "reduced"
 

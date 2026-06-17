@@ -13,6 +13,7 @@ from polyarray import (
     AssertOp,
     DetOp,
     EinsumStmtOp,
+    GSvdOp,
     OutSpec,
     Program,
     Provenance,
@@ -23,6 +24,11 @@ from polyarray import (
     SymbolicBudget,
     SvdOp,
 )
+
+
+def _rand_spd(rng: np.random.Generator, k: int) -> np.ndarray:
+    X = rng.standard_normal((k, k))
+    return X @ X.T + k * np.eye(k)
 
 
 def _prov(label: str) -> Provenance:
@@ -87,6 +93,110 @@ def test_svdop_in_program_multi_output() -> None:
     assert int(round(float(res["rank"]))) == 3
     # Singular values match numpy's.
     np.testing.assert_allclose(np.sort(res["S"]), np.sort(np.linalg.svd(An, compute_uv=False)), atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# GSvdOp — metric-aware generalised SVD
+# ---------------------------------------------------------------------------
+
+def test_gsvdop_identity_metrics_matches_svd() -> None:
+    rng = np.random.default_rng(10)
+    A = rng.standard_normal((5, 4))
+    Iv, Iw = np.eye(4), np.eye(5)
+    U, UI, V, VI, S, rank = GSvdOp()(A, Iv, Iw)
+
+    # rank + singular values agree with the plain SVD.
+    Us, Ss, Vhs = np.linalg.svd(A, full_matrices=True)
+    assert int(rank) == int((Ss > Ss.max() * max(A.shape) * np.finfo(float).eps).sum())
+    np.testing.assert_allclose(S, Ss, atol=1e-9)
+
+    # Full factors are (plain) orthonormal and reconstruct A = [U|UI] Sfull [V|VI]^T.
+    Ufull = np.concatenate([U, UI], axis=1)
+    Vfull = np.concatenate([V, VI], axis=1)
+    np.testing.assert_allclose(Ufull.T @ Ufull, np.eye(5), atol=1e-9)
+    np.testing.assert_allclose(Vfull.T @ Vfull, np.eye(4), atol=1e-9)
+    Sfull = np.zeros((5, 4))
+    Sfull[: S.size, : S.size] = np.diag(S)
+    # With identity metrics the documented identity reduces to U Sfull V^T,
+    # i.e. Vfull^T plays SvdOp's Vh role (matching factorisation, sign/subspace aside).
+    np.testing.assert_allclose(Ufull @ Sfull @ Vfull.T, A, atol=1e-9)
+
+
+def test_gsvdop_metric_orthonormality_and_reconstruction() -> None:
+    rng = np.random.default_rng(11)
+    A = rng.standard_normal((5, 4))
+    M_V = _rand_spd(rng, 4)
+    M_W = _rand_spd(rng, 5)
+    U, UI, V, VI, S, rank = GSvdOp()(A, M_V, M_W)
+
+    Ufull = np.concatenate([U, UI], axis=1)
+    Vfull = np.concatenate([V, VI], axis=1)
+    # Orthonormal in the respective metrics.
+    np.testing.assert_allclose(Ufull.T @ M_W @ Ufull, np.eye(5), atol=1e-9)
+    np.testing.assert_allclose(Vfull.T @ M_V @ Vfull, np.eye(4), atol=1e-9)
+
+    # Documented reconstruction identity: A = [U|UI] Sfull [V|VI]^T M_V.
+    Sfull = np.zeros((5, 4))
+    Sfull[: S.size, : S.size] = np.diag(S)
+    np.testing.assert_allclose(Ufull @ Sfull @ Vfull.T @ M_V, A, atol=1e-9)
+
+
+def test_gsvdop_block_split_known_rank() -> None:
+    rng = np.random.default_rng(12)
+    # rank-2 map V(4) -> W(5)
+    A = rng.standard_normal((5, 2)) @ rng.standard_normal((2, 4))
+    M_V = _rand_spd(rng, 4)
+    M_W = _rand_spd(rng, 5)
+    U, UI, V, VI, S, rank = GSvdOp()(A, M_V, M_W)
+
+    assert int(rank) == 2
+    assert U.shape == (5, 2) and UI.shape == (5, 3)
+    assert V.shape == (4, 2) and VI.shape == (4, 2)
+
+    # VI is the kernel: A · VI ≈ 0.
+    np.testing.assert_allclose(A @ VI, 0.0, atol=1e-9)
+    # UI is the coker: the metric adjoint A* = M_V^{-1} A^T M_W kills it.
+    Astar = np.linalg.inv(M_V) @ A.T @ M_W
+    np.testing.assert_allclose(Astar @ UI, 0.0, atol=1e-9)
+    # Reduced reconstruction from the image / coimg blocks only.
+    np.testing.assert_allclose(U @ np.diag(S[:2]) @ V.T @ M_V, A, atol=1e-9)
+
+
+def test_gsvdop_in_program_multi_output() -> None:
+    rng = np.random.default_rng(13)
+    An = rng.standard_normal((5, 4))
+    M_Vn = _rand_spd(rng, 4)
+    M_Wn = _rand_spd(rng, 5)
+
+    prog = Program("gsvd")
+    A, va = _sym_matrix(prog, An, "ga")
+    MV, vmv = _sym_matrix(prog, M_Vn, "gv")
+    MW, vmw = _sym_matrix(prog, M_Wn, "gw")
+    U, UI, V, VI, S, rank = prog.emit_stmt(
+        GSvdOp(),
+        [A, MV, MW],
+        [
+            OutSpec("U", (5, 4)),
+            OutSpec("UI", (5, 1)),
+            OutSpec("V", (4, 4)),
+            OutSpec("VI", (4, 0)),
+            OutSpec("S", (4,)),
+            OutSpec("rank", ()),
+        ],
+        note="gsvd",
+        bulk=True,
+    )
+    assert isinstance(prog.statements[-1].fn, GSvdOp)
+    assert len(prog.statements[-1].out) == 6  # 6-output scatter
+    prog.add_output("U", U)
+    prog.add_output("V", V)
+    prog.add_output("S", S)
+    prog.add_output("rank", rank)
+    res = prog.run({**va, **vmv, **vmw})
+
+    assert int(round(float(res["rank"]))) == 4  # full rank 5x4
+    np.testing.assert_allclose(res["U"].T @ M_Wn @ res["U"], np.eye(4), atol=1e-9)
+    np.testing.assert_allclose(res["V"].T @ M_Vn @ res["V"], np.eye(4), atol=1e-9)
 
 
 # ---------------------------------------------------------------------------

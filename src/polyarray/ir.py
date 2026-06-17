@@ -1077,6 +1077,92 @@ class SvdOp:
 
 
 @dataclass(frozen=True)
+class GSvdOp:
+    """Metric-aware generalised SVD of a map ``A : V → W``.
+
+    Multi-output: returns ``(U, UI, V, VI, S, rank)``.  ``A`` is the
+    ``|W|×|V|`` matrix of the map; ``M_V`` (``|V|×|V|`` SPD) is the domain
+    inner-product / metric and ``M_W`` (``|W|×|W|`` SPD) the codomain metric.
+
+    The factors are orthonormal **in the respective metrics** and split into
+    the four-fundamental-subspace (FFS) blocks at the numerical ``rank``
+    (``δ_f``), exactly as in `50 §A1`/`§A5`:
+
+    =======  ===============================  ========================
+    output   columns                          FFS block / property
+    =======  ===============================  ========================
+    ``U``    first ``rank`` cols of the        **image** basis of ``A`` in
+             codomain factor                   ``W``; ``Uᵀ M_W U = I``
+    ``UI``   remaining ``|W|−rank`` cols        **coker** basis (``M_W``-⊥
+                                               complement of the image)
+    ``V``    first ``rank`` cols of the        **coimg** basis of ``A`` in
+             domain factor                     ``V``; ``Vᵀ M_V V = I``
+    ``VI``   remaining ``|V|−rank`` cols        **ker** basis (``A·VI ≈ 0``)
+    ``S``    descending singular values        the ``rank`` nonzero ones lead
+    ``rank`` 0-d int ndarray                   numerical rank ``δ_f``
+    =======  ===============================  ========================
+
+    Both ``U`` (``=[U|UI]``) and ``V`` (``=[V|VI]``) are returned as the
+    leading (image / coimg) blocks only; ``UI`` / ``VI`` carry the
+    complementary (coker / ker) blocks — so the full metric-orthonormal
+    factors are the horizontal concatenations ``[U, UI]`` and ``[V, VI]``.
+
+    **Construction.**  Whiten ``A`` by the Cholesky factors of the two
+    metrics (``M_W = Lw Lwᵀ``, ``M_V = Rw Rwᵀ``)::
+
+        Aw = Lwᵀ · A · Rw⁻ᵀ            # both spaces now orthonormal
+        Ũ, S, Ṽᵀ = svd(Aw)            # ordinary SVD in white coords
+
+    then de-whiten the factors back into the metrics::
+
+        [U|UI] = Lw⁻ᵀ · Ũ             # ⇒ ([U|UI])ᵀ M_W ([U|UI]) = I
+        [V|VI] = Rw⁻ᵀ · Ṽ             # ⇒ ([V|VI])ᵀ M_V ([V|VI]) = I
+
+    **Reconstruction identity** (note the trailing ``M_V`` — the dual
+    pairing makes the coordinates contravariant)::
+
+        A = U · diag(S[:rank]) · Vᵀ · M_V
+          = [U|UI] · Sfull · [V|VI]ᵀ · M_V        # full form
+
+    where ``Sfull`` is the ``|W|×|V|`` rectangular-diagonal padding of ``S``.
+
+    **Reduction to** :class:`SvdOp`.  With ``M_V = M_W = I`` the Cholesky
+    factors are the identity, ``U = Ũ``, ``V = Ṽ``, and the identity above
+    collapses to ``A = U diag(S) Vᵀ`` — i.e. ``Vᵀ`` is :class:`SvdOp`'s
+    ``Vh`` and ``rank``/``S`` agree.  ``rcond`` mirrors ``SvdOp`` /
+    ``np.linalg.matrix_rank`` (threshold on the *whitened* singular values).
+    """
+
+    rcond: float | None = None
+
+    def __call__(
+        self, A: np.ndarray, M_V: np.ndarray, M_W: np.ndarray
+    ) -> tuple[np.ndarray, ...]:
+        A = np.asarray(A, dtype=float)
+        Lw = np.linalg.cholesky(np.asarray(M_W, dtype=float))  # M_W = Lw Lwᵀ
+        Rw = np.linalg.cholesky(np.asarray(M_V, dtype=float))  # M_V = Rw Rwᵀ
+        Aw = Lw.T @ A @ np.linalg.inv(Rw.T)  # whiten both spaces
+        Ut, S, Vth = np.linalg.svd(Aw, full_matrices=True)
+        if S.size == 0:
+            rank = 0
+        elif self.rcond is None:
+            tol = S.max() * max(Aw.shape) * np.finfo(float).eps
+            rank = int((S > tol).sum())
+        else:
+            tol = self.rcond * S.max()
+            rank = int((S > tol).sum())
+        # De-whiten the factors back into the two metrics:
+        #   [U|UI] = Lw⁻ᵀ Ũ   so ([U|UI])ᵀ M_W ([U|UI]) = I
+        #   [V|VI] = Rw⁻ᵀ Ṽ   so ([V|VI])ᵀ M_V ([V|VI]) = I
+        U_full = np.linalg.solve(Lw.T, Ut)
+        V_full = np.linalg.solve(Rw.T, Vth.T)
+        # Split into image/coimg (first ``rank``) vs coker/ker (complement):
+        U, UI = U_full[:, :rank], U_full[:, rank:]
+        V, VI = V_full[:, :rank], V_full[:, rank:]
+        return U, UI, V, VI, S, np.asarray(rank)
+
+
+@dataclass(frozen=True)
 class QrOp:
     """Stmt-compatible ``np.linalg.qr`` over a bound numeric matrix.
 
@@ -2867,6 +2953,7 @@ __all__ = [
     "Cell",
     "Const",
     "DetOp",
+    "GSvdOp",
     "InputRef",
     "IntAtom",
     "IntAtomRef",
