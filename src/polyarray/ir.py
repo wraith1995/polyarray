@@ -2453,12 +2453,37 @@ class Program:
         # Runtime dimension table: maps a producing output ``(stmt_idx,
         # out_idx)`` to its concrete int value, so a later dynamic
         # ``OutSpec.shape`` carrying a :class:`DimAtom` (whose ``source`` is
-        # that output) resolves to a concrete shape.  Empty for static
-        # programs (never consulted) — the static path stays byte-identical.
-        dim_bindings: dict[tuple[int, int], int] = {}
+        # that output) resolves to a concrete shape.  Built ONLY for programs
+        # that actually carry a dynamic shape; static programs pass ``None``
+        # so ``_run_stmt`` skips all per-output dim bookkeeping (B5) — the
+        # static path stays byte-identical AND free of per-output overhead.
+        dim_bindings: "dict[tuple[int, int], int] | None" = (
+            {} if self._has_dynamic_shape() else None
+        )
         for stmt_idx, stmt in enumerate(self.statements):
             self._run_stmt(stmt_idx, stmt, bindings, dim_bindings)
         return bindings
+
+    def _has_dynamic_shape(self) -> bool:
+        """True iff any Stmt output is a dynamic (``DimAtom``-sized) bulk array.
+
+        Such a program needs the run-time dim-binding table (B4); a purely
+        static program does not, and skipping the table keeps its execution
+        path byte-identical to the pre-dynamic-shapes behavior (B5).
+
+        Memoized: ``run`` (hence this) is called once per slice / sub-Program
+        recursion, so the O(#stmts) scan must not repeat per call. Statements
+        are fixed by run time, so the answer is cached on the instance.
+        """
+        cached = getattr(self, "_dynamic_shape_memo", None)
+        if cached is None:
+            cached = any(
+                o._bulk is not None and is_dynamic(o._bulk.shape)
+                for stmt in self.statements
+                for o in stmt.out
+            )
+            self._dynamic_shape_memo = cached
+        return cached
 
     # -- helpers --------------------------------------------------------
 
