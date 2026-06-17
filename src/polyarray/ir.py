@@ -433,7 +433,7 @@ class BulkOut:
     """
 
     name: str
-    shape: tuple["int | DimAtom", ...]
+    shape: tuple[int | DimAtom, ...]
 
 
 class SymArrayRef:
@@ -505,7 +505,7 @@ class DimAtom:
     source: tuple[int, int]
 
 
-def is_dynamic(shape: "tuple[int | DimAtom, ...]") -> bool:
+def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool:
     """True iff any entry of ``shape`` is a :class:`DimAtom` (a runtime dim).
 
     The single gate that routes a shape away from the static per-cell
@@ -518,7 +518,7 @@ def is_dynamic(shape: "tuple[int | DimAtom, ...]") -> bool:
 
 
 def _resolve_shape(
-    shape: "tuple[int | DimAtom, ...]",
+    shape: tuple[int | DimAtom, ...],
     dim_bindings: "Mapping[tuple[int, int], int]",
 ) -> tuple[int, ...]:
     """Substitute each :class:`DimAtom` in ``shape`` with its bound int.
@@ -662,7 +662,7 @@ class SymArray:
         return self.cells.astype(dtype)
 
     @property
-    def shape(self) -> "tuple[int | DimAtom, ...]":
+    def shape(self) -> tuple[int | DimAtom, ...]:
         # A dynamic bulk array (an axis sized by a runtime ``DimAtom``) has a
         # 0-d placeholder ``_cells``; its build-time shape is the symbolic
         # ``_bulk.shape`` (may carry ``DimAtom`` entries — see B6).
@@ -2457,7 +2457,7 @@ class Program:
         # that actually carry a dynamic shape; static programs pass ``None``
         # so ``_run_stmt`` skips all per-output dim bookkeeping (B5) — the
         # static path stays byte-identical AND free of per-output overhead.
-        dim_bindings: "dict[tuple[int, int], int] | None" = (
+        dim_bindings: dict[tuple[int, int], int] | None = (
             {} if self._has_dynamic_shape() else None
         )
         for stmt_idx, stmt in enumerate(self.statements):
@@ -2552,7 +2552,7 @@ class Program:
         stmt_idx: int,
         stmt: Stmt,
         bindings: dict[str, float],
-        dim_bindings: "dict[tuple[int, int], int] | None" = None,
+        dim_bindings: dict[tuple[int, int], int] | None = None,
     ) -> None:
         """Resolve refs, call fn, scatter returns into ``bindings``.
 
@@ -2644,7 +2644,7 @@ class Program:
         bound: SymArray,
         value: Any,
         bindings: dict[str, float],
-        dim_bindings: "dict[tuple[int, int], int] | None" = None,
+        dim_bindings: dict[tuple[int, int], int] | None = None,
     ) -> None:
         """Bind a Stmt output: whole-tensor for bulk, per-cell atoms otherwise.
 
