@@ -427,10 +427,13 @@ class BulkOut:
     the bulk tensor into the usual per-cell atom array.
 
     ``name`` is the run-time binding key; ``shape`` is the tensor shape.
+    For a *dynamic* bulk output (Stage B) ``shape`` may carry
+    :class:`DimAtom` entries (the symbolic shape); the concrete axis sizes
+    are resolved at :meth:`Program.run` time.
     """
 
     name: str
-    shape: tuple[int, ...]
+    shape: tuple["int | DimAtom", ...]
 
 
 class SymArrayRef:
@@ -480,6 +483,66 @@ Ref = Union[InputRef, OutputRef, Const, RationalRef, SymArrayRef, IntAtomRef]
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class DimAtom:
+    """A runtime array dimension produced by a :class:`Stmt` output.
+
+    Unlike :class:`IntAtom` (a pre-declared integer-valued *input*), a
+    ``DimAtom`` is an integer *produced* by a prior Stmt output — e.g. the
+    ``rank`` (δ_f) output of an :class:`SvdOp`.  It may be used as an entry
+    in an :class:`OutSpec.shape`, making that output's shape **dynamic**:
+    the axis size is resolved at :meth:`Program.run` time from the bound
+    value of the producing output.
+
+    * ``name`` — provenance, e.g. ``"rank:Alt"``.
+    * ``source`` — ``(stmt_idx, output_index)`` of the producing Stmt
+      output, used to look up the concrete int at run time.
+
+    Frozen so it hashes by value (usable as a dict key and in a shape
+    tuple alongside concrete ints).
+    """
+
+    name: str
+    source: tuple[int, int]
+
+
+def is_dynamic(shape: "tuple[int | DimAtom, ...]") -> bool:
+    """True iff any entry of ``shape`` is a :class:`DimAtom` (a runtime dim).
+
+    The single gate that routes a shape away from the static per-cell
+    build-time path (cell-atom allocation, ``np.ndindex``, cell-size math)
+    and into the dynamic bulk lane.  A fully-concrete shape is *not*
+    dynamic, so static-shape programs hit none of the dynamic branches and
+    remain byte-identical.
+    """
+    return any(isinstance(d, DimAtom) for d in shape)
+
+
+def _resolve_shape(
+    shape: "tuple[int | DimAtom, ...]",
+    dim_bindings: "Mapping[tuple[int, int], int]",
+) -> tuple[int, ...]:
+    """Substitute each :class:`DimAtom` in ``shape`` with its bound int.
+
+    Concrete entries pass through unchanged.  A ``DimAtom`` whose source
+    output has not yet been bound raises ``KeyError`` — the producing Stmt
+    must run before any consumer that uses its dimension (guaranteed by
+    Stmt ordering).
+    """
+    out: list[int] = []
+    for d in shape:
+        if isinstance(d, DimAtom):
+            if d.source not in dim_bindings:
+                raise KeyError(
+                    f"DimAtom {d.name!r}: dimension from output {d.source} "
+                    f"not yet bound at run time"
+                )
+            out.append(int(dim_bindings[d.source]))
+        else:
+            out.append(int(d))
+    return tuple(out)
+
+
+@dataclass(frozen=True)
 class OutSpec:
     """Declaration of one Stmt output: a name and a shape.
 
@@ -487,10 +550,16 @@ class OutSpec:
     allocated for each cell of the declared shape.  The ``name`` is
     used as the provenance label prefix for the allocated atoms — it
     surfaces in repr / debug output.
+
+    ``shape`` entries are ordinarily ``int``; an entry may also be a
+    :class:`DimAtom` (a runtime dimension produced by a prior Stmt
+    output), making the shape **dynamic** — see :func:`is_dynamic`.  A
+    dynamic output is always emitted bulk (whole-tensor), its axis sizes
+    resolved at :meth:`Program.run` time.
     """
 
     name: str
-    shape: tuple[int, ...] = ()
+    shape: tuple[int | DimAtom, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +662,12 @@ class SymArray:
         return self.cells.astype(dtype)
 
     @property
-    def shape(self) -> tuple[int, ...]:
+    def shape(self) -> "tuple[int | DimAtom, ...]":
+        # A dynamic bulk array (an axis sized by a runtime ``DimAtom``) has a
+        # 0-d placeholder ``_cells``; its build-time shape is the symbolic
+        # ``_bulk.shape`` (may carry ``DimAtom`` entries — see B6).
+        if self._bulk is not None and is_dynamic(self._bulk.shape):
+            return self._bulk.shape
         return self._cells.shape
 
     @property
@@ -2172,7 +2246,10 @@ class Program:
 
         out_arrays: list[SymArray] = []
         for spec in out_specs:
-            if bulk:
+            dynamic = is_dynamic(spec.shape)
+            # A dynamic shape (an axis sized by a runtime ``DimAtom``) cannot
+            # enumerate per-cell atoms — force the whole-tensor bulk lane.
+            if bulk or dynamic:
                 # One whole-tensor handle, no per-cell atoms.  Placeholder
                 # cells (None) exist only for ``.shape``; they are never read
                 # per-cell — eval routes through ``_bulk`` (a per-cell read
@@ -2184,7 +2261,14 @@ class Program:
                         label=label_prefix + ":" + spec.name,
                     ),
                 )
-                cells = np.empty(spec.shape, dtype=object)
+                # A dynamic shape has no concrete placeholder array (a
+                # ``DimAtom`` axis is unknown until run time); use a 0-d
+                # object placeholder — ``.shape`` on a dynamic bulk array is
+                # the symbolic ``_bulk.shape`` (read via the override below).
+                if dynamic:
+                    cells = np.empty((), dtype=object)
+                else:
+                    cells = np.empty(spec.shape, dtype=object)
                 sa = SymArray(cells, program=self, name=spec.name)
                 sa._bulk = BulkOut(name=name, shape=tuple(spec.shape))
                 out_arrays.append(sa)
@@ -2280,8 +2364,14 @@ class Program:
         going through full :meth:`run`.
         """
         bindings = self._bindings_from_values(values)
+        # Runtime dimension table: maps a producing output ``(stmt_idx,
+        # out_idx)`` to its concrete int value, so a later dynamic
+        # ``OutSpec.shape`` carrying a :class:`DimAtom` (whose ``source`` is
+        # that output) resolves to a concrete shape.  Empty for static
+        # programs (never consulted) — the static path stays byte-identical.
+        dim_bindings: dict[tuple[int, int], int] = {}
         for stmt_idx, stmt in enumerate(self.statements):
-            self._run_stmt(stmt_idx, stmt, bindings)
+            self._run_stmt(stmt_idx, stmt, bindings, dim_bindings)
         return bindings
 
     # -- helpers --------------------------------------------------------
@@ -2351,8 +2441,15 @@ class Program:
         stmt_idx: int,
         stmt: Stmt,
         bindings: dict[str, float],
+        dim_bindings: "dict[tuple[int, int], int] | None" = None,
     ) -> None:
-        """Resolve refs, call fn, scatter returns into ``bindings``."""
+        """Resolve refs, call fn, scatter returns into ``bindings``.
+
+        ``dim_bindings`` (when supplied) records each scalar output's int
+        value keyed by ``(stmt_idx, out_idx)`` so a later dynamic shape can
+        resolve a :class:`DimAtom` (B4).  ``None`` (the legacy default)
+        skips all dim bookkeeping.
+        """
         if stmt.fn is None:
             return
         resolved = [self._resolve_ref(r, stmt_idx, bindings) for r in stmt.in_]
@@ -2360,15 +2457,22 @@ class Program:
             sub_results = stmt.fn.run(
                 self._sub_value_map(stmt.fn, resolved)
             )
-            sub_outs = list(sub_results.values())
-            for k, bound in enumerate(stmt.out):
-                self._bind_output(bound, sub_outs[k], bindings)
+            outs = list(sub_results.values())
         else:
             results = stmt.fn(*resolved)
-            if not isinstance(results, tuple):
-                results = (results,)
-            for k, bound in enumerate(stmt.out):
-                self._bind_output(bound, results[k], bindings)
+            outs = list(results) if isinstance(results, tuple) else [results]
+        for k, bound in enumerate(stmt.out):
+            self._bind_output(bound, outs[k], bindings, dim_bindings)
+            # Record any scalar (0-d) output as a candidate runtime
+            # dimension, keyed by its producing output position.  Only
+            # 0-d ints can size an axis (the SVD ``rank`` / δ_f output).
+            if dim_bindings is not None:
+                arr = np.asarray(outs[k])
+                if arr.ndim == 0:
+                    try:
+                        dim_bindings[(stmt_idx, k)] = int(arr)
+                    except (TypeError, ValueError):
+                        pass
 
     def _resolve_ref(
         self,
@@ -2429,14 +2533,29 @@ class Program:
         bound: SymArray,
         value: Any,
         bindings: dict[str, float],
+        dim_bindings: "dict[tuple[int, int], int] | None" = None,
     ) -> None:
-        """Bind a Stmt output: whole-tensor for bulk, per-cell atoms otherwise."""
+        """Bind a Stmt output: whole-tensor for bulk, per-cell atoms otherwise.
+
+        For a *dynamic* bulk output (an axis sized by a :class:`DimAtom`),
+        the declared ``_bulk.shape`` is resolved against ``dim_bindings``
+        before validating the produced tensor's shape (B4).
+        """
         if bound._bulk is not None:
             arr = np.asarray(value)
-            if tuple(arr.shape) != tuple(bound._bulk.shape):
+            if is_dynamic(bound._bulk.shape):
+                if dim_bindings is None:
+                    raise RuntimeError(
+                        f"dynamic bulk output {bound.name!r} requires the run "
+                        f"path's dim-binding table"
+                    )
+                expected = _resolve_shape(bound._bulk.shape, dim_bindings)
+            else:
+                expected = tuple(bound._bulk.shape)
+            if tuple(arr.shape) != expected:
                 raise ValueError(
                     f"bulk Stmt output {bound.name!r}: expected shape "
-                    f"{bound._bulk.shape}; got {arr.shape}"
+                    f"{expected}; got {arr.shape}"
                 )
             bindings[bound._bulk.name] = arr  # type: ignore[assignment]
         else:

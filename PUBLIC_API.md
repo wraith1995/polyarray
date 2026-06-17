@@ -47,7 +47,19 @@ class Provenance:
 @dataclass(frozen=True)
 class OutSpec:
     name: str
-    shape: tuple[int, ...] = ()
+    # A shape entry may be a runtime DimAtom (dynamic shape); see below.
+    shape: tuple[int | DimAtom, ...] = ()
+
+@dataclass(frozen=True)
+class DimAtom:                   # a runtime array dimension (e.g. SVD rank δ_f)
+    name: str                    # provenance, e.g. "rank:Alt"
+    source: tuple[int, int]      # (stmt_idx, output_index) that produces it
+
+def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool
+    # True iff any shape entry is a DimAtom (a runtime dimension).  An
+    # OutSpec/output with a dynamic shape is always emitted bulk, its axis
+    # sizes resolved at Program.run time.  Fully-concrete shapes are not
+    # dynamic, so static-shape programs are byte-identical.
 
 class SymbolEnv:                 # owned by Program; shared across cells
     ...
@@ -87,6 +99,20 @@ All frozen / hashable dataclasses.
 @dataclass(frozen=True) class InvOp                  # -> np.linalg.inv
 @dataclass(frozen=True) class PinvOp                 # -> np.linalg.pinv
 @dataclass(frozen=True) class SolveOp                # -> np.linalg.solve
+
+@dataclass(frozen=True)
+class SvdOp:                     # -> (U, S, Vh, rank); 4-output
+    rcond: float | None = None   # rank threshold (np.linalg.matrix_rank rule)
+    full_matrices: bool = False  # rank is the thresholded numerical rank (δ_f)
+
+@dataclass(frozen=True)
+class QrOp:                      # -> (Q, R); 2-output
+    mode: str = "reduced"
+
+@dataclass(frozen=True)
+class AssertOp:                  # passthrough predicate check; returns first input
+    kind: str                    # "shape_eq" | "rank_eq" | "spd" | "square_full_rank"
+    msg: str = ""                # AssertionError(msg + detail) on failure
 @dataclass(frozen=True) class SqrtOp                 # per-cell sqrt
 @dataclass(frozen=True) class AbsOp                  # per-cell abs
 @dataclass(frozen=True) class SignOp                 # per-cell sign
@@ -151,6 +177,11 @@ class SymbolicBudget:
     @classmethod def build_big_symbols(cls, *, retain_covariant: bool = False,
                                        surface_frame: bool | None = None,
                                        **overrides: Any) -> SymbolicBudget
+    @classmethod def force_stmts(cls, **overrides: Any) -> SymbolicBudget
+        # "no symbolic budget": drive every modeled op to a Stmt
+        # (naive_inverse_max_size=0, inverse_max_degree=0,
+        #  einsum_bag_threshold=1, freeze=True).  The build-then-simplify
+        # entry point for Grassman lowering.
 ```
 
 ## IR passes (`forward.py`)
