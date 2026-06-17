@@ -2211,6 +2211,13 @@ class Stmt:
 
     ``note`` is a human-readable provenance string.
 
+    ``provenance`` is an optional *structured* :class:`Provenance` describing
+    what produced this Stmt (e.g. a lowering front-end's algebra-centric node /
+    basis-choice record).  It is **purely descriptive metadata**: it is never
+    read by :meth:`run`/evaluation, so a program with ``provenance=None`` (the
+    default) is byte-identical to one before this field existed.  Preserved
+    across :meth:`Program.copy` (hence through ``partial_eval``).
+
     ``inline`` controls sub-Program composition (§1.3).  When ``True``
     the sub-program's rational outputs are spliced into the parent at
     construction time and this Stmt is dropped from the parent's
@@ -2221,6 +2228,7 @@ class Stmt:
     in_: tuple[Ref, ...]
     out: tuple[SymArray, ...]
     note: str = ""
+    provenance: Provenance | None = None
     inline: bool = False
 
 
@@ -2347,6 +2355,7 @@ class Program:
         out_specs: Sequence["OutSpec"],
         note: str = "",
         bulk: bool = True,
+        provenance: "Provenance | None" = None,
     ) -> tuple["SymArray", ...]:
         """Append an imperative :class:`Stmt` and return its outputs.
 
@@ -2433,6 +2442,7 @@ class Program:
             in_=tuple(wrapped_refs),
             out=tuple(out_arrays),
             note=note,
+            provenance=provenance,
         )
         self.statements.append(stmt)
         return tuple(out_arrays)
@@ -2461,6 +2471,7 @@ class Program:
                 in_=s.in_,
                 out=tuple(o._rebind(new) for o in s.out),
                 note=s.note,
+                provenance=s.provenance,
                 inline=s.inline,
             )
             for s in self.statements
