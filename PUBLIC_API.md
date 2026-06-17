@@ -34,7 +34,11 @@ class Program:
 @dataclass(frozen=True)
 class SymInput:
     name: str
-    shape: tuple[int, ...]
+    # A shape entry may be a runtime DimAtom (a dynamic input axis, e.g. an
+    # FFS-typed Grassmann input a : Λᵏ). A dynamic SymInput is allocated as a
+    # single bulk SymArray (no per-cell atoms); its DimAtom axes are bound from
+    # the provided array's shape at Program.run time. Static inputs unchanged.
+    shape: tuple[int | DimAtom, ...]
     provenance: Provenance | Callable[[tuple[int, ...]], Provenance]
 
 @dataclass(frozen=True)
@@ -53,7 +57,15 @@ class OutSpec:
 @dataclass(frozen=True)
 class DimAtom:                   # a runtime array dimension (e.g. SVD rank δ_f)
     name: str                    # provenance, e.g. "rank:Alt"
-    source: tuple[int, int]      # (stmt_idx, output_index) that produces it
+    # A tagged, hashable tuple identifying the run-time origin (the
+    # dim_bindings key):
+    #   ("stmt", stmt_idx, out_idx)  — a prior Stmt output (Stage B)
+    #   ("in",   input_name, axis)   — a dynamic SymInput axis (Stage C)
+    # Compat: a bare (stmt_idx, out_idx) 2-tuple is normalised to the
+    # ("stmt", ...) form. Build input-axis atoms via DimAtom.from_input.
+    source: tuple[Any, ...]
+    @staticmethod
+    def from_input(name: str, input_name: str, axis: int) -> DimAtom: ...
 
 def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool
     # True iff any shape entry is a DimAtom (a runtime dimension).  An
