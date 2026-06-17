@@ -324,6 +324,32 @@ class SymbolicBudget:
             **overrides,
         )
 
+    @classmethod
+    def force_stmts(cls, **overrides: Any) -> "SymbolicBudget":
+        """The "no symbolic budget" preset: drive every modeled op to a Stmt.
+
+        The opposite of :meth:`build_big_symbols`: rather than retaining
+        closed-form rational structure, this forces every modeled op to
+        emit an imperative :class:`Stmt` (no closed-form rational lane), so
+        Grassman's symbolic inputs flow through as deferred Stmts that are
+        simplified afterward (the build-then-simplify novelty).
+
+        * ``naive_inverse_max_size=0`` / ``inverse_max_degree=0`` — every
+          ``det`` / ``inverse`` is over-budget ⇒ emits a Stmt.
+        * ``einsum_bag_threshold=1`` — every multi-operand symbolic einsum
+          offloads to a numeric Stmt.
+        * ``freeze=True`` — cap any residual cell to an atom.
+
+        Extra ``overrides`` are forwarded to the constructor.
+        """
+        return cls(
+            naive_inverse_max_size=0,
+            inverse_max_degree=0,
+            einsum_bag_threshold=1,
+            freeze=True,
+            **overrides,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Refs
@@ -943,6 +969,125 @@ class SignOp:
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         return np.sign(np.asarray(x, dtype=float))
+
+
+@dataclass(frozen=True)
+class SvdOp:
+    """Stmt-compatible ``np.linalg.svd`` plus a thresholded numerical rank.
+
+    Multi-output: returns ``(U, S, Vh, rank)`` where ``rank`` is a 0-d
+    integer ndarray giving the numerical rank of ``A`` at tolerance
+    ``rcond`` (defaulting to numpy's ``matrix_rank`` rule).  The ``rank``
+    output is the runtime dimension ``δ_f`` consumed as a :class:`DimAtom`
+    (Stage B) — sizing image / projected / FFS arrays at run time.
+
+    ``full_matrices=False`` (the default) yields the reduced SVD, matching
+    the orthonormal-basis use; ``rcond`` mirrors ``np.linalg.matrix_rank``.
+    """
+
+    rcond: float | None = None
+    full_matrices: bool = False
+
+    def __call__(self, A: np.ndarray) -> tuple[np.ndarray, ...]:
+        A = np.asarray(A, dtype=float)
+        U, S, Vh = np.linalg.svd(A, full_matrices=self.full_matrices)
+        if S.size == 0:
+            rank = 0
+        elif self.rcond is None:
+            tol = S.max() * max(A.shape) * np.finfo(float).eps
+            rank = int((S > tol).sum())
+        else:
+            tol = self.rcond * S.max()
+            rank = int((S > tol).sum())
+        return U, S, Vh, np.asarray(rank)
+
+
+@dataclass(frozen=True)
+class QrOp:
+    """Stmt-compatible ``np.linalg.qr`` over a bound numeric matrix.
+
+    Multi-output: returns ``(Q, R)``.  ``mode`` follows numpy's QR modes
+    (``"reduced"`` by default — the orthonormal-basis / image use).
+    """
+
+    mode: str = "reduced"
+
+    def __call__(self, A: np.ndarray) -> tuple[np.ndarray, ...]:
+        Q, R = np.linalg.qr(np.asarray(A, dtype=float), mode=self.mode)
+        return Q, R
+
+
+def _check(ok: bool, msg: str, detail: str = "") -> None:
+    """Raise ``AssertionError(msg + detail)`` unless ``ok``."""
+    if not ok:
+        raise AssertionError(msg + detail)
+
+
+def _is_spd(A: np.ndarray) -> bool:
+    """True iff ``A`` is symmetric positive-definite (numerically)."""
+    A = np.asarray(A, dtype=float)
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        return False
+    if not np.allclose(A, A.T):
+        return False
+    try:
+        np.linalg.cholesky(A)
+    except np.linalg.LinAlgError:
+        return False
+    return True
+
+
+def _full_rank(A: np.ndarray) -> bool:
+    """True iff ``A`` has full numerical rank (min of its two dims)."""
+    A = np.asarray(A, dtype=float)
+    if A.ndim != 2:
+        return False
+    return int(np.linalg.matrix_rank(A)) == min(A.shape)
+
+
+@dataclass(frozen=True)
+class AssertOp:
+    """Passthrough predicate check over bound inputs (the D-scope asserts).
+
+    Validates ``kind`` against the bound inputs and **returns the first
+    input unchanged**, so a downstream consumer data-depends on the assert
+    (preserving Stmt ordering).  Kinds:
+
+    * ``"shape_eq"``       — ``x.shape == rest[0].shape``
+    * ``"rank_eq"``        — ``int(rest[0]) == int(rest[1])`` (δ vs asserted)
+    * ``"spd"``            — ``x`` is symmetric positive-definite
+    * ``"square_full_rank"`` — ``x`` is square and full rank
+
+    On failure raises ``AssertionError(msg + detail)``; ``msg`` is the
+    caller-supplied prefix.
+    """
+
+    kind: str
+    msg: str = ""
+
+    def __call__(self, x: np.ndarray, *rest: np.ndarray) -> np.ndarray:
+        x = np.asarray(x)
+        if self.kind == "shape_eq":
+            other = np.asarray(rest[0])
+            _check(
+                x.shape == other.shape,
+                self.msg,
+                f"[shape_eq] {x.shape} != {other.shape}",
+            )
+        elif self.kind == "rank_eq":
+            a, b = int(rest[0]), int(rest[1])
+            _check(a == b, self.msg, f"[rank_eq] {a} != {b}")
+        elif self.kind == "spd":
+            _check(_is_spd(x), self.msg, "[spd] matrix not symmetric positive-definite")
+        elif self.kind == "square_full_rank":
+            _check(
+                x.ndim == 2 and x.shape[0] == x.shape[1] and _full_rank(x),
+                self.msg,
+                f"[square_full_rank] shape={x.shape}",
+            )
+        else:
+            raise ValueError(f"AssertOp: unknown kind {self.kind!r}")
+        return x
 
 
 @dataclass(frozen=True)
