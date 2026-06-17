@@ -20,6 +20,7 @@ from .ir import (
     Provenance,
     SymArray,
     OutSpec,
+    DimAtom,
     SymbolicBudget,
     allocate_input,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "Provenance",
     "SymArray",
     "OutSpec",
+    "DimAtom",
     "SymbolicBudget",
     "allocate_input",
     "RationalFunction",
