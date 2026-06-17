@@ -147,16 +147,25 @@ class SymbolEnv:
 class SymInput:
     """A flat, atom-per-cell descriptor for a named symbolic input.
 
-    See plan §1.4: every :class:`SymInput` allocates *one atom per
+    See plan §1.4: a *static* :class:`SymInput` allocates *one atom per
     cell* of its declared shape — there is no granularity knob.  The
     ``provenance`` field is either a fixed :class:`Provenance` (used
     for every cell, with the cell's own index appended) or a callable
     mapping a cell index to its :class:`Provenance` for fully custom
     labelling.
+
+    **Dynamic inputs (Stage C).** A ``shape`` entry may be a
+    :class:`DimAtom` (an axis whose size is known only at run time — e.g. an
+    FFS-typed Grassmann input ``a : Λᵏ`` whose dimension ``δ`` is a runtime
+    rank).  Such an input is *dynamic* (:func:`is_dynamic`); it does **not**
+    enumerate per-cell atoms but is allocated as a single **bulk**
+    :class:`SymArray` whose axis sizes are read from the provided array at
+    :meth:`Program.run` time and bound into ``dim_bindings``.  Static inputs
+    are unchanged (byte-identical).
     """
 
     name: str
-    shape: tuple[int, ...]
+    shape: tuple[int | DimAtom, ...]
     provenance: "Provenance | Callable[[tuple[int, ...]], Provenance]"
 
 
@@ -484,25 +493,53 @@ Ref = Union[InputRef, OutputRef, Const, RationalRef, SymArrayRef, IntAtomRef]
 
 @dataclass(frozen=True)
 class DimAtom:
-    """A runtime array dimension produced by a :class:`Stmt` output.
+    """A runtime array dimension produced by a :class:`Stmt` output or input.
 
     Unlike :class:`IntAtom` (a pre-declared integer-valued *input*), a
-    ``DimAtom`` is an integer *produced* by a prior Stmt output — e.g. the
-    ``rank`` (δ_f) output of an :class:`SvdOp`.  It may be used as an entry
-    in an :class:`OutSpec.shape`, making that output's shape **dynamic**:
-    the axis size is resolved at :meth:`Program.run` time from the bound
-    value of the producing output.
+    ``DimAtom`` is an integer resolved at :meth:`Program.run` time.  It may be
+    used as an entry in an :class:`OutSpec.shape` / :class:`SymInput.shape`,
+    making that shape **dynamic**: the axis size is resolved at run time from
+    the bound value of its source.
 
     * ``name`` — provenance, e.g. ``"rank:Alt"``.
-    * ``source`` — ``(stmt_idx, output_index)`` of the producing Stmt
-      output, used to look up the concrete int at run time.
+    * ``source`` — a *tagged* hashable tuple identifying the run-time origin
+      of the dimension and used as the ``dim_bindings`` key:
+
+      - ``("stmt", stmt_idx, out_idx)`` — a prior Stmt output (Stage B), e.g.
+        the ``rank`` (δ_f) output of an :class:`SvdOp`.
+      - ``("in", input_name, axis)`` — an axis of a dynamic :class:`SymInput`
+        (Stage C); resolved from the provided array's actual shape.
+
+    Backward-compat shim: a bare 2-tuple ``(stmt_idx, out_idx)`` (Stage B's
+    original form) is normalised to ``("stmt", stmt_idx, out_idx)`` so old
+    callers keep working and the key still matches the binder.
 
     Frozen so it hashes by value (usable as a dict key and in a shape
     tuple alongside concrete ints).
     """
 
     name: str
-    source: tuple[int, int]
+    source: tuple[Any, ...]
+
+    def __post_init__(self) -> None:
+        src = self.source
+        # Compat shim: normalise the Stage-B 2-tuple (stmt_idx, out_idx) to the
+        # tagged ("stmt", stmt_idx, out_idx) form so it matches the binder key.
+        if (
+            len(src) == 2
+            and isinstance(src[0], (int, np.integer))
+            and isinstance(src[1], (int, np.integer))
+        ):
+            object.__setattr__(
+                self, "source", ("stmt", int(src[0]), int(src[1]))
+            )
+        else:
+            object.__setattr__(self, "source", tuple(src))
+
+    @staticmethod
+    def from_input(name: str, input_name: str, axis: int) -> "DimAtom":
+        """Construct an input-axis ``DimAtom`` (Stage C)."""
+        return DimAtom(name=name, source=("in", input_name, int(axis)))
 
 
 def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool:
@@ -519,7 +556,7 @@ def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool:
 
 def _resolve_shape(
     shape: tuple[int | DimAtom, ...],
-    dim_bindings: "Mapping[tuple[int, int], int]",
+    dim_bindings: "Mapping[tuple[Any, ...], int]",
 ) -> tuple[int, ...]:
     """Substitute each :class:`DimAtom` in ``shape`` with its bound int.
 
@@ -2225,8 +2262,20 @@ class Program:
         self.inputs: tuple[SymInput, ...] = tuple(inputs)
         self.input_arrays: dict[str, SymArray] = {}
         for inp in self.inputs:
-            cells = allocate_input(self.env, inp)
-            self.input_arrays[inp.name] = SymArray(cells, program=self, name=inp.name)
+            if is_dynamic(inp.shape):
+                # Stage C: a dynamic (DimAtom-sized) input cannot enumerate
+                # per-cell atoms — allocate one whole-tensor bulk handle whose
+                # symbolic shape carries the DimAtom axes (resolved at run
+                # time from the provided array; see build_runtime_bindings).
+                cells = np.empty((), dtype=object)
+                sa = SymArray(cells, program=self, name=inp.name)
+                sa._bulk = BulkOut(name=inp.name, shape=tuple(inp.shape))
+                self.input_arrays[inp.name] = sa
+            else:
+                cells = allocate_input(self.env, inp)
+                self.input_arrays[inp.name] = SymArray(
+                    cells, program=self, name=inp.name
+                )
         self.statements: list[Stmt] = []
         self.outputs: dict[str, SymArray] = {}
         self.budget: SymbolicBudget = budget if budget is not None else SymbolicBudget()
@@ -2457,9 +2506,33 @@ class Program:
         # that actually carry a dynamic shape; static programs pass ``None``
         # so ``_run_stmt`` skips all per-output dim bookkeeping (B5) — the
         # static path stays byte-identical AND free of per-output overhead.
-        dim_bindings: dict[tuple[int, int], int] | None = (
+        dim_bindings: dict[tuple[Any, ...], int] | None = (
             {} if self._has_dynamic_shape() else None
         )
+        # Stage C: before walking statements, bind each dynamic INPUT.  Read
+        # the provided array's actual shape, record each DimAtom axis into
+        # dim_bindings (keyed by the DimAtom's ("in", name, axis) source so a
+        # later dynamic OutSpec.shape / sibling resolves against it), and bind
+        # the whole tensor as a bulk value.  Concrete axes are validated.
+        if dim_bindings is not None:
+            for inp in self.inputs:
+                if not is_dynamic(inp.shape):
+                    continue
+                arr = np.asarray(values[inp.name], dtype=float)
+                if arr.ndim != len(inp.shape):
+                    raise ValueError(
+                        f"dynamic input {inp.name!r}: expected {len(inp.shape)} "
+                        f"axes; got array of ndim {arr.ndim} (shape {arr.shape})"
+                    )
+                for axis, dim in enumerate(inp.shape):
+                    if isinstance(dim, DimAtom):
+                        dim_bindings[dim.source] = int(arr.shape[axis])
+                    elif int(dim) != int(arr.shape[axis]):
+                        raise ValueError(
+                            f"dynamic input {inp.name!r}: axis {axis} expected "
+                            f"{int(dim)}; got {int(arr.shape[axis])}"
+                        )
+                bindings[inp.name] = arr  # type: ignore[assignment]
         for stmt_idx, stmt in enumerate(self.statements):
             self._run_stmt(stmt_idx, stmt, bindings, dim_bindings)
         return bindings
@@ -2478,6 +2551,8 @@ class Program:
         cached = getattr(self, "_dynamic_shape_memo", None)
         if cached is None:
             cached = any(
+                is_dynamic(inp.shape) for inp in self.inputs
+            ) or any(
                 o._bulk is not None and is_dynamic(o._bulk.shape)
                 for stmt in self.statements
                 for o in stmt.out
@@ -2506,6 +2581,12 @@ class Program:
             declared.add(inp.name)
             if inp.name not in values:
                 raise KeyError(f"missing value for input {inp.name!r}")
+            # Dynamic (DimAtom-sized) inputs are bulk; their whole-tensor value
+            # and DimAtom axis sizes are bound in build_runtime_bindings (C3),
+            # not per-cell here.  Mark declared so the geometry-side fallthrough
+            # below leaves them alone, and skip the static per-cell binding.
+            if is_dynamic(inp.shape):
+                continue
             arr = np.asarray(values[inp.name], dtype=float)
             if tuple(arr.shape) != tuple(inp.shape):
                 raise ValueError(
@@ -2552,7 +2633,7 @@ class Program:
         stmt_idx: int,
         stmt: Stmt,
         bindings: dict[str, float],
-        dim_bindings: dict[tuple[int, int], int] | None = None,
+        dim_bindings: dict[tuple[Any, ...], int] | None = None,
     ) -> None:
         """Resolve refs, call fn, scatter returns into ``bindings``.
 
@@ -2581,7 +2662,7 @@ class Program:
                 arr = np.asarray(outs[k])
                 if arr.ndim == 0:
                     try:
-                        dim_bindings[(stmt_idx, k)] = int(arr)
+                        dim_bindings[("stmt", stmt_idx, k)] = int(arr)
                     except (TypeError, ValueError):
                         pass
 
@@ -2644,7 +2725,7 @@ class Program:
         bound: SymArray,
         value: Any,
         bindings: dict[str, float],
-        dim_bindings: dict[tuple[int, int], int] | None = None,
+        dim_bindings: dict[tuple[Any, ...], int] | None = None,
     ) -> None:
         """Bind a Stmt output: whole-tensor for bulk, per-cell atoms otherwise.
 

@@ -21,6 +21,7 @@ from .ir import (
     SymArray,
     OutSpec,
     DimAtom,
+    is_dynamic,
     SymbolicBudget,
     allocate_input,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "SymArray",
     "OutSpec",
     "DimAtom",
+    "is_dynamic",
     "SymbolicBudget",
     "allocate_input",
     "RationalFunction",
