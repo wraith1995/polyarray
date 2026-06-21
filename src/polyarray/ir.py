@@ -2537,6 +2537,16 @@ class Program:
                     )
                 for axis, dim in enumerate(inp.shape):
                     if isinstance(dim, DimAtom):
+                        # An input axis sourced from a prior Stmt's output (e.g. an FFS-typed
+                        # input Var sized by the factorization's canonical rank atom,
+                        # ``source[0] == "stmt"``) is NOT bound from the fed array's shape:
+                        # the producing Stmt records it later in ``_run_stmt``.  Binding it
+                        # here would shadow that canonical value with the fed shape and defeat
+                        # the rank-consistency check.  The fed axis length is still validated
+                        # against the resolved atom by the ``rank_eq`` AssertOp downstream.
+                        # An ``("in", …)`` atom is genuinely input-sourced — bind it here.
+                        if dim.source and dim.source[0] == "stmt":
+                            continue
                         dim_bindings[dim.source] = int(arr.shape[axis])
                     elif int(dim) != int(arr.shape[axis]):
                         raise ValueError(
