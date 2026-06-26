@@ -58,6 +58,9 @@ from .int_atom import IntAtom
 # --- IR passes --------------------------------------------------------------
 from .forward import analyze, partial_eval
 
+# --- Code generation --------------------------------------------------------
+from .numpy_source import to_numpy_source
+
 __all__ = [
     # construction / values
     "Program",
@@ -95,4 +98,6 @@ __all__ = [
     # IR passes
     "analyze",
     "partial_eval",
+    # code generation
+    "to_numpy_source",
 ]
