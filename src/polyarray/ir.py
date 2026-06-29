@@ -2952,6 +2952,13 @@ def vmap(
 
     fn.__qualname__ = f"vmap({body.name})"
     fn.__name__ = f"vmap_{body.name}"
+    # Additive, descriptive metadata so introspecting tools (e.g.
+    # to_numpy_source) can recover the batched body and the normalised
+    # in/out axis tuples without spelunking the closure cells.  These are
+    # never read by ``run``/evaluation — purely informational.
+    fn._vmap_body = body
+    fn._in_axes = in_axes_tup
+    fn._out_axes = out_axes_tup
     return fn
 
 
