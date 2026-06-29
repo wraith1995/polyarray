@@ -10,3 +10,6 @@ build/
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# uv lockfile (created by the isolated test venv)
+uv.lock
