@@ -71,6 +71,46 @@ from .rational import RationalFunction, _poly_to_pyexpr, _ring_names
 
 __all__ = ["to_numpy_source", "OpRenderer"]
 
+
+def _vmap_body_of(fn: Any) -> "Program | None":
+    """Pull a per-point body :class:`Program` out of a ``vmap`` closure.
+
+    Mirrors :func:`polyarray.forward._body_of` but kept local so this module
+    has no import-time dependency on ``forward``.  ``vmap`` also stamps the
+    body onto ``fn._vmap_body`` (additive); prefer that, fall back to the
+    closure scan for robustness.
+    """
+    body = getattr(fn, "_vmap_body", None)
+    if isinstance(body, Program):
+        return body
+    for c in getattr(fn, "__closure__", None) or ():
+        try:
+            v = c.cell_contents
+        except ValueError:
+            continue
+        if isinstance(v, Program):
+            return v
+    return None
+
+
+class _HelperRegistry:
+    """Shared, module-level helper-def accumulator across nested emitters.
+
+    Sub-``Program`` bodies and ``vmap`` bodies are emitted once each as a
+    module-level ``def`` (deduplicated by object identity) and referenced by
+    name from the call sites that need them.
+    """
+
+    def __init__(self) -> None:
+        self.helpers: dict[int, str] = {}   # id(obj) -> function name
+        self.defs: list[list[str]] = []     # ordered list of def line-blocks
+        self._counter = 0
+
+    def fresh(self, stem: str) -> str:
+        name = f"_{stem}{self._counter}"
+        self._counter += 1
+        return name
+
 # A renderer maps ``(op, arg_exprs)`` to a single Python expression string that,
 # when evaluated, yields the op's result (a tuple for multi-output ops).
 OpRenderer = Callable[[Any, "list[str]"], str]
@@ -110,10 +150,14 @@ class _Emitter:
         program: Program,
         func_name: str,
         op_renderers: Mapping[str, OpRenderer] | None,
+        registry: "_HelperRegistry | None" = None,
     ) -> None:
         self.prog = program
         self.func_name = func_name
         self.extra_renderers = dict(op_renderers or {})
+        # Shared across nested emitters so sub-Program / vmap bodies become
+        # module-level helper defs emitted exactly once.
+        self.registry = registry if registry is not None else _HelperRegistry()
         self.lines: list[str] = []
         # generator-name -> Python scalar expression producing its value.
         self.genmap: dict[str, str] = {}
@@ -136,11 +180,76 @@ class _Emitter:
         body.extend(self._emit_outputs())
 
         sig = f"def {self.func_name}({', '.join(params)}):"
-        src = ["import numpy as np", "", sig]
+        src = ["import numpy as np", ""]
+        # Helper defs (sub-Program / vmap bodies) accumulated while emitting
+        # the body above; emitted module-level, before the entrypoint.
+        for block in self.registry.defs:
+            src.extend(block)
+            src.append("")
+        src.append(sig)
         src.append('    """Generated from polyarray Program '
                    f'{self.prog.name!r} by to_numpy_source."""')
         src.extend("    " + ln if ln else "" for ln in body)
         return "\n".join(src) + "\n"
+
+    # -- nested-program helper emission ---------------------------------
+
+    def _emit_program_helper(self, prog: Program) -> str:
+        """Emit ``prog`` as a module-level helper def; return its name.
+
+        Reproduces :meth:`Program._run_stmt`'s sub-Program dispatch: the
+        helper takes one positional parameter per body input (in declaration
+        order) and returns the body outputs in insertion order — a bare value
+        for a single output, else a tuple.  Deduplicated by identity, so a
+        shared body is emitted once and recursion terminates.
+        """
+        key = id(prog)
+        existing = self.registry.helpers.get(key)
+        if existing is not None:
+            return existing
+        name = self.registry.fresh("sub")
+        self.registry.helpers[key] = name  # reserve before recursing
+        sub = _Emitter(prog, name, self.extra_renderers, registry=self.registry)
+        self.registry.defs.append(sub._emit_helper_lines())
+        return name
+
+    def _emit_helper_lines(self) -> list[str]:
+        """Build this program's lines as a module-level helper def block.
+
+        Like :meth:`emit` but: no ``import`` line, parameters are the body
+        inputs only (positional, matching ``_run_stmt``'s operand→input map),
+        and the helper returns the outputs rather than being an entrypoint.
+        """
+        params = self._collect_helper_params()
+        self._bind_inputs()
+        body: list[str] = []
+        for stmt_idx, stmt in enumerate(self.prog.statements):
+            body.extend(self._emit_stmt(stmt_idx, stmt))
+        body.extend(self._emit_outputs())
+        lines = [f"def {self.func_name}({', '.join(params)}):"]
+        lines.append('    """Sub-Program/vmap body '
+                     f'{self.prog.name!r} from to_numpy_source."""')
+        lines.extend("    " + ln if ln else "" for ln in body)
+        return lines
+
+    def _collect_helper_params(self) -> list[str]:
+        """Positional params for a helper: the body inputs, in order.
+
+        IntAtoms are intentionally excluded — ``_run_stmt`` passes only the
+        resolved operands to a sub-Program's :meth:`run`, so a body that
+        references an IntAtom would already fail at run time.
+        """
+        params: list[str] = []
+        for inp in self.prog.inputs:
+            if is_dynamic(inp.shape):
+                raise NotImplementedError(
+                    "to_numpy_source: dynamic (DimAtom-shaped) input "
+                    f"{inp.name!r} in a sub-Program/vmap body is not supported"
+                )
+            p = _safe_param_name(inp.name)
+            self.param[inp.name] = p
+            params.append(p)
+        return params
 
     # -- inputs ---------------------------------------------------------
 
@@ -239,18 +348,90 @@ class _Emitter:
         renderer = self.builtin.get(type(fn))
         if renderer is None:
             renderer = self.extra_renderers.get(type(fn).__name__)
-        if renderer is None:
-            if isinstance(fn, Program):
-                raise NotImplementedError(
-                    "to_numpy_source: sub-Program Stmt fns are not yet "
-                    f"supported (stmt fn is Program {fn.name!r})"
-                )
+        if renderer is not None:
+            return renderer(fn, args)
+        # A sub-Program Stmt fn: dispatch like ``_run_stmt`` (operands map to
+        # body inputs by position; outputs in insertion order).
+        if isinstance(fn, Program):
+            helper = self._emit_program_helper(fn)
+            return f"{helper}({', '.join(args)})"
+        # A ``vmap(body)`` closure Stmt fn: batch the body over its axes.
+        if _vmap_body_of(fn) is not None:
+            helper = self._emit_vmap_helper(fn)
+            return f"{helper}({', '.join(args)})"
+        raise NotImplementedError(
+            f"to_numpy_source: no renderer for op {type(fn).__name__!r}. "
+            "Pass op_renderers={'"
+            f"{type(fn).__name__}': lambda op, args: ...}} to emit it."
+        )
+
+    def _emit_vmap_helper(self, fn: Any) -> str:
+        """Emit a ``vmap(body)`` closure as a module-level helper; return name.
+
+        Mirrors :func:`polyarray.ir.vmap`'s loop exactly: each batched input
+        (``in_axes[i] != None``) is sliced along its normalised axis at index
+        ``i``; ``None`` operands are broadcast unchanged; the body runs once
+        per slice and outputs are ``np.stack``-ed along ``out_axes``.
+        """
+        key = id(fn)
+        existing = self.registry.helpers.get(key)
+        if existing is not None:
+            return existing
+        body = _vmap_body_of(fn)
+        in_axes = getattr(fn, "_in_axes", None)
+        out_axes = getattr(fn, "_out_axes", None)
+        if in_axes is None or out_axes is None:
             raise NotImplementedError(
-                f"to_numpy_source: no renderer for op {type(fn).__name__!r}. "
-                "Pass op_renderers={'"
-                f"{type(fn).__name__}': lambda op, args: ...}} to emit it."
+                "to_numpy_source: vmap closure does not expose _in_axes/"
+                "_out_axes (rebuild it via polyarray.ir.vmap)"
             )
-        return renderer(fn, args)
+        in_axes = tuple(in_axes)
+        out_axes = tuple(out_axes)
+        # Emit the per-slice body as its own helper (deduplicated by identity).
+        body_helper = self._emit_program_helper(body)
+
+        name = self.registry.fresh("vmap")
+        self.registry.helpers[key] = name
+        n_in = len(body.inputs)
+        n_out = len(body.outputs)
+        params = [f"a{i}" for i in range(n_in)]
+        L = "    "
+        block: list[str] = [f"def {name}({', '.join(params)}):"]
+        block.append(L + '"""vmap('
+                     f'{body.name!r}) batched body from to_numpy_source."""')
+        block.append(L + f"_arrs = [np.asarray(a) for a in ({', '.join(params)}"
+                     f"{',' if n_in == 1 else ''})]")
+        block.append(L + f"_in_axes = {in_axes!r}")
+        block.append(L + "_norm = []")
+        block.append(L + "_M = None")
+        block.append(L + "for _a, _ax in zip(_arrs, _in_axes):")
+        block.append(L + "    if _ax is None:")
+        block.append(L + "        _norm.append(None)")
+        block.append(L + "    else:")
+        block.append(L + "        _axn = _ax if _ax >= 0 else _a.ndim + _ax")
+        block.append(L + "        _norm.append(_axn)")
+        block.append(L + "        _M = _a.shape[_axn]")
+        block.append(L + "_per = []")
+        block.append(L + "for _i in range(_M):")
+        block.append(L + "    _sv = []")
+        block.append(L + "    for _a, _ax in zip(_arrs, _norm):")
+        block.append(L + "        if _ax is None:")
+        block.append(L + "            _sv.append(_a)")
+        block.append(L + "        else:")
+        block.append(L + "            _idx = [slice(None)] * _a.ndim")
+        block.append(L + "            _idx[_ax] = _i")
+        block.append(L + "            _sv.append(_a[tuple(_idx)])")
+        block.append(L + f"    _per.append({body_helper}(*_sv))")
+        if n_out == 1:
+            block.append(L + f"return np.stack(_per, axis={out_axes[0]!r})")
+        else:
+            parts = ", ".join(
+                f"np.stack([_p[{k}] for _p in _per], axis={out_axes[k]!r})"
+                for k in range(n_out)
+            )
+            block.append(L + f"return ({parts})")
+        self.registry.defs.append(block)
+        return name
 
     # -- cells / rational functions -------------------------------------
 
