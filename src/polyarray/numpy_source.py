@@ -32,6 +32,19 @@ ops (e.g. grassmann's ``_AxisLenOp``) pass an ``op_renderers`` mapping keyed by
 the op class name to :func:`to_numpy_source` — keeping polyarray free of any
 dependency on the front-end.  An op with no renderer raises a clear
 ``NotImplementedError`` naming the op.
+
+Plain-callable Stmt fns: the ``__numpy_source__`` emit hook
+-----------------------------------------------------------
+A ``Stmt.fn`` may also be a *plain Python callable* that is neither an op class,
+a sub-:class:`Program`, nor a ``vmap`` closure (e.g. a producer's
+``lambda *arrs: np.einsum(spec, *arrs)``).  Such a fn emits **iff** it carries a
+``__numpy_source__(args) -> str`` attribute: a callable taking the list of
+already-rendered argument-expression strings (in operand order) and returning a
+single numpy *expression string* (written in terms of ``np`` and those arg
+exprs).  Producers opt a plain-callable Stmt into emission by stamping
+``fn.__numpy_source__``; a plain fn with no such hook still raises the clear
+``NotImplementedError``.  This keeps the protocol additive and polyarray free of
+any front-end dependency.
 """
 from __future__ import annotations
 
@@ -359,6 +372,16 @@ class _Emitter:
         if _vmap_body_of(fn) is not None:
             helper = self._emit_vmap_helper(fn)
             return f"{helper}({', '.join(args)})"
+        # A plain Python callable Stmt fn (not an op class, Program, or vmap
+        # closure) emits IFF it carries an ``__numpy_source__(args)->str`` hook:
+        # the producer stamps ``fn.__numpy_source__`` with a callable taking the
+        # already-rendered arg-expression strings and returning a numpy
+        # expression string (in terms of ``np`` and those arg exprs). This lets
+        # any front-end opt a plain-callable Stmt into emission without polyarray
+        # importing it. Hookless plain-fn Stmts fall through to the raise below.
+        hook = getattr(fn, "__numpy_source__", None)
+        if callable(hook):
+            return hook(args)
         raise NotImplementedError(
             f"to_numpy_source: no renderer for op {type(fn).__name__!r}. "
             "Pass op_renderers={'"
