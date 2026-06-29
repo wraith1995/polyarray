@@ -45,6 +45,7 @@ from .ir import (
     SymArrayRef,
     is_dynamic,
 )
+from .budget import SimplifyBudget, _apply_budget
 from .rational import RationalFunction
 
 # Ops we do not execute at build time.  ``WhileOp`` could loop; ``CallOp`` and
@@ -298,7 +299,7 @@ def specialize(
     bind: Mapping[str, Any] | None = None,
     subs: Mapping[str, Any] | None = None,
     sparsity: bool = False,
-    budget: Any = None,
+    budget: "SimplifyBudget | None" = None,
 ) -> Program:
     """Partially evaluate ``program`` against optional ``subs`` / ``bind`` values.
 
@@ -313,10 +314,22 @@ def specialize(
     ``sparsity`` and ``budget`` are accepted for signature stability but are
     no-op passthrough here (a parallel branch — P4/P5 — implements them).
     Exactness-preserving.
+
+    ``budget`` (a :class:`~polyarray.budget.SimplifyBudget`) is the post-build
+    moderation control surface (P5): after the unconditional numeric-fold floor
+    runs, it collapses / extracts / keeps the residual symbolic structure per
+    ``plans/01-budget-moderated-simplification.md``.  ``budget=None`` is the
+    floor only.  ``subs`` (symbolic argument substitution, P3) and ``sparsity``
+    (P4) are accepted for API parity but are no-op passthroughs in this slice.
     """
-    # P5: budget applied elsewhere; sparsity handled by the P4 branch.
+    del sparsity  # P4 sparsity is a separate pass; accepted here for API parity.
+    # P3: apply symbolic substitution first, then the bind+fold+descent floor,
+    # then (P5) the post-build budget moderation.
     prog = substitute(program, subs) if subs else program
-    return _specialize(prog, dict(bind or {}), 0, frozenset())
+    result = _specialize(prog, dict(bind or {}), 0, frozenset())
+    if budget is not None:
+        result = _apply_budget(result, budget)
+    return result
 
 
 def _specialize(

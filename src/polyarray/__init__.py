@@ -58,6 +58,7 @@ from .int_atom import IntAtom
 # --- IR passes --------------------------------------------------------------
 from .forward import analyze, partial_eval
 from .simplify import specialize, fold_numeric, bind_inputs, substitute
+from .budget import SimplifyBudget
 from .sparsity import propagate_sparsity, block_zero_mask, SparsityReport
 
 # --- Code generation --------------------------------------------------------
@@ -104,6 +105,7 @@ __all__ = [
     "fold_numeric",
     "bind_inputs",
     "substitute",
+    "SimplifyBudget",
     "propagate_sparsity",
     "block_zero_mask",
     "SparsityReport",
