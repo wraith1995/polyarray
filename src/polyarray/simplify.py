@@ -45,6 +45,7 @@ from .ir import (
     SymArrayRef,
     is_dynamic,
 )
+from .budget import SimplifyBudget, _apply_budget
 from .rational import RationalFunction
 
 # Ops we do not execute at build time.  ``WhileOp`` could loop; ``CallOp`` and
@@ -292,7 +293,14 @@ def _try_descend(
 # Entry points
 # ---------------------------------------------------------------------------
 
-def specialize(program: Program, *, bind: Mapping[str, Any] | None = None) -> Program:
+def specialize(
+    program: Program,
+    *,
+    bind: Mapping[str, Any] | None = None,
+    subs: Mapping[str, Any] | None = None,
+    sparsity: bool = False,
+    budget: "SimplifyBudget | None" = None,
+) -> Program:
     """Partially evaluate ``program`` against optional numeric ``bind`` values.
 
     Folds every build-time-numeric subcomputation, drops the Stmts that produced
@@ -301,8 +309,19 @@ def specialize(program: Program, *, bind: Mapping[str, Any] | None = None) -> Pr
     into its body — specializing it with the numeric operands bound to the body's
     inputs and shrinking the Stmt to the still-symbolic operands.
     Exactness-preserving.
+
+    ``budget`` (a :class:`~polyarray.budget.SimplifyBudget`) is the post-build
+    moderation control surface (P5): after the unconditional numeric-fold floor
+    runs, it collapses / extracts / keeps the residual symbolic structure per
+    ``plans/01-budget-moderated-simplification.md``.  ``budget=None`` is the
+    floor only.  ``subs`` (symbolic argument substitution, P3) and ``sparsity``
+    (P4) are accepted for API parity but are no-op passthroughs in this slice.
     """
-    return _specialize(program, dict(bind or {}), 0, frozenset())
+    del subs, sparsity  # parallel branches (P3/P4) implement these
+    result = _specialize(program, dict(bind or {}), 0, frozenset())
+    if budget is not None:
+        result = _apply_budget(result, budget)
+    return result
 
 
 def _specialize(
