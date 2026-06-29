@@ -614,12 +614,37 @@ def clear_ring_caches() -> dict[str, int]:
     rings are referenced by identity only inside a single build, so
     clearing between builds is safe: any still-live polynomial keeps its
     own ring alive via its back-reference, and the next build simply
-    re-populates the cache.  Returns ``{"flint": n, "sympy": m}`` giving
-    the number of entries dropped (useful for instrumentation).
+    re-populates the cache.  Returns ``{"flint": n, "sympy": m,
+    "flint_ctx": k}`` giving the number of entries dropped (useful for
+    instrumentation).
+
+    ``flint_ctx`` covers python-flint's *own* global context-intern cache
+    (:attr:`fmpq_mpoly_ctx._ctx_cache`).  ``fmpq_mpoly_ctx.get`` interns
+    every context it builds by ``(names, ordering)`` and never evicts.
+    Because :data:`_FLINT_RING_CACHE`'s key space is unbounded across
+    builds (every fresh generator name spawns a fresh context), that
+    intern table grows without bound, and each cached context pins its
+    polynomial arena — the multi-GB live data the IR's per-statement
+    ``SymArray.cells`` once referenced.  Dropping only :data:`_FLINT_RING_CACHE`
+    frees nothing: flint's ``_ctx_cache`` keeps every context (hence every
+    ring and its polys) alive on its own.  We therefore clear it here too.
+    Live polynomials keep their context alive directly, so this stays safe
+    at a build boundary.
     """
     sizes = {"flint": len(_FLINT_RING_CACHE), "sympy": len(_SYMPY_RING_CACHE)}
     _FLINT_RING_CACHE.clear()
     _SYMPY_RING_CACHE.clear()
+    # Also drop python-flint's internal context-intern cache, the true
+    # unbounded retainer (see docstring).  Guarded: ``_ctx_cache`` is a
+    # python-flint implementation detail and may be absent / renamed in
+    # other versions, in which case there is nothing extra to clear.
+    flint_ctx_dropped = 0
+    if _FLINT_AVAILABLE and fmpq_mpoly_ctx is not None:
+        ctx_cache = getattr(fmpq_mpoly_ctx, "_ctx_cache", None)
+        if isinstance(ctx_cache, dict):
+            flint_ctx_dropped = len(ctx_cache)
+            ctx_cache.clear()
+    sizes["flint_ctx"] = flint_ctx_dropped
     return sizes
 
 

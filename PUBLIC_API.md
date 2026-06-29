@@ -34,7 +34,11 @@ class Program:
 @dataclass(frozen=True)
 class SymInput:
     name: str
-    shape: tuple[int, ...]
+    # A shape entry may be a runtime DimAtom (a dynamic input axis, e.g. an
+    # FFS-typed Grassmann input a : Λᵏ). A dynamic SymInput is allocated as a
+    # single bulk SymArray (no per-cell atoms); its DimAtom axes are bound from
+    # the provided array's shape at Program.run time. Static inputs unchanged.
+    shape: tuple[int | DimAtom, ...]
     provenance: Provenance | Callable[[tuple[int, ...]], Provenance]
 
 @dataclass(frozen=True)
@@ -47,7 +51,27 @@ class Provenance:
 @dataclass(frozen=True)
 class OutSpec:
     name: str
-    shape: tuple[int, ...] = ()
+    # A shape entry may be a runtime DimAtom (dynamic shape); see below.
+    shape: tuple[int | DimAtom, ...] = ()
+
+@dataclass(frozen=True)
+class DimAtom:                   # a runtime array dimension (e.g. SVD rank δ_f)
+    name: str                    # provenance, e.g. "rank:Alt"
+    # A tagged, hashable tuple identifying the run-time origin (the
+    # dim_bindings key):
+    #   ("stmt", stmt_idx, out_idx)  — a prior Stmt output (Stage B)
+    #   ("in",   input_name, axis)   — a dynamic SymInput axis (Stage C)
+    # Compat: a bare (stmt_idx, out_idx) 2-tuple is normalised to the
+    # ("stmt", ...) form. Build input-axis atoms via DimAtom.from_input.
+    source: tuple[Any, ...]
+    @staticmethod
+    def from_input(name: str, input_name: str, axis: int) -> DimAtom: ...
+
+def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool
+    # True iff any shape entry is a DimAtom (a runtime dimension).  An
+    # OutSpec/output with a dynamic shape is always emitted bulk, its axis
+    # sizes resolved at Program.run time.  Fully-concrete shapes are not
+    # dynamic, so static-shape programs are byte-identical.
 
 class SymbolEnv:                 # owned by Program; shared across cells
     ...
@@ -87,6 +111,30 @@ All frozen / hashable dataclasses.
 @dataclass(frozen=True) class InvOp                  # -> np.linalg.inv
 @dataclass(frozen=True) class PinvOp                 # -> np.linalg.pinv
 @dataclass(frozen=True) class SolveOp                # -> np.linalg.solve
+
+@dataclass(frozen=True)
+class SvdOp:                     # -> (U, S, Vh, rank); 4-output
+    rcond: float | None = None   # rank threshold (np.linalg.matrix_rank rule)
+    full_matrices: bool = False  # rank is the thresholded numerical rank (δ_f)
+
+@dataclass(frozen=True)
+class GSvdOp:                    # metric-aware GSVD of A:V->W; -> (U, UI, V, VI, S, rank); 6-output
+    rcond: float | None = None   # rank threshold on the *whitened* singular values
+    # __call__(A, M_V, M_W) with SPD domain/codomain metrics.
+    #   U  = image basis in W  (Uᵀ M_W U = I);  UI = coker basis (M_W-⊥ complement)
+    #   V  = coimg basis in V  (Vᵀ M_V V = I);  VI = ker  basis  (A·VI ≈ 0)
+    #   full factors are [U|UI], [V|VI]; reconstruction:
+    #       A = [U|UI] · Sfull · [V|VI]ᵀ · M_V    (trailing M_V; contravariant coords)
+    #   M_V = M_W = I  ⇒  reduces to SvdOp (A = U diag(S) Vᵀ, same S/rank).
+
+@dataclass(frozen=True)
+class QrOp:                      # -> (Q, R); 2-output
+    mode: str = "reduced"
+
+@dataclass(frozen=True)
+class AssertOp:                  # passthrough predicate check; returns first input
+    kind: str                    # "shape_eq" | "rank_eq" | "spd" | "square_full_rank"
+    msg: str = ""                # AssertionError(msg + detail) on failure
 @dataclass(frozen=True) class SqrtOp                 # per-cell sqrt
 @dataclass(frozen=True) class AbsOp                  # per-cell abs
 @dataclass(frozen=True) class SignOp                 # per-cell sign
@@ -151,6 +199,11 @@ class SymbolicBudget:
     @classmethod def build_big_symbols(cls, *, retain_covariant: bool = False,
                                        surface_frame: bool | None = None,
                                        **overrides: Any) -> SymbolicBudget
+    @classmethod def force_stmts(cls, **overrides: Any) -> SymbolicBudget
+        # "no symbolic budget": drive every modeled op to a Stmt
+        # (naive_inverse_max_size=0, inverse_max_degree=0,
+        #  einsum_bag_threshold=1, freeze=True).  The build-then-simplify
+        # entry point for Grassman lowering.
 ```
 
 ## IR passes (`forward.py`)
