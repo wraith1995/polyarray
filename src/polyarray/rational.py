@@ -518,6 +518,58 @@ class RationalFunction:
             self._compiled = fn
         return fn(bindings)
 
+    # ------------------------------------------------------------------
+    # Symbolic substitution (build-time `compose`)
+    # ------------------------------------------------------------------
+
+    def compose(self, name: str, repl: "RationalFunction") -> "RationalFunction":
+        """Substitute generator ``name`` with the rational function ``repl``.
+
+        ``repl`` is a :class:`RationalFunction` over *other* generators.
+        The result lives over a ring spanning
+        ``(self.gens - {name}) ∪ repl.gens`` and equals ``self`` with every
+        occurrence of ``name`` replaced by ``repl`` — computed by **ring
+        arithmetic**, a generalization of :func:`_partial_substitute` where
+        the bound generator's contribution ``name**exp`` is the RF power
+        ``repl**exp`` (RF multiply / add) instead of a float.
+
+        Numerator and denominator are each composed independently, so for
+        ``num/den`` the answer is ``compose(num) / compose(den)``.  No
+        :func:`sympy.subs` / :func:`sympy.simplify` is used.
+
+        If ``name`` is not one of ``self.gens`` this is a semantic no-op and
+        ``self`` is returned unchanged (its ring already excludes ``name``;
+        any further ring join is resolved lazily by RF arithmetic).
+        """
+        src_names = self._ring.names
+        if name not in src_names:
+            return self
+        name_pos = src_names.index(name)
+        leftover_names = [n for n in src_names if n != name]
+        target_names = tuple(sorted(set(leftover_names) | set(repl._ring.names)))
+        target = _make_ring(target_names)
+        repl_t = RationalFunction(
+            _lift(repl._num, target), _lift(repl._den, target)
+        )
+        new_num = _compose_poly(self._num, src_names, name_pos, repl_t, target)
+        new_den = _compose_poly(self._den, src_names, name_pos, repl_t, target)
+        return new_num / new_den
+
+    def compose_multi(
+        self, mapping: Mapping[str, "RationalFunction"]
+    ) -> "RationalFunction":
+        """Substitute several generators at once (see :meth:`compose`).
+
+        Each ``repl`` must be over generators *disjoint* from ``mapping``'s
+        keys (the substituted names), so the substitutions are independent
+        and order-insensitive.  Names absent from ``self.gens`` are skipped.
+        """
+        result = self
+        for name, repl in mapping.items():
+            if name in result._ring.names:
+                result = result.compose(name, repl)
+        return result
+
     def _eval_constant_to_float(self) -> float:
         n = self._num if not coeff_zero(self._num) else self._ring.zero
         d = self._den
@@ -836,17 +888,67 @@ def _partial_substitute(
                 continue
             name = src_names[src_pos]
             if name in bindings:
-                c = c * (float(bindings[name]) ** exp)
+                c = c * (float(bindings[name]) ** int(exp))
         if not n_left:
             key: tuple[int, ...] = ()
         else:
-            key = tuple(monom[src_pos] for src_pos in leftover_idx_in_src)
+            key = tuple(int(monom[src_pos]) for src_pos in leftover_idx_in_src)
         prev = new_dict.get(key)
         new_dict[key] = c if prev is None else prev + c
     if not n_left:
         const = new_dict.get((), 0.0)
         return target.ground_new(const)
     return target.from_dict(new_dict) if new_dict else target.zero
+
+
+def _compose_poly(
+    poly: Poly,
+    src_names: tuple[str, ...],
+    name_pos: int,
+    repl_t: "RationalFunction",
+    target: Ring,
+) -> "RationalFunction":
+    """Substitute the generator at ``name_pos`` with ``repl_t`` in ``poly``.
+
+    The symbolic analogue of :func:`_partial_substitute`: iterate ``poly``'s
+    terms once; each term is ``coeff · (leftover monomial) · name**exp``.  The
+    leftover monomial (and the coefficient folded in) is built directly in the
+    target ring, the bound generator's ``name**exp`` is the RF power
+    ``repl_t**exp``, and the term RFs are summed.  ``repl_t`` is assumed already
+    lifted into ``target``.
+    """
+    target_names = target.names
+    n_tgt = len(target_names)
+    tgt_index = {nm: i for i, nm in enumerate(target_names)}
+    result = RationalFunction.constant(0, target)
+    pow_cache: dict[int, RationalFunction] = {
+        0: RationalFunction.constant(1, target)
+    }
+
+    def repl_pow(e: int) -> "RationalFunction":
+        p = pow_cache.get(e)
+        if p is None:
+            p = repl_t ** e
+            pow_cache[e] = p
+        return p
+
+    for monom, coeff in poly.terms():
+        c = _coeff_to_float(coeff)
+        if c == 0.0:
+            continue
+        exp_name = int(monom[name_pos])
+        if n_tgt == 0:
+            mono = RationalFunction.constant(c, target)
+        else:
+            tgt_exp = [0] * n_tgt
+            for src_pos, exp in enumerate(monom):
+                if exp == 0 or src_pos == name_pos:
+                    continue
+                tgt_exp[tgt_index[src_names[src_pos]]] += int(exp)
+            mono = RationalFunction.from_poly(target.from_dict({tuple(tgt_exp): c}))
+        term = mono if not exp_name else mono * repl_pow(exp_name)
+        result = result + term
+    return result
 
 
 # ---------------------------------------------------------------------------

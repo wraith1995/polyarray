@@ -292,17 +292,31 @@ def _try_descend(
 # Entry points
 # ---------------------------------------------------------------------------
 
-def specialize(program: Program, *, bind: Mapping[str, Any] | None = None) -> Program:
-    """Partially evaluate ``program`` against optional numeric ``bind`` values.
+def specialize(
+    program: Program,
+    *,
+    bind: Mapping[str, Any] | None = None,
+    subs: Mapping[str, Any] | None = None,
+    sparsity: bool = False,
+    budget: Any = None,
+) -> Program:
+    """Partially evaluate ``program`` against optional ``subs`` / ``bind`` values.
 
-    Folds every build-time-numeric subcomputation, drops the Stmts that produced
-    it, and drops inputs replaced by a ``bind`` value.  When a surviving
-    sub-Program / ``CallOp`` Stmt has a *partial* numeric binding (P6), descends
-    into its body — specializing it with the numeric operands bound to the body's
-    inputs and shrinking the Stmt to the still-symbolic operands.
+    * ``subs`` — replace an input with an **expression over other inputs**
+      (symbolic argument substitution, P3).  Applied first: each substituted
+      input's per-cell atoms are rewritten throughout the program via
+      :meth:`RationalFunction.compose`, then the input is dropped.
+    * ``bind`` — replace an input with a **concrete numeric** array; folds every
+      build-time-numeric subcomputation, drops the producing Stmts, and (P6)
+      descends into a partially-numeric sub-Program / ``CallOp`` body.
+
+    ``sparsity`` and ``budget`` are accepted for signature stability but are
+    no-op passthrough here (a parallel branch — P4/P5 — implements them).
     Exactness-preserving.
     """
-    return _specialize(program, dict(bind or {}), 0, frozenset())
+    # P5: budget applied elsewhere; sparsity handled by the P4 branch.
+    prog = substitute(program, subs) if subs else program
+    return _specialize(prog, dict(bind or {}), 0, frozenset())
 
 
 def _specialize(
@@ -378,3 +392,149 @@ def fold_numeric(program: Program) -> Program:
 def bind_inputs(program: Program, bind: Mapping[str, Any]) -> Program:
     """Replace inputs with concrete numeric arrays, then fold and drop them."""
     return specialize(program, bind=bind)
+
+
+# ---------------------------------------------------------------------------
+# P3: symbolic argument substitution (`subs`)
+# ---------------------------------------------------------------------------
+
+def _as_rf(value: Any) -> RationalFunction:
+    """Coerce a cell value (RF / numeric) to a :class:`RationalFunction`."""
+    if isinstance(value, RationalFunction):
+        return value
+    if isinstance(value, (int, float)):
+        return RationalFunction.constant(float(value))
+    raise TypeError(f"substitute expression cell must be RF/numeric; got {value!r}")
+
+
+def _build_subs_map(
+    in_sa: SymArray, expr: Any,
+) -> tuple[dict[str, RationalFunction], np.ndarray]:
+    """Map each cell-atom of the substituted input to its replacement RF.
+
+    Returns ``(gen_name -> repl_rf, composed_input_cells)`` where the second is
+    the input's cells with each atom replaced by its expression cell (used to
+    rewrite any direct ``InputRef`` to the dropped input).
+    """
+    if in_sa._bulk is not None:
+        raise NotImplementedError("substitute of a bulk/dynamic input is unsupported")
+    cells = np.asarray(in_sa.cells)
+    is_array_expr = isinstance(expr, SymArray)
+    if is_array_expr:
+        ecells = np.asarray(expr.cells)
+        if tuple(ecells.shape) != tuple(cells.shape):
+            raise ValueError(
+                f"substitute expression shape {ecells.shape} != input shape {cells.shape}"
+            )
+    subs_map: dict[str, RationalFunction] = {}
+    composed = np.empty(cells.shape, dtype=object)
+    shape = cells.shape
+    for idx in (np.ndindex(*shape) if shape else [()]):
+        cell = cells[idx] if shape else cells[()]
+        repl = _as_rf(ecells[idx] if shape else ecells[()]) if is_array_expr else _as_rf(expr)
+        if isinstance(cell, RationalFunction):
+            subs_map[cell.gens[0]] = repl
+        composed[idx] = repl
+    return subs_map, composed
+
+
+def _compose_cells(cells: np.ndarray, subs_map: Mapping[str, RationalFunction]) -> np.ndarray:
+    """Apply :meth:`RationalFunction.compose_multi` to every RF cell."""
+    cells = np.asarray(cells)
+    if cells.dtype.kind == "f":
+        return cells.copy()
+    out = np.empty(cells.shape, dtype=object)
+    shape = cells.shape
+    for idx in (np.ndindex(*shape) if shape else [()]):
+        c = cells[idx] if shape else cells[()]
+        if isinstance(c, RationalFunction):
+            v = c.compose_multi(subs_map)
+        else:
+            v = c
+        if shape:
+            out[idx] = v
+        else:
+            out[()] = v
+    return out
+
+
+def _compose_symarray(
+    sa: SymArray, subs_map: Mapping[str, RationalFunction], program: Program, name: str | None,
+) -> SymArray:
+    """Rewrite a SymArray's cells under ``subs_map`` (bulk arrays pass through)."""
+    if sa._bulk is not None:
+        return sa  # a bulk handle holds no per-cell substituted-input atoms
+    return SymArray(_compose_cells(np.asarray(sa.cells), subs_map), program=program, name=name)
+
+
+def _compose_ref(
+    ref: Any,
+    subs_map: Mapping[str, RationalFunction],
+    composed_inputs: Mapping[str, np.ndarray],
+) -> Any:
+    """Rewrite a Stmt input ref under ``subs_map``.
+
+    Cells that carry the substituted input's atoms — ``SymArrayRef`` /
+    ``RationalRef`` — are composed.  A direct ``InputRef`` to a dropped input is
+    rewritten to a ``SymArrayRef`` over the input's composed expression cells (so
+    the dropped input never needs to be bound at run time).
+    """
+    if isinstance(ref, SymArrayRef):
+        if ref._bulk is not None:
+            return ref
+        return SymArrayRef(_compose_cells(np.asarray(ref.cells), subs_map))
+    if isinstance(ref, RationalRef):
+        return RationalRef(ref.rf.compose_multi(subs_map))
+    if isinstance(ref, InputRef) and ref.name in composed_inputs:
+        cells = composed_inputs[ref.name]
+        sub = cells[ref.indices] if ref.indices else cells
+        return SymArrayRef(np.asarray(sub, dtype=object))
+    return ref  # OutputRef / Const / IntAtomRef / InputRef over a live input
+
+
+def substitute(program: Program, subs: Mapping[str, Any]) -> Program:
+    """Replace inputs with expressions over the program's *other* inputs.
+
+    ``subs`` maps an input name to a :class:`SymArray` (per-cell, shape-matched)
+    or a :class:`RationalFunction` (broadcast to every cell) whose generators are
+    the program's OTHER existing input atoms.  Each substituted input's per-cell
+    atom ``g`` is replaced everywhere it appears — program outputs and Stmt-input
+    ``SymArrayRef`` / ``RationalRef`` / ``InputRef`` cells — via
+    :meth:`RationalFunction.compose`, after which the input is dropped from
+    :attr:`Program.inputs` / :attr:`Program.input_arrays`.
+
+    Exactness: ``substitute(p, {b: expr}).run(rest) ==
+    p.run({**rest, b: expr_evaluated_at(rest)})``.  Read-only on ``program``.
+    """
+    if not subs:
+        return program.copy()
+    new = program.copy()
+    subs_map: dict[str, RationalFunction] = {}
+    composed_inputs: dict[str, np.ndarray] = {}
+    dropped: set[str] = set()
+    for name, expr in subs.items():
+        if name not in new.input_arrays:
+            raise KeyError(f"unknown input {name!r}; have {list(new.input_arrays)}")
+        gmap, composed = _build_subs_map(new.input_arrays[name], expr)
+        subs_map.update(gmap)
+        composed_inputs[name] = composed
+        dropped.add(name)
+
+    new.statements = [
+        Stmt(
+            fn=s.fn,
+            in_=tuple(_compose_ref(r, subs_map, composed_inputs) for r in s.in_),
+            out=s.out,
+            note=s.note,
+            provenance=s.provenance,
+            inline=s.inline,
+        )
+        for s in new.statements
+    ]
+    new.outputs = {
+        k: _compose_symarray(sa, subs_map, new, k) for k, sa in new.outputs.items()
+    }
+    new.inputs = tuple(inp for inp in new.inputs if inp.name not in dropped)
+    for nm in dropped:
+        new.input_arrays.pop(nm, None)
+    return new
