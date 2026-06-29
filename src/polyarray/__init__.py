@@ -57,6 +57,7 @@ from .int_atom import IntAtom
 
 # --- IR passes --------------------------------------------------------------
 from .forward import analyze, partial_eval
+from .simplify import specialize, fold_numeric, bind_inputs
 
 # --- Code generation --------------------------------------------------------
 from .numpy_source import to_numpy_source
@@ -98,6 +99,9 @@ __all__ = [
     # IR passes
     "analyze",
     "partial_eval",
+    "specialize",
+    "fold_numeric",
+    "bind_inputs",
     # code generation
     "to_numpy_source",
 ]
