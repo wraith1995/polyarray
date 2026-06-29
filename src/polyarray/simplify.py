@@ -21,8 +21,10 @@ tuples, so the pass builds *fresh* folded cells/refs rather than rewriting in
 place.  Exactness: ``fold_numeric(p, bind=b).run(rest) == p.run({**b, **rest})``.
 
 Conservative by construction — anything not confidently foldable (bulk / dynamic
-outputs, sub-Program fns, control-flow ops) is kept symbolic, so the worst case
-degrades to ``copy()``.
+outputs, control-flow ops) is kept symbolic, so the worst case degrades to
+``copy()``.  A partially-numeric sub-Program / ``CallOp`` Stmt is *descended*
+into (P6): its body is recursively specialized with the numeric operands bound,
+shrinking the Stmt to the still-symbolic operands.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from .ir import (
+    CallOp,
     Const,
     InputRef,
     IntAtomRef,
@@ -49,6 +52,11 @@ from .rational import RationalFunction
 # ``_exec_fn``).  ``SwitchOp`` is fine too: it only resolves once its IntAtom
 # selector is bound, otherwise its inputs stay symbolic and it survives.
 _SKIP_OP_NAMES = frozenset({"WhileOp"})
+
+# Recursion ceiling for P6 partial descent into nested sub-Program / CallOp
+# bodies.  Bodies are acyclic in practice; the ``seen`` set already breaks any
+# cycle, so this is a belt-and-braces cap against pathological nesting.
+_MAX_DESCENT_DEPTH = 32
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +211,84 @@ def _record_known(stmt: Stmt, outs: list[Any], known: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# P6: partial descent into nested sub-Program / CallOp bodies
+# ---------------------------------------------------------------------------
+
+def _descent_body(fn: Any) -> tuple[Program, Any] | None:
+    """If ``fn`` has a directly-positional body Program, return it plus a
+    re-wrapper that rebuilds an ``fn`` from a specialized body; else ``None``.
+
+    Only the cases where operands map to the body's inputs *by position with
+    matching shapes* and an ``fn``-swap is exactly equivalent are descendable:
+
+    * a raw sub-:class:`Program` (``_run_stmt`` runs it via ``zip(inputs, ops)``);
+    * a :class:`CallOp` wrapping a Program (``_invoke`` maps by position too).
+
+    A genuine ``vmap`` closure is **not** descendable here: its operands carry a
+    batch axis (and ``in_axes=None`` broadcasts), so they do NOT match the body
+    inputs by shape, and replacing the closure with the bare body would drop the
+    batching.  Such Stmts (and ``WhileOp``, opaque callables) return ``None`` and
+    stay symbolic — the conservative degrade.
+    """
+    if isinstance(fn, Program):
+        return fn, (lambda body: body)
+    if isinstance(fn, CallOp) and isinstance(fn.fn, Program):
+        return fn.fn, (lambda body: CallOp(fn=body))
+    return None
+
+
+def _try_descend(
+    prog: Program,
+    s: Stmt,
+    stmt_idx: int,
+    known: Mapping[str, float],
+    idx_map: Mapping[int, int],
+    depth: int,
+    seen: frozenset[int],
+) -> tuple[Any, tuple[Any, ...]] | None:
+    """Attempt P6 partial descent on a surviving Stmt ``s``.
+
+    Returns ``(new_fn, new_in)`` when ``s`` has a descendable body, SOME (not
+    all, not none) of its operands resolve numeric, and the specialized body
+    drops exactly those operands' inputs.  Returns ``None`` to fall back to the
+    plain symbolic ref-fold (today's behaviour) in every other case.
+    """
+    info = _descent_body(s.fn)
+    if info is None:
+        return None
+    body, rewrap = info
+    if id(body) in seen:
+        return None  # cycle guard — a body reaching itself / an ancestor
+    if len(s.in_) != len(body.inputs):
+        return None  # arity must line up to bind operands -> body inputs
+    numeric_bind: dict[str, Any] = {}
+    symbolic_idx: list[int] = []
+    for k, r in enumerate(s.in_):
+        v = _try_eval_ref(prog, r, stmt_idx, known)
+        if v is None:
+            symbolic_idx.append(k)
+        else:
+            numeric_bind[body.inputs[k].name] = v
+    if not numeric_bind or not symbolic_idx:
+        # none numeric -> normal symbolic path; all numeric -> the fold loop
+        # already handled it (or it raised, in which case keep it whole).
+        return None
+    try:
+        spec_body = _specialize(body, numeric_bind, depth + 1, seen | {id(body)})
+    except Exception:
+        return None  # bulk/dynamic bind, shape mismatch, ... -> degrade
+    remaining = [inp.name for inp in spec_body.inputs]
+    kept = [body.inputs[k].name for k in symbolic_idx]
+    if remaining != kept:
+        return None  # specialized body didn't drop exactly the bound inputs
+    new_fn = rewrap(spec_body)
+    new_in = tuple(
+        _fold_ref(prog, s.in_[k], stmt_idx, known, idx_map) for k in symbolic_idx
+    )
+    return new_fn, new_in
+
+
+# ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
 
@@ -210,10 +296,25 @@ def specialize(program: Program, *, bind: Mapping[str, Any] | None = None) -> Pr
     """Partially evaluate ``program`` against optional numeric ``bind`` values.
 
     Folds every build-time-numeric subcomputation, drops the Stmts that produced
-    it, and drops inputs replaced by a ``bind`` value.  Exactness-preserving.
+    it, and drops inputs replaced by a ``bind`` value.  When a surviving
+    sub-Program / ``CallOp`` Stmt has a *partial* numeric binding (P6), descends
+    into its body — specializing it with the numeric operands bound to the body's
+    inputs and shrinking the Stmt to the still-symbolic operands.
+    Exactness-preserving.
     """
+    return _specialize(program, dict(bind or {}), 0, frozenset())
+
+
+def _specialize(
+    program: Program,
+    bind: Mapping[str, Any],
+    depth: int,
+    seen: frozenset[int],
+) -> Program:
     new = program.copy()
-    known, dropped = _seed_bind(new, bind or {})
+    known, dropped = _seed_bind(new, bind)
+    # Guard self / ancestor reference for any descent spawned below.
+    seen_here = seen | {id(program), id(new)}
 
     foldable: set[int] = set()
     for i, stmt in enumerate(new.statements):
@@ -243,9 +344,16 @@ def specialize(program: Program, *, bind: Mapping[str, Any] | None = None) -> Pr
     new_statements: list[Stmt] = []
     for i in survivors:
         s = new.statements[i]
-        new_in = tuple(_fold_ref(new, r, i, known, idx_map) for r in s.in_)
+        descended = None
+        if depth < _MAX_DESCENT_DEPTH and _simple_stmt(s):
+            descended = _try_descend(new, s, i, known, idx_map, depth, seen_here)
+        if descended is not None:
+            new_fn, new_in = descended
+        else:
+            new_fn = s.fn
+            new_in = tuple(_fold_ref(new, r, i, known, idx_map) for r in s.in_)
         new_statements.append(
-            Stmt(fn=s.fn, in_=new_in, out=s.out, note=s.note,
+            Stmt(fn=new_fn, in_=new_in, out=s.out, note=s.note,
                  provenance=s.provenance, inline=s.inline)
         )
     new.statements = new_statements
