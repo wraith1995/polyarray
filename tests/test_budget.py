@@ -291,11 +291,13 @@ def test_total_mass_high_is_noop() -> None:
 # presets + passthrough params
 # ---------------------------------------------------------------------------
 
-def test_subs_sparsity_passthrough_noop() -> None:
+def test_sparsity_passthrough_noop() -> None:
     p = _poly_program()
     x = {"a": np.array([1.0, 2.0, 3.0])}
-    # accepted for API parity, no effect in this slice.
-    out = specialize(p, subs={"ignored": None}, sparsity=True)
+    # ``sparsity`` is accepted for API parity but is a separate pass (P4) — it has
+    # no effect on the program specialize() returns.  (``subs`` is now a real
+    # transform post-merge; see tests/test_substitute.py.)
+    out = specialize(p, sparsity=True)
     np.testing.assert_allclose(out.run(x)["out"], p.run(x)["out"])
 
 
