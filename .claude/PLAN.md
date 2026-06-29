@@ -49,12 +49,25 @@ The pass is chartLib's long-specified, never-built "build-then-simplify". Additi
 - [x] **Merged + verified**: both branches merged into `simplify`; combined suite
       **77 passed / 1 skipped**; fold+sparsity compose (smoke-tested). Only overlap was
       `.gitignore` (auto-merged). Feature worktrees can be pruned.
-- [ ] P3 symbolic `subs` + `RationalFunction.compose` (RF→RF substitution, the remaining
-      requirement-2 piece: replace an arg with an expression over OTHER args).
-- [ ] P5 `SimplifyBudget` (collapse↔expose moderation; see plan 01).
-- [ ] P4 sparsity propagation + `block_zero_mask` (oracle M3 consumer).
-- [ ] P5 `SimplifyBudget` + moderation procedure (collapse ceilings, `expose`,
-      `den_degree_max`, `keep_provenance`, `analyze→budget→specialize` seam) — see plan 01.
+- [x] **P3 symbolic subs** (merged from `simplify-p3`): `RationalFunction.compose`/
+      `compose_multi` (RF→RF via ring arithmetic, no sympy.subs; generalizes
+      `_partial_substitute`, +fixed a latent flint fmpz-exponent bug) and
+      `substitute(program, subs)` + `subs=` path in `specialize` (replace an arg with an
+      expression over OTHER args, drops the arg). `tests/test_substitute.py`: 16 tests.
+- [x] **P5 SimplifyBudget** (merged from `simplify-p5`): new `src/polyarray/budget.py` —
+      `SimplifyBudget` (max_cell_mass/total_mass/expose/den_degree_max/keep_provenance/
+      inherit_freeze) + presets (none/legacy, numeric_only, balanced, expose_symbols) +
+      `_apply_budget`. Collapse via IdentityOp capture (subsumes `partial_eval`;
+      `numeric_only()==partial_eval(max_cell_size=0)` asserted), keep_provenance protect,
+      den_degree extraction (try_cancel), total_mass greedy. expose="never" full;
+      if_under_budget/always documented best-effort no-op (nothing unsound).
+      `tests/test_budget.py`: 26 tests.
+- [x] **P3+P5 merged + verified**: reconciled `specialize` (signature `bind/subs/sparsity/
+      budget`; order = subs → fold/descent → budget) and `__init__`; fixed one merge-
+      semantic test (subs is now real, not passthrough). Combined suite **119 passed /
+      1 skipped**. Smoke-tested subs→budget→bind compose to an exact number.
+- [ ] FUTURE: expose-direction re-expansion (chartLib todo.md:87), partial_eval nested-body
+      descent, oracle M3 consumer wiring, pointwise integration (replace hand-rolled walker).
 - [ ] P6 nested-body descent + pointwise integration.
 
 ## Key anchors
