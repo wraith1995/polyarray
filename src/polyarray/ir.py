@@ -147,16 +147,25 @@ class SymbolEnv:
 class SymInput:
     """A flat, atom-per-cell descriptor for a named symbolic input.
 
-    See plan §1.4: every :class:`SymInput` allocates *one atom per
+    See plan §1.4: a *static* :class:`SymInput` allocates *one atom per
     cell* of its declared shape — there is no granularity knob.  The
     ``provenance`` field is either a fixed :class:`Provenance` (used
     for every cell, with the cell's own index appended) or a callable
     mapping a cell index to its :class:`Provenance` for fully custom
     labelling.
+
+    **Dynamic inputs (Stage C).** A ``shape`` entry may be a
+    :class:`DimAtom` (an axis whose size is known only at run time — e.g. an
+    FFS-typed Grassmann input ``a : Λᵏ`` whose dimension ``δ`` is a runtime
+    rank).  Such an input is *dynamic* (:func:`is_dynamic`); it does **not**
+    enumerate per-cell atoms but is allocated as a single **bulk**
+    :class:`SymArray` whose axis sizes are read from the provided array at
+    :meth:`Program.run` time and bound into ``dim_bindings``.  Static inputs
+    are unchanged (byte-identical).
     """
 
     name: str
-    shape: tuple[int, ...]
+    shape: tuple[int | DimAtom, ...]
     provenance: "Provenance | Callable[[tuple[int, ...]], Provenance]"
 
 
@@ -324,6 +333,32 @@ class SymbolicBudget:
             **overrides,
         )
 
+    @classmethod
+    def force_stmts(cls, **overrides: Any) -> "SymbolicBudget":
+        """The "no symbolic budget" preset: drive every modeled op to a Stmt.
+
+        The opposite of :meth:`build_big_symbols`: rather than retaining
+        closed-form rational structure, this forces every modeled op to
+        emit an imperative :class:`Stmt` (no closed-form rational lane), so
+        Grassman's symbolic inputs flow through as deferred Stmts that are
+        simplified afterward (the build-then-simplify novelty).
+
+        * ``naive_inverse_max_size=0`` / ``inverse_max_degree=0`` — every
+          ``det`` / ``inverse`` is over-budget ⇒ emits a Stmt.
+        * ``einsum_bag_threshold=1`` — every multi-operand symbolic einsum
+          offloads to a numeric Stmt.
+        * ``freeze=True`` — cap any residual cell to an atom.
+
+        Extra ``overrides`` are forwarded to the constructor.
+        """
+        return cls(
+            naive_inverse_max_size=0,
+            inverse_max_degree=0,
+            einsum_bag_threshold=1,
+            freeze=True,
+            **overrides,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Refs
@@ -401,10 +436,13 @@ class BulkOut:
     the bulk tensor into the usual per-cell atom array.
 
     ``name`` is the run-time binding key; ``shape`` is the tensor shape.
+    For a *dynamic* bulk output (Stage B) ``shape`` may carry
+    :class:`DimAtom` entries (the symbolic shape); the concrete axis sizes
+    are resolved at :meth:`Program.run` time.
     """
 
     name: str
-    shape: tuple[int, ...]
+    shape: tuple[int | DimAtom, ...]
 
 
 class SymArrayRef:
@@ -454,6 +492,94 @@ Ref = Union[InputRef, OutputRef, Const, RationalRef, SymArrayRef, IntAtomRef]
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class DimAtom:
+    """A runtime array dimension produced by a :class:`Stmt` output or input.
+
+    Unlike :class:`IntAtom` (a pre-declared integer-valued *input*), a
+    ``DimAtom`` is an integer resolved at :meth:`Program.run` time.  It may be
+    used as an entry in an :class:`OutSpec.shape` / :class:`SymInput.shape`,
+    making that shape **dynamic**: the axis size is resolved at run time from
+    the bound value of its source.
+
+    * ``name`` — provenance, e.g. ``"rank:Alt"``.
+    * ``source`` — a *tagged* hashable tuple identifying the run-time origin
+      of the dimension and used as the ``dim_bindings`` key:
+
+      - ``("stmt", stmt_idx, out_idx)`` — a prior Stmt output (Stage B), e.g.
+        the ``rank`` (δ_f) output of an :class:`SvdOp`.
+      - ``("in", input_name, axis)`` — an axis of a dynamic :class:`SymInput`
+        (Stage C); resolved from the provided array's actual shape.
+
+    Backward-compat shim: a bare 2-tuple ``(stmt_idx, out_idx)`` (Stage B's
+    original form) is normalised to ``("stmt", stmt_idx, out_idx)`` so old
+    callers keep working and the key still matches the binder.
+
+    Frozen so it hashes by value (usable as a dict key and in a shape
+    tuple alongside concrete ints).
+    """
+
+    name: str
+    source: tuple[Any, ...]
+
+    def __post_init__(self) -> None:
+        src = self.source
+        # Compat shim: normalise the Stage-B 2-tuple (stmt_idx, out_idx) to the
+        # tagged ("stmt", stmt_idx, out_idx) form so it matches the binder key.
+        if (
+            len(src) == 2
+            and isinstance(src[0], (int, np.integer))
+            and isinstance(src[1], (int, np.integer))
+        ):
+            object.__setattr__(
+                self, "source", ("stmt", int(src[0]), int(src[1]))
+            )
+        else:
+            object.__setattr__(self, "source", tuple(src))
+
+    @staticmethod
+    def from_input(name: str, input_name: str, axis: int) -> "DimAtom":
+        """Construct an input-axis ``DimAtom`` (Stage C)."""
+        return DimAtom(name=name, source=("in", input_name, int(axis)))
+
+
+def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool:
+    """True iff any entry of ``shape`` is a :class:`DimAtom` (a runtime dim).
+
+    The single gate that routes a shape away from the static per-cell
+    build-time path (cell-atom allocation, ``np.ndindex``, cell-size math)
+    and into the dynamic bulk lane.  A fully-concrete shape is *not*
+    dynamic, so static-shape programs hit none of the dynamic branches and
+    remain byte-identical.
+    """
+    return any(isinstance(d, DimAtom) for d in shape)
+
+
+def _resolve_shape(
+    shape: tuple[int | DimAtom, ...],
+    dim_bindings: "Mapping[tuple[Any, ...], int]",
+) -> tuple[int, ...]:
+    """Substitute each :class:`DimAtom` in ``shape`` with its bound int.
+
+    Concrete entries pass through unchanged.  A ``DimAtom`` whose source
+    output has not yet been bound raises ``KeyError`` — the producing Stmt
+    must run before any consumer that uses its dimension (guaranteed by
+    Stmt ordering).
+    """
+    out: list[int] = []
+    for d in shape:
+        if isinstance(d, DimAtom):
+            if d.source not in dim_bindings:
+                raise KeyError(
+                    f"DimAtom {d.name!r}: dimension from output {d.source} "
+                    f"not yet bound at run time"
+                )
+            out.append(int(dim_bindings[d.source]))
+        else:
+            out.append(int(d))
+    return tuple(out)
+
+
+@dataclass(frozen=True)
 class OutSpec:
     """Declaration of one Stmt output: a name and a shape.
 
@@ -461,10 +587,16 @@ class OutSpec:
     allocated for each cell of the declared shape.  The ``name`` is
     used as the provenance label prefix for the allocated atoms — it
     surfaces in repr / debug output.
+
+    ``shape`` entries are ordinarily ``int``; an entry may also be a
+    :class:`DimAtom` (a runtime dimension produced by a prior Stmt
+    output), making the shape **dynamic** — see :func:`is_dynamic`.  A
+    dynamic output is always emitted bulk (whole-tensor), its axis sizes
+    resolved at :meth:`Program.run` time.
     """
 
     name: str
-    shape: tuple[int, ...] = ()
+    shape: tuple[int | DimAtom, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +699,12 @@ class SymArray:
         return self.cells.astype(dtype)
 
     @property
-    def shape(self) -> tuple[int, ...]:
+    def shape(self) -> tuple[int | DimAtom, ...]:
+        # A dynamic bulk array (an axis sized by a runtime ``DimAtom``) has a
+        # 0-d placeholder ``_cells``; its build-time shape is the symbolic
+        # ``_bulk.shape`` (may carry ``DimAtom`` entries — see B6).
+        if self._bulk is not None and is_dynamic(self._bulk.shape):
+            return self._bulk.shape
         return self._cells.shape
 
     @property
@@ -943,6 +1080,211 @@ class SignOp:
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         return np.sign(np.asarray(x, dtype=float))
+
+
+@dataclass(frozen=True)
+class SvdOp:
+    """Stmt-compatible ``np.linalg.svd`` plus a thresholded numerical rank.
+
+    Multi-output: returns ``(U, S, Vh, rank)`` where ``rank`` is a 0-d
+    integer ndarray giving the numerical rank of ``A`` at tolerance
+    ``rcond`` (defaulting to numpy's ``matrix_rank`` rule).  The ``rank``
+    output is the runtime dimension ``δ_f`` consumed as a :class:`DimAtom`
+    (Stage B) — sizing image / projected / FFS arrays at run time.
+
+    ``full_matrices=False`` (the default) yields the reduced SVD, matching
+    the orthonormal-basis use; ``rcond`` mirrors ``np.linalg.matrix_rank``.
+    """
+
+    rcond: float | None = None
+    full_matrices: bool = False
+
+    def __call__(self, A: np.ndarray) -> tuple[np.ndarray, ...]:
+        A = np.asarray(A, dtype=float)
+        U, S, Vh = np.linalg.svd(A, full_matrices=self.full_matrices)
+        if S.size == 0:
+            rank = 0
+        elif self.rcond is None:
+            tol = S.max() * max(A.shape) * np.finfo(float).eps
+            rank = int((S > tol).sum())
+        else:
+            tol = self.rcond * S.max()
+            rank = int((S > tol).sum())
+        return U, S, Vh, np.asarray(rank)
+
+
+@dataclass(frozen=True)
+class GSvdOp:
+    """Metric-aware generalised SVD of a map ``A : V → W``.
+
+    Multi-output: returns ``(U, UI, V, VI, S, rank)``.  ``A`` is the
+    ``|W|×|V|`` matrix of the map; ``M_V`` (``|V|×|V|`` SPD) is the domain
+    inner-product / metric and ``M_W`` (``|W|×|W|`` SPD) the codomain metric.
+
+    The factors are orthonormal **in the respective metrics** and split into
+    the four-fundamental-subspace (FFS) blocks at the numerical ``rank``
+    (``δ_f``), exactly as in `50 §A1`/`§A5`:
+
+    =======  ===============================  ========================
+    output   columns                          FFS block / property
+    =======  ===============================  ========================
+    ``U``    first ``rank`` cols of the        **image** basis of ``A`` in
+             codomain factor                   ``W``; ``Uᵀ M_W U = I``
+    ``UI``   remaining ``|W|−rank`` cols        **coker** basis (``M_W``-⊥
+                                               complement of the image)
+    ``V``    first ``rank`` cols of the        **coimg** basis of ``A`` in
+             domain factor                     ``V``; ``Vᵀ M_V V = I``
+    ``VI``   remaining ``|V|−rank`` cols        **ker** basis (``A·VI ≈ 0``)
+    ``S``    descending singular values        the ``rank`` nonzero ones lead
+    ``rank`` 0-d int ndarray                   numerical rank ``δ_f``
+    =======  ===============================  ========================
+
+    Both ``U`` (``=[U|UI]``) and ``V`` (``=[V|VI]``) are returned as the
+    leading (image / coimg) blocks only; ``UI`` / ``VI`` carry the
+    complementary (coker / ker) blocks — so the full metric-orthonormal
+    factors are the horizontal concatenations ``[U, UI]`` and ``[V, VI]``.
+
+    **Construction.**  Whiten ``A`` by the Cholesky factors of the two
+    metrics (``M_W = Lw Lwᵀ``, ``M_V = Rw Rwᵀ``)::
+
+        Aw = Lwᵀ · A · Rw⁻ᵀ            # both spaces now orthonormal
+        Ũ, S, Ṽᵀ = svd(Aw)            # ordinary SVD in white coords
+
+    then de-whiten the factors back into the metrics::
+
+        [U|UI] = Lw⁻ᵀ · Ũ             # ⇒ ([U|UI])ᵀ M_W ([U|UI]) = I
+        [V|VI] = Rw⁻ᵀ · Ṽ             # ⇒ ([V|VI])ᵀ M_V ([V|VI]) = I
+
+    **Reconstruction identity** (note the trailing ``M_V`` — the dual
+    pairing makes the coordinates contravariant)::
+
+        A = U · diag(S[:rank]) · Vᵀ · M_V
+          = [U|UI] · Sfull · [V|VI]ᵀ · M_V        # full form
+
+    where ``Sfull`` is the ``|W|×|V|`` rectangular-diagonal padding of ``S``.
+
+    **Reduction to** :class:`SvdOp`.  With ``M_V = M_W = I`` the Cholesky
+    factors are the identity, ``U = Ũ``, ``V = Ṽ``, and the identity above
+    collapses to ``A = U diag(S) Vᵀ`` — i.e. ``Vᵀ`` is :class:`SvdOp`'s
+    ``Vh`` and ``rank``/``S`` agree.  ``rcond`` mirrors ``SvdOp`` /
+    ``np.linalg.matrix_rank`` (threshold on the *whitened* singular values).
+    """
+
+    rcond: float | None = None
+
+    def __call__(
+        self, A: np.ndarray, M_V: np.ndarray, M_W: np.ndarray
+    ) -> tuple[np.ndarray, ...]:
+        A = np.asarray(A, dtype=float)
+        Lw = np.linalg.cholesky(np.asarray(M_W, dtype=float))  # M_W = Lw Lwᵀ
+        Rw = np.linalg.cholesky(np.asarray(M_V, dtype=float))  # M_V = Rw Rwᵀ
+        Aw = Lw.T @ A @ np.linalg.inv(Rw.T)  # whiten both spaces
+        Ut, S, Vth = np.linalg.svd(Aw, full_matrices=True)
+        if S.size == 0:
+            rank = 0
+        elif self.rcond is None:
+            tol = S.max() * max(Aw.shape) * np.finfo(float).eps
+            rank = int((S > tol).sum())
+        else:
+            tol = self.rcond * S.max()
+            rank = int((S > tol).sum())
+        # De-whiten the factors back into the two metrics:
+        #   [U|UI] = Lw⁻ᵀ Ũ   so ([U|UI])ᵀ M_W ([U|UI]) = I
+        #   [V|VI] = Rw⁻ᵀ Ṽ   so ([V|VI])ᵀ M_V ([V|VI]) = I
+        U_full = np.linalg.solve(Lw.T, Ut)
+        V_full = np.linalg.solve(Rw.T, Vth.T)
+        # Split into image/coimg (first ``rank``) vs coker/ker (complement):
+        U, UI = U_full[:, :rank], U_full[:, rank:]
+        V, VI = V_full[:, :rank], V_full[:, rank:]
+        return U, UI, V, VI, S, np.asarray(rank)
+
+
+@dataclass(frozen=True)
+class QrOp:
+    """Stmt-compatible ``np.linalg.qr`` over a bound numeric matrix.
+
+    Multi-output: returns ``(Q, R)``.  ``mode`` follows numpy's QR modes
+    (``"reduced"`` by default — the orthonormal-basis / image use).
+    """
+
+    mode: str = "reduced"
+
+    def __call__(self, A: np.ndarray) -> tuple[np.ndarray, ...]:
+        Q, R = np.linalg.qr(np.asarray(A, dtype=float), mode=self.mode)
+        return Q, R
+
+
+def _check(ok: bool, msg: str, detail: str = "") -> None:
+    """Raise ``AssertionError(msg + detail)`` unless ``ok``."""
+    if not ok:
+        raise AssertionError(msg + detail)
+
+
+def _is_spd(A: np.ndarray) -> bool:
+    """True iff ``A`` is symmetric positive-definite (numerically)."""
+    A = np.asarray(A, dtype=float)
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        return False
+    if not np.allclose(A, A.T):
+        return False
+    try:
+        np.linalg.cholesky(A)
+    except np.linalg.LinAlgError:
+        return False
+    return True
+
+
+def _full_rank(A: np.ndarray) -> bool:
+    """True iff ``A`` has full numerical rank (min of its two dims)."""
+    A = np.asarray(A, dtype=float)
+    if A.ndim != 2:
+        return False
+    return int(np.linalg.matrix_rank(A)) == min(A.shape)
+
+
+@dataclass(frozen=True)
+class AssertOp:
+    """Passthrough predicate check over bound inputs (the D-scope asserts).
+
+    Validates ``kind`` against the bound inputs and **returns the first
+    input unchanged**, so a downstream consumer data-depends on the assert
+    (preserving Stmt ordering).  Kinds:
+
+    * ``"shape_eq"``       — ``x.shape == rest[0].shape``
+    * ``"rank_eq"``        — ``int(rest[0]) == int(rest[1])`` (δ vs asserted)
+    * ``"spd"``            — ``x`` is symmetric positive-definite
+    * ``"square_full_rank"`` — ``x`` is square and full rank
+
+    On failure raises ``AssertionError(msg + detail)``; ``msg`` is the
+    caller-supplied prefix.
+    """
+
+    kind: str
+    msg: str = ""
+
+    def __call__(self, x: np.ndarray, *rest: np.ndarray) -> np.ndarray:
+        x = np.asarray(x)
+        if self.kind == "shape_eq":
+            other = np.asarray(rest[0])
+            _check(
+                x.shape == other.shape,
+                self.msg,
+                f"[shape_eq] {x.shape} != {other.shape}",
+            )
+        elif self.kind == "rank_eq":
+            a, b = int(rest[0]), int(rest[1])
+            _check(a == b, self.msg, f"[rank_eq] {a} != {b}")
+        elif self.kind == "spd":
+            _check(_is_spd(x), self.msg, "[spd] matrix not symmetric positive-definite")
+        elif self.kind == "square_full_rank":
+            _check(
+                x.ndim == 2 and x.shape[0] == x.shape[1] and _full_rank(x),
+                self.msg,
+                f"[square_full_rank] shape={x.shape}",
+            )
+        else:
+            raise ValueError(f"AssertOp: unknown kind {self.kind!r}")
+        return x
 
 
 @dataclass(frozen=True)
@@ -1869,6 +2211,13 @@ class Stmt:
 
     ``note`` is a human-readable provenance string.
 
+    ``provenance`` is an optional *structured* :class:`Provenance` describing
+    what produced this Stmt (e.g. a lowering front-end's algebra-centric node /
+    basis-choice record).  It is **purely descriptive metadata**: it is never
+    read by :meth:`run`/evaluation, so a program with ``provenance=None`` (the
+    default) is byte-identical to one before this field existed.  Preserved
+    across :meth:`Program.copy` (hence through ``partial_eval``).
+
     ``inline`` controls sub-Program composition (§1.3).  When ``True``
     the sub-program's rational outputs are spliced into the parent at
     construction time and this Stmt is dropped from the parent's
@@ -1879,6 +2228,7 @@ class Stmt:
     in_: tuple[Ref, ...]
     out: tuple[SymArray, ...]
     note: str = ""
+    provenance: Provenance | None = None
     inline: bool = False
 
 
@@ -1920,8 +2270,20 @@ class Program:
         self.inputs: tuple[SymInput, ...] = tuple(inputs)
         self.input_arrays: dict[str, SymArray] = {}
         for inp in self.inputs:
-            cells = allocate_input(self.env, inp)
-            self.input_arrays[inp.name] = SymArray(cells, program=self, name=inp.name)
+            if is_dynamic(inp.shape):
+                # Stage C: a dynamic (DimAtom-sized) input cannot enumerate
+                # per-cell atoms — allocate one whole-tensor bulk handle whose
+                # symbolic shape carries the DimAtom axes (resolved at run
+                # time from the provided array; see build_runtime_bindings).
+                cells = np.empty((), dtype=object)
+                sa = SymArray(cells, program=self, name=inp.name)
+                sa._bulk = BulkOut(name=inp.name, shape=tuple(inp.shape))
+                self.input_arrays[inp.name] = sa
+            else:
+                cells = allocate_input(self.env, inp)
+                self.input_arrays[inp.name] = SymArray(
+                    cells, program=self, name=inp.name
+                )
         self.statements: list[Stmt] = []
         self.outputs: dict[str, SymArray] = {}
         self.budget: SymbolicBudget = budget if budget is not None else SymbolicBudget()
@@ -1993,6 +2355,7 @@ class Program:
         out_specs: Sequence["OutSpec"],
         note: str = "",
         bulk: bool = True,
+        provenance: "Provenance | None" = None,
     ) -> tuple["SymArray", ...]:
         """Append an imperative :class:`Stmt` and return its outputs.
 
@@ -2027,7 +2390,10 @@ class Program:
 
         out_arrays: list[SymArray] = []
         for spec in out_specs:
-            if bulk:
+            dynamic = is_dynamic(spec.shape)
+            # A dynamic shape (an axis sized by a runtime ``DimAtom``) cannot
+            # enumerate per-cell atoms — force the whole-tensor bulk lane.
+            if bulk or dynamic:
                 # One whole-tensor handle, no per-cell atoms.  Placeholder
                 # cells (None) exist only for ``.shape``; they are never read
                 # per-cell — eval routes through ``_bulk`` (a per-cell read
@@ -2039,7 +2405,14 @@ class Program:
                         label=label_prefix + ":" + spec.name,
                     ),
                 )
-                cells = np.empty(spec.shape, dtype=object)
+                # A dynamic shape has no concrete placeholder array (a
+                # ``DimAtom`` axis is unknown until run time); use a 0-d
+                # object placeholder — ``.shape`` on a dynamic bulk array is
+                # the symbolic ``_bulk.shape`` (read via the override below).
+                if dynamic:
+                    cells = np.empty((), dtype=object)
+                else:
+                    cells = np.empty(spec.shape, dtype=object)
                 sa = SymArray(cells, program=self, name=spec.name)
                 sa._bulk = BulkOut(name=name, shape=tuple(spec.shape))
                 out_arrays.append(sa)
@@ -2069,6 +2442,7 @@ class Program:
             in_=tuple(wrapped_refs),
             out=tuple(out_arrays),
             note=note,
+            provenance=provenance,
         )
         self.statements.append(stmt)
         return tuple(out_arrays)
@@ -2097,6 +2471,7 @@ class Program:
                 in_=s.in_,
                 out=tuple(o._rebind(new) for o in s.out),
                 note=s.note,
+                provenance=s.provenance,
                 inline=s.inline,
             )
             for s in self.statements
@@ -2135,9 +2510,76 @@ class Program:
         going through full :meth:`run`.
         """
         bindings = self._bindings_from_values(values)
+        # Runtime dimension table: maps a producing output ``(stmt_idx,
+        # out_idx)`` to its concrete int value, so a later dynamic
+        # ``OutSpec.shape`` carrying a :class:`DimAtom` (whose ``source`` is
+        # that output) resolves to a concrete shape.  Built ONLY for programs
+        # that actually carry a dynamic shape; static programs pass ``None``
+        # so ``_run_stmt`` skips all per-output dim bookkeeping (B5) — the
+        # static path stays byte-identical AND free of per-output overhead.
+        dim_bindings: dict[tuple[Any, ...], int] | None = (
+            {} if self._has_dynamic_shape() else None
+        )
+        # Stage C: before walking statements, bind each dynamic INPUT.  Read
+        # the provided array's actual shape, record each DimAtom axis into
+        # dim_bindings (keyed by the DimAtom's ("in", name, axis) source so a
+        # later dynamic OutSpec.shape / sibling resolves against it), and bind
+        # the whole tensor as a bulk value.  Concrete axes are validated.
+        if dim_bindings is not None:
+            for inp in self.inputs:
+                if not is_dynamic(inp.shape):
+                    continue
+                arr = np.asarray(values[inp.name], dtype=float)
+                if arr.ndim != len(inp.shape):
+                    raise ValueError(
+                        f"dynamic input {inp.name!r}: expected {len(inp.shape)} "
+                        f"axes; got array of ndim {arr.ndim} (shape {arr.shape})"
+                    )
+                for axis, dim in enumerate(inp.shape):
+                    if isinstance(dim, DimAtom):
+                        # An input axis sourced from a prior Stmt's output (e.g. an FFS-typed
+                        # input Var sized by the factorization's canonical rank atom,
+                        # ``source[0] == "stmt"``) is NOT bound from the fed array's shape:
+                        # the producing Stmt records it later in ``_run_stmt``.  Binding it
+                        # here would shadow that canonical value with the fed shape and defeat
+                        # the rank-consistency check.  The fed axis length is still validated
+                        # against the resolved atom by the ``rank_eq`` AssertOp downstream.
+                        # An ``("in", …)`` atom is genuinely input-sourced — bind it here.
+                        if dim.source and dim.source[0] == "stmt":
+                            continue
+                        dim_bindings[dim.source] = int(arr.shape[axis])
+                    elif int(dim) != int(arr.shape[axis]):
+                        raise ValueError(
+                            f"dynamic input {inp.name!r}: axis {axis} expected "
+                            f"{int(dim)}; got {int(arr.shape[axis])}"
+                        )
+                bindings[inp.name] = arr  # type: ignore[assignment]
         for stmt_idx, stmt in enumerate(self.statements):
-            self._run_stmt(stmt_idx, stmt, bindings)
+            self._run_stmt(stmt_idx, stmt, bindings, dim_bindings)
         return bindings
+
+    def _has_dynamic_shape(self) -> bool:
+        """True iff any Stmt output is a dynamic (``DimAtom``-sized) bulk array.
+
+        Such a program needs the run-time dim-binding table (B4); a purely
+        static program does not, and skipping the table keeps its execution
+        path byte-identical to the pre-dynamic-shapes behavior (B5).
+
+        Memoized: ``run`` (hence this) is called once per slice / sub-Program
+        recursion, so the O(#stmts) scan must not repeat per call. Statements
+        are fixed by run time, so the answer is cached on the instance.
+        """
+        cached = getattr(self, "_dynamic_shape_memo", None)
+        if cached is None:
+            cached = any(
+                is_dynamic(inp.shape) for inp in self.inputs
+            ) or any(
+                o._bulk is not None and is_dynamic(o._bulk.shape)
+                for stmt in self.statements
+                for o in stmt.out
+            )
+            self._dynamic_shape_memo = cached
+        return cached
 
     # -- helpers --------------------------------------------------------
 
@@ -2160,6 +2602,12 @@ class Program:
             declared.add(inp.name)
             if inp.name not in values:
                 raise KeyError(f"missing value for input {inp.name!r}")
+            # Dynamic (DimAtom-sized) inputs are bulk; their whole-tensor value
+            # and DimAtom axis sizes are bound in build_runtime_bindings (C3),
+            # not per-cell here.  Mark declared so the geometry-side fallthrough
+            # below leaves them alone, and skip the static per-cell binding.
+            if is_dynamic(inp.shape):
+                continue
             arr = np.asarray(values[inp.name], dtype=float)
             if tuple(arr.shape) != tuple(inp.shape):
                 raise ValueError(
@@ -2206,8 +2654,15 @@ class Program:
         stmt_idx: int,
         stmt: Stmt,
         bindings: dict[str, float],
+        dim_bindings: dict[tuple[Any, ...], int] | None = None,
     ) -> None:
-        """Resolve refs, call fn, scatter returns into ``bindings``."""
+        """Resolve refs, call fn, scatter returns into ``bindings``.
+
+        ``dim_bindings`` (when supplied) records each scalar output's int
+        value keyed by ``(stmt_idx, out_idx)`` so a later dynamic shape can
+        resolve a :class:`DimAtom` (B4).  ``None`` (the legacy default)
+        skips all dim bookkeeping.
+        """
         if stmt.fn is None:
             return
         resolved = [self._resolve_ref(r, stmt_idx, bindings) for r in stmt.in_]
@@ -2215,15 +2670,22 @@ class Program:
             sub_results = stmt.fn.run(
                 self._sub_value_map(stmt.fn, resolved)
             )
-            sub_outs = list(sub_results.values())
-            for k, bound in enumerate(stmt.out):
-                self._bind_output(bound, sub_outs[k], bindings)
+            outs = list(sub_results.values())
         else:
             results = stmt.fn(*resolved)
-            if not isinstance(results, tuple):
-                results = (results,)
-            for k, bound in enumerate(stmt.out):
-                self._bind_output(bound, results[k], bindings)
+            outs = list(results) if isinstance(results, tuple) else [results]
+        for k, bound in enumerate(stmt.out):
+            self._bind_output(bound, outs[k], bindings, dim_bindings)
+            # Record any scalar (0-d) output as a candidate runtime
+            # dimension, keyed by its producing output position.  Only
+            # 0-d ints can size an axis (the SVD ``rank`` / δ_f output).
+            if dim_bindings is not None:
+                arr = np.asarray(outs[k])
+                if arr.ndim == 0:
+                    try:
+                        dim_bindings[("stmt", stmt_idx, k)] = int(arr)
+                    except (TypeError, ValueError):
+                        pass
 
     def _resolve_ref(
         self,
@@ -2284,14 +2746,29 @@ class Program:
         bound: SymArray,
         value: Any,
         bindings: dict[str, float],
+        dim_bindings: dict[tuple[Any, ...], int] | None = None,
     ) -> None:
-        """Bind a Stmt output: whole-tensor for bulk, per-cell atoms otherwise."""
+        """Bind a Stmt output: whole-tensor for bulk, per-cell atoms otherwise.
+
+        For a *dynamic* bulk output (an axis sized by a :class:`DimAtom`),
+        the declared ``_bulk.shape`` is resolved against ``dim_bindings``
+        before validating the produced tensor's shape (B4).
+        """
         if bound._bulk is not None:
             arr = np.asarray(value)
-            if tuple(arr.shape) != tuple(bound._bulk.shape):
+            if is_dynamic(bound._bulk.shape):
+                if dim_bindings is None:
+                    raise RuntimeError(
+                        f"dynamic bulk output {bound.name!r} requires the run "
+                        f"path's dim-binding table"
+                    )
+                expected = _resolve_shape(bound._bulk.shape, dim_bindings)
+            else:
+                expected = tuple(bound._bulk.shape)
+            if tuple(arr.shape) != expected:
                 raise ValueError(
                     f"bulk Stmt output {bound.name!r}: expected shape "
-                    f"{bound._bulk.shape}; got {arr.shape}"
+                    f"{expected}; got {arr.shape}"
                 )
             bindings[bound._bulk.name] = arr  # type: ignore[assignment]
         else:
@@ -2475,6 +2952,13 @@ def vmap(
 
     fn.__qualname__ = f"vmap({body.name})"
     fn.__name__ = f"vmap_{body.name}"
+    # Additive, descriptive metadata so introspecting tools (e.g.
+    # to_numpy_source) can recover the batched body and the normalised
+    # in/out axis tuples without spelunking the closure cells.  These are
+    # never read by ``run``/evaluation — purely informational.
+    fn._vmap_body = body
+    fn._in_axes = in_axes_tup
+    fn._out_axes = out_axes_tup
     return fn
 
 
@@ -2603,6 +3087,7 @@ __all__ = [
     "Cell",
     "Const",
     "DetOp",
+    "GSvdOp",
     "InputRef",
     "IntAtom",
     "IntAtomRef",

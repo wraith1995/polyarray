@@ -20,6 +20,8 @@ from .ir import (
     Provenance,
     SymArray,
     OutSpec,
+    DimAtom,
+    is_dynamic,
     SymbolicBudget,
     allocate_input,
 )
@@ -30,6 +32,10 @@ from .ir import (
     InvOp,
     PinvOp,
     SolveOp,
+    SvdOp,
+    GSvdOp,
+    QrOp,
+    AssertOp,
     SqrtOp,
     AbsOp,
     SignOp,
@@ -52,6 +58,12 @@ from .int_atom import IntAtom
 # --- IR passes --------------------------------------------------------------
 from .forward import analyze, partial_eval
 
+# --- Batched execution ------------------------------------------------------
+from .ir import vmap
+
+# --- Code generation --------------------------------------------------------
+from .numpy_source import to_numpy_source
+
 __all__ = [
     # construction / values
     "Program",
@@ -60,6 +72,8 @@ __all__ = [
     "Provenance",
     "SymArray",
     "OutSpec",
+    "DimAtom",
+    "is_dynamic",
     "SymbolicBudget",
     "allocate_input",
     "RationalFunction",
@@ -69,6 +83,10 @@ __all__ = [
     "InvOp",
     "PinvOp",
     "SolveOp",
+    "SvdOp",
+    "GSvdOp",
+    "QrOp",
+    "AssertOp",
     "SqrtOp",
     "AbsOp",
     "SignOp",
@@ -83,4 +101,8 @@ __all__ = [
     # IR passes
     "analyze",
     "partial_eval",
+    # batched execution
+    "vmap",
+    # code generation
+    "to_numpy_source",
 ]
