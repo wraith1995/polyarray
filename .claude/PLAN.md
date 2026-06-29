@@ -31,11 +31,27 @@ The pass is chartLib's long-specified, never-built "build-then-simplify". Additi
       (skip `is_dynamic` outputs), **OutputRef reindex** (+ hand-built test). simplify
       tests now 8 (added bulk, sub-Program, 3-stmt chain, OutputRef-remap). Full suite
       61 passed / 1 skipped.
-- [ ] P6 (remaining, larger): **partial descent** into nested sub-Program / vmap CallOp
-      bodies — specialize a body with the partial binds implied by its parent stmt's
-      numeric inputs (today a body folds only when ALL its operands are numeric). This is
-      the pointwise vmap-per-point case.
-- [ ] P3 symbolic `subs` + `RationalFunction.compose`.
+- [x] **P4 sparsity** (merged from `simplify-p4`): new `src/polyarray/sparsity.py` —
+      `propagate_sparsity(program) -> SparsityReport`, `block_zero_mask(...)`. Structural-
+      zero masks threaded across statements: +/- (both zero), * (either), tensordot/einsum
+      boolean contractions, moveaxis permute, identity/assert passthrough; opaque ops
+      (Det/Inv/Svd/Qr/sub-Program/Call/While/Switch) reset to all-False. Subset-safe
+      (never a false-positive zero); cross-statement flow via cells-identity lookup on
+      SymArrayRef/output (NOT bare cells_sparsity). `tests/test_sparsity.py`: 11 tests.
+      First consumer: oracle M3 Vandermonde block-zero. Note: masks `None` for dynamic
+      arrays = treat as all-unknown.
+- [x] **P6 partial descent** (merged from `simplify-p6`): `specialize` now descends a
+      partially-numeric sub-Program / `CallOp(Program)` Stmt — recursively specializes the
+      body with the numeric operands bound, shrinking the Stmt to the symbolic operands
+      (`_descent_body`/`_try_descend`/`_specialize`, depth cap 32, cycle `seen` guard).
+      Genuine vmap closures + WhileOp kept symbolic (conservative). `tests/test_simplify_
+      descent.py`: 5 tests. The pointwise vmap-per-point case.
+- [x] **Merged + verified**: both branches merged into `simplify`; combined suite
+      **77 passed / 1 skipped**; fold+sparsity compose (smoke-tested). Only overlap was
+      `.gitignore` (auto-merged). Feature worktrees can be pruned.
+- [ ] P3 symbolic `subs` + `RationalFunction.compose` (RF→RF substitution, the remaining
+      requirement-2 piece: replace an arg with an expression over OTHER args).
+- [ ] P5 `SimplifyBudget` (collapse↔expose moderation; see plan 01).
 - [ ] P4 sparsity propagation + `block_zero_mask` (oracle M3 consumer).
 - [ ] P5 `SimplifyBudget` + moderation procedure (collapse ceilings, `expose`,
       `den_degree_max`, `keep_provenance`, `analyze→budget→specialize` seam) — see plan 01.
