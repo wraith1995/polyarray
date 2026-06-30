@@ -745,6 +745,51 @@ class SymArray:
             else:
                 yield c
 
+    # ------------------------------------------------------------------
+    # Arithmetic operators (numpy-like; closed-form cell arithmetic).
+    #
+    # SymArray exposes matmul/transpose/etc. as named methods; these
+    # dunders let operator-based numeric code (``A @ B``, ``A + B``,
+    # ``D - C``, ``-M``) run on a SymArray directly, delegating to the
+    # cell helpers (numeric fast path, object-RationalFunction otherwise).
+    # Program back-reference is propagated so downstream passes still see
+    # one owning Program.
+    # ------------------------------------------------------------------
+
+    def _elementwise(self, other: Any, op: Any) -> "SymArray":
+        a = self.cells
+        if isinstance(other, SymArray):
+            b = other.cells
+            prog = self.program or other.program
+        else:
+            b = _to_cells(other)
+            prog = self.program
+        if a.dtype.kind == "f" and getattr(b, "dtype", None) is not None and b.dtype.kind == "f":
+            return SymArray(op(a, b), program=prog)
+        return SymArray(op(_ensure_object(a), _ensure_object(b)), program=prog)
+
+    def __matmul__(self, other: "SymArray | np.ndarray") -> "SymArray":
+        return self.matmul(other)
+
+    def __rmatmul__(self, other: "SymArray | np.ndarray") -> "SymArray":
+        return SymArray(_to_cells(other), program=self.program).matmul(self)
+
+    def __neg__(self) -> "SymArray":
+        a = self.cells
+        return SymArray(-a if a.dtype.kind == "f" else -_ensure_object(a), program=self.program)
+
+    def __add__(self, other: Any) -> "SymArray":
+        return self._elementwise(other, lambda x, y: x + y)
+
+    def __radd__(self, other: Any) -> "SymArray":
+        return self._elementwise(other, lambda x, y: y + x)
+
+    def __sub__(self, other: Any) -> "SymArray":
+        return self._elementwise(other, lambda x, y: x - y)
+
+    def __rsub__(self, other: Any) -> "SymArray":
+        return self._elementwise(other, lambda x, y: y - x)
+
     def __repr__(self) -> str:
         if self._bulk is not None:
             return f"SymArray(bulk{self._bulk.shape})"
