@@ -57,6 +57,7 @@ import numpy as np
 from .ir import (
     AbsOp,
     AssertOp,
+    CallOp,
     Const,
     DetOp,
     EinsumOp,
@@ -363,6 +364,10 @@ class _Emitter:
             renderer = self.extra_renderers.get(type(fn).__name__)
         if renderer is not None:
             return renderer(fn, args)
+        # CallOp wraps a Program / vmap-closure / opaque callable — unwrap and
+        # dispatch on the inner fn (matches CallOp.__call__ -> _invoke(self.fn, ...)).
+        if isinstance(fn, CallOp):
+            return self._render_op(fn.fn, args)
         # A sub-Program Stmt fn: dispatch like ``_run_stmt`` (operands map to
         # body inputs by position; outputs in insertion order).
         if isinstance(fn, Program):

@@ -215,3 +215,31 @@ def test_unsupported_op_raises():
     prog.add_output("result", out.cells)
     with pytest.raises(NotImplementedError, match="_MysteryOp"):
         pa.to_numpy_source(prog)
+
+
+def test_grassmann_derivative_callop_emits_and_matches():
+    """A grassmann derivative program lowers through a CallOp/sub-program (vmap full
+    Jacobian); to_numpy_source must emit it and match Program.run (gap G12)."""
+    import inspect
+
+    import grassmann as G
+    from grassmann.lower.numpy_renderers import op_renderers
+    from grassmann.syntax.mcalc import build_problem
+
+    for expr, decls, dims, wrt in [
+        ("0.5*x'*A*x", {"x": "vector", "A": "matrix"}, {"n1": 3}, "x"),
+        ("sin(x)'*y", {"x": "vector", "y": "vector"}, {"n0": 3}, "x"),
+        ("A*exp(x)", {"A": "matrix", "x": "vector"}, {"n0": 3, "n1": 4}, "x"),
+    ]:
+        r = build_problem(expr, wrt=wrt, decls=decls)
+        dprog = G.compile(r.instantiate(r.derivative, dims))
+        src = pa.to_numpy_source(dprog, func_name="df", op_renderers=op_renderers())
+        ns = {}
+        exec(src, ns)  # noqa: S102
+        params = list(inspect.signature(ns["df"]).parameters)
+        rng = np.random.default_rng(0)
+        shp = {si.name: tuple(int(d) for d in si.shape) for si in dprog.inputs}
+        vals = {p: rng.standard_normal(shp[p]) for p in params}
+        got = np.asarray(ns["df"](*[vals[p] for p in params]))
+        ref = np.asarray(dprog.run(vals)["result"])
+        assert np.allclose(got, ref), f"{expr}: emitted derivative != run()"
