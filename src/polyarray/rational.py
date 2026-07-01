@@ -54,6 +54,8 @@ Helpers exported alongside the class:
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 from collections.abc import Mapping, Sequence
 from typing import Any, Union
 
@@ -63,6 +65,36 @@ import sympy as sp
 from .poly_backend import Poly, PolyTypes, Ring
 from .poly_backend import lift as _lift
 from .poly_backend import make_ring as _make_ring
+
+# --- eager cancellation (opt-in) -------------------------------------------
+# `RationalFunction` accumulates raw num/den in the hot loop (cancel only at a boundary via
+# `clean()`), so a long `*`/`+` chain can grow a large shared gcd (a euclidean-jet cell reached
+# degree 29/28, 70k terms). Within `eager_cancel(k)`, `*`/`+`/`-` results whose denominator degree
+# exceeds `k` are gcd-cancelled immediately, keeping intermediates reduced (the same chain stays ~10
+# terms). Off by default → byte-identical; the low-degree hot loop never trips the threshold.
+_EAGER_CANCEL: contextvars.ContextVar = contextvars.ContextVar("_pa_eager_cancel", default=0)
+
+
+@contextlib.contextmanager
+def eager_cancel(den_degree_threshold: int = 2):
+    """Within this context, cancel RF arithmetic results whose denominator degree exceeds the
+    threshold (0 restores the default lazy behavior)."""
+    tok = _EAGER_CANCEL.set(int(den_degree_threshold))
+    try:
+        yield
+    finally:
+        _EAGER_CANCEL.reset(tok)
+
+
+def _maybe_cancel(rf: "RationalFunction") -> "RationalFunction":
+    thr = _EAGER_CANCEL.get()
+    if thr and isinstance(rf, RationalFunction):
+        try:
+            if _total_degree(rf._den) > thr:
+                return rf.clean()
+        except Exception:  # noqa: BLE001 - cancellation is a best-effort optimization
+            pass
+    return rf
 
 NumericLike = Union[int, float, sp.Rational, sp.Integer]
 
@@ -391,8 +423,8 @@ class RationalFunction:
             return self
         a, b = self._aligned(coerced)
         if a._den == b._den:
-            return RationalFunction(a._num + b._num, a._den)
-        return RationalFunction(a._num * b._den + b._num * a._den, a._den * b._den)
+            return _maybe_cancel(RationalFunction(a._num + b._num, a._den))
+        return _maybe_cancel(RationalFunction(a._num * b._den + b._num * a._den, a._den * b._den))
 
     def __radd__(self, other: Any) -> "RationalFunction":
         return self.__add__(other)
@@ -403,8 +435,8 @@ class RationalFunction:
             return NotImplemented
         a, b = self._aligned(coerced)
         if a._den == b._den:
-            return RationalFunction(a._num - b._num, a._den)
-        return RationalFunction(a._num * b._den - b._num * a._den, a._den * b._den)
+            return _maybe_cancel(RationalFunction(a._num - b._num, a._den))
+        return _maybe_cancel(RationalFunction(a._num * b._den - b._num * a._den, a._den * b._den))
 
     def __rsub__(self, other: Any) -> "RationalFunction":
         coerced = self._coerce(other)
@@ -424,7 +456,7 @@ class RationalFunction:
         if coeff_zero(coerced._num):
             return coerced
         a, b = self._aligned(coerced)
-        return RationalFunction(a._num * b._num, a._den * b._den)
+        return _maybe_cancel(RationalFunction(a._num * b._num, a._den * b._den))
 
     def __rmul__(self, other: Any) -> "RationalFunction":
         return self.__mul__(other)

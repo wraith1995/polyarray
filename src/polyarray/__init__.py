@@ -52,7 +52,7 @@ from .ir import (
 )
 
 # --- Rational lane ----------------------------------------------------------
-from .rational import RationalFunction
+from .rational import RationalFunction, eager_cancel
 
 # --- Integer selectors ------------------------------------------------------
 from .int_atom import IntAtom
@@ -84,6 +84,7 @@ __all__ = [
     "current_budget_override",
     "allocate_input",
     "RationalFunction",
+    "eager_cancel",
     "IntAtom",
     # op vocabulary
     "DetOp",
