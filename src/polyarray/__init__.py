@@ -23,6 +23,8 @@ from .ir import (
     DimAtom,
     is_dynamic,
     SymbolicBudget,
+    budget_override,
+    current_budget_override,
     allocate_input,
 )
 
@@ -78,6 +80,8 @@ __all__ = [
     "DimAtom",
     "is_dynamic",
     "SymbolicBudget",
+    "budget_override",
+    "current_budget_override",
     "allocate_input",
     "RationalFunction",
     "IntAtom",

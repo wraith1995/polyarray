@@ -119,6 +119,25 @@ def _to_qq(coeff: NumericLike | sp.Expr) -> float:
     raise TypeError(f"cannot coerce {coeff!r} ({type(coeff).__name__}) to float")
 
 
+def _coeff_abs_float(co: Any) -> float:
+    """Best-effort ``|coeff|`` → ``float`` across coefficient backends (Python float / int,
+    flint ``fmpq``, sympy Rational/mpf). Used by the numeric-magnitude sparsity test."""
+    if isinstance(co, float):
+        return abs(co)
+    try:
+        return abs(float(co))
+    except (TypeError, ValueError):
+        pass
+    for num_attr, den_attr in (("p", "q"), ("numer", "denom"), ("numerator", "denominator")):
+        n = getattr(co, num_attr, None)
+        d = getattr(co, den_attr, None)
+        if n is not None and d is not None:
+            n = n() if callable(n) else n
+            d = d() if callable(d) else d
+            return abs(float(int(n)) / float(int(d)))
+    return abs(float(str(co)))
+
+
 def coeff_zero(poly: Poly) -> bool:
     """Return ``True`` iff ``poly`` is the zero polynomial of its ring.
 
@@ -273,6 +292,20 @@ class RationalFunction:
     def is_zero(self) -> bool:
         """Structural-zero test on the numerator (denominator is always non-zero)."""
         return coeff_zero(self._num)
+
+    def max_abs_coeff(self) -> float:
+        """Largest ``|coefficient|`` of the numerator (``0.0`` if the numerator is zero).
+
+        A *numeric* magnitude for a tolerance-based sparsity test: a cell whose numerator
+        coefficients are all negligible (``≤ tol·scale``) is an identically-zero rational function
+        up to float roundoff (e.g. chartLib QR / Orthopoly's irrational normalization) — a structural
+        zero that exact :meth:`is_zero` misses. Distinct from ``is_zero`` (which is exact)."""
+        m = 0.0
+        for _, co in self._num.terms():
+            c = _coeff_abs_float(co)
+            if c > m:
+                m = c
+        return m
 
     def is_constant(self) -> bool:
         """True iff both numerator and denominator have total-degree zero."""
