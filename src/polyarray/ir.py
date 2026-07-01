@@ -62,6 +62,12 @@ def budget_override(budget: "SymbolicBudget | None"):
         _BUDGET_OVERRIDE.reset(tok)
 
 
+def current_budget_override() -> "SymbolicBudget | None":
+    """The ambient `budget_override` budget, or None. For builders that construct a `Program` with an
+    EXPLICIT budget (e.g. chartlib's SymbolicInterpreter) and want to honor the override themselves."""
+    return _BUDGET_OVERRIDE.get()
+
+
 # ---------------------------------------------------------------------------
 # Provenance
 # ---------------------------------------------------------------------------
