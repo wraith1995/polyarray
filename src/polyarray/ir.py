@@ -24,6 +24,8 @@ IR structure
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -35,6 +37,29 @@ from .int_atom import IntAtom
 from .rational import RationalFunction, simple_zero
 
 Cell = Union[RationalFunction, float, int]
+
+
+# ---------------------------------------------------------------------------
+# Ambient budget override
+# ---------------------------------------------------------------------------
+# A `Program` built with no explicit `budget=` consults this context. It lets a
+# caller (e.g. oracle's sparsity mask) request the non-deferred, inline-covariant
+# symbolic lane for the SHARED sampling program — so the covariant/φ-jet chain is
+# built inline over the vertices (not deferred to `out_cov`/`phi_jet` Stmts) — without
+# threading a budget through every builder (pointwise never references it).
+_BUDGET_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
+    "_pa_budget_override", default=None
+)
+
+
+@contextlib.contextmanager
+def budget_override(budget: "SymbolicBudget | None"):
+    """Within this context, budget-less `Program`s use `budget` (None restores default)."""
+    tok = _BUDGET_OVERRIDE.set(budget)
+    try:
+        yield
+    finally:
+        _BUDGET_OVERRIDE.reset(tok)
 
 
 # ---------------------------------------------------------------------------
@@ -2331,7 +2356,12 @@ class Program:
                 )
         self.statements: list[Stmt] = []
         self.outputs: dict[str, SymArray] = {}
-        self.budget: SymbolicBudget = budget if budget is not None else SymbolicBudget()
+        # An explicit `budget=` always wins; otherwise consult the ambient `budget_override`
+        # context (oracle's sparsity mask requests the inline-covariant lane), else the default.
+        self.budget: SymbolicBudget = (
+            budget if budget is not None
+            else (_BUDGET_OVERRIDE.get() or SymbolicBudget())
+        )
         # IntAtom registry — keyed by name; resolved at run time by
         # reading the matching entry out of the values dict.  Distinct
         # from the rational ``inputs`` table because IntAtoms do not
