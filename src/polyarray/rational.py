@@ -913,7 +913,7 @@ def _poly_term_strings(
         c = _coeff_to_float(coeff)
         if c == 0.0:
             continue
-        factors: list[str] = [repr(c)]
+        factors: list[str] = []
         for src_pos, exp in enumerate(monom):
             if exp == 0:
                 continue
@@ -922,7 +922,17 @@ def _poly_term_strings(
                 factors.append(v)
             else:
                 factors.append(f"{v}**{exp}")
-        terms.append("*".join(factors))
+        if not factors:
+            # pure constant term — the coefficient is the whole term.
+            terms.append(repr(c))
+        elif c == 1.0:
+            # drop the redundant ``1.0*`` coefficient prefix.
+            terms.append("*".join(factors))
+        elif c == -1.0:
+            # ``-1.0*x`` ⇒ ``-x`` (unary negate, matching existing ``+ -`` style).
+            terms.append("-" + "*".join(factors))
+        else:
+            terms.append("*".join([repr(c), *factors]))
     return terms
 
 

@@ -75,6 +75,7 @@ from .ir import (
     SignOp,
     SolveOp,
     SqrtOp,
+    SvdOp,
     SwitchOp,
     SymArray,
     SymArrayRef,
@@ -255,11 +256,8 @@ class _Emitter:
         """
         params: list[str] = []
         for inp in self.prog.inputs:
-            if is_dynamic(inp.shape):
-                raise NotImplementedError(
-                    "to_numpy_source: dynamic (DimAtom-shaped) input "
-                    f"{inp.name!r} in a sub-Program/vmap body is not supported"
-                )
+            # A DimAtom-shaped (runtime-rank FFS) input is fine as a positional array param — its
+            # actual shape is fixed at call time; the body's ops read it from the passed array.
             p = _safe_param_name(inp.name)
             self.param[inp.name] = p
             params.append(p)
@@ -406,6 +404,8 @@ class _Emitter:
         if existing is not None:
             return existing
         body = _vmap_body_of(fn)
+        if getattr(fn, "_nested_n_vars", None) is not None:
+            return self._emit_nested_vmap_helper(fn, body)
         in_axes = getattr(fn, "_in_axes", None)
         out_axes = getattr(fn, "_out_axes", None)
         if in_axes is None or out_axes is None:
@@ -459,6 +459,41 @@ class _Emitter:
             )
             block.append(L + f"return ({parts})")
         self.registry.defs.append(block)
+        return name
+
+    def _emit_nested_vmap_helper(self, fn: Any, body: "Program") -> str:
+        """Emit a MULTI-var nested vmap (the antisymmetrizer's k-bound-var ``LLam`` lowering) as a
+        helper: loop the cartesian product of the ``n_vars`` basis-index axes, run the per-slice
+        body, stack into ``(*var_sizes, *cod)``, then move the var axes AFTER the cod axes — exactly
+        mirroring grassmann's ``_nested_vmap`` runtime closure."""
+        key = id(fn)
+        existing = self.registry.helpers.get(key)
+        if existing is not None:
+            return existing
+        n_vars = int(fn._nested_n_vars)
+        n_free = int(fn._nested_n_free)
+        body_helper = self._emit_program_helper(body)
+        name = self.registry.fresh("vmapnest")
+        self.registry.helpers[key] = name
+        params = [f"a{i}" for i in range(n_vars + n_free)]
+        L = "    "
+        b = [f"def {name}({', '.join(params)}):"]
+        b.append(L + f'"""nested vmap({body.name!r}) — {n_vars} bound vars — from to_numpy_source."""')
+        b.append(L + "import itertools as _it")
+        b.append(L + f"_eyes = [np.asarray(a) for a in ({', '.join(params[:n_vars])},)]")
+        free_list = ", ".join(params[n_vars:])
+        b.append(L + f"_free = [np.asarray(a) for a in ({free_list}{',' if n_free == 1 else ''})]"
+                 if n_free else L + "_free = []")
+        b.append(L + "_sizes = [e.shape[0] for e in _eyes]")
+        b.append(L + "_grid = {}")
+        b.append(L + "for _c in _it.product(*[range(s) for s in _sizes]):")
+        b.append(L + "    _sv = [_eyes[_v][_c[_v]] for _v in range(len(_eyes))] + _free")
+        b.append(L + f"    _grid[_c] = np.asarray({body_helper}(*_sv))")
+        b.append(L + "_cod = next(iter(_grid.values())).shape")
+        b.append(L + "_full = np.empty(tuple(_sizes) + _cod, dtype=float)")
+        b.append(L + "for _c, _r in _grid.items(): _full[_c] = _r")
+        b.append(L + f"return np.moveaxis(_full, range({n_vars}), range(-{n_vars}, 0))")
+        self.registry.defs.append(b)
         return name
 
     # -- cells / rational functions -------------------------------------
@@ -580,6 +615,18 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
     def qr(op, a):
         return f"np.linalg.qr({a[0]}, mode={op.mode!r})"
 
+    def svd(op, a):
+        # Multi-output (U, S, Vh, rank): np.linalg.svd + a thresholded numerical rank (mirrors
+        # SvdOp.__call__). Emitted as one self-contained expression (no prelude helper needed).
+        rc = "None" if op.rcond is None else repr(op.rcond)
+        return (
+            f"(lambda _A: (lambda _U, _S, _Vh: (_U, _S, _Vh, np.asarray("
+            f"0 if _S.size == 0 else int((_S > (("
+            f"_S.max() * max(_A.shape) * np.finfo(float).eps) if {rc} is None "
+            f"else {rc} * _S.max())).sum()))))(*np.linalg.svd("
+            f"_A, full_matrices={op.full_matrices!r})))({a[0]})"
+        )
+
     def switch(op, a):
         branches = ", ".join(a[1:])
         return f"np.asarray([{branches}][int({a[0]})])"
@@ -599,6 +646,7 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
         EinsumOp: einsum,
         EinsumStmtOp: einsum_stmt,
         QrOp: qr,
+        SvdOp: svd,
         SwitchOp: switch,
     }
 
