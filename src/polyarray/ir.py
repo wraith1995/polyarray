@@ -2856,6 +2856,13 @@ class Program:
                         f"dynamic bulk output {bound.name!r} requires the run "
                         f"path's dim-binding table"
                     )
+                # Admit runtime dims: a not-yet-bound DimAtom in this output's declared shape is
+                # bound HERE from the realized array's actual axis size — the produced output IS
+                # the runtime dimension (its canonical source), so a consumer can resolve it next.
+                for axis, d in enumerate(bound._bulk.shape):
+                    if (isinstance(d, DimAtom) and d.source not in dim_bindings
+                            and axis < arr.ndim):
+                        dim_bindings[d.source] = int(arr.shape[axis])
                 expected = _resolve_shape(bound._bulk.shape, dim_bindings)
             else:
                 expected = tuple(bound._bulk.shape)
