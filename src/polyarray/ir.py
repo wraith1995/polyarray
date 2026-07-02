@@ -320,6 +320,15 @@ class SymbolicBudget:
     # on 3-D high-order cells (where the inline contraction blows up).  Default
     # False = today's inline rational lane (byte-identical).
     defer_frame_contraction: bool = False
+    # Downstream block-inverse deferral (oracle's Schur `symbolic_inverse`): the matrix size at/above
+    # which a base-case inverse / a Schur-combine matrix product offloads to a NUMERIC Stmt instead of
+    # inline RationalFunction arithmetic (the degree blow-up on a single connected component — e.g.
+    # Argyris). ``None`` ⇒ the consumer's own module defaults; ``build_big_symbols`` raises them (stay
+    # symbolic / never defer), ``force_stmts`` lowers them (always defer). Read via
+    # ``current_budget_override``; other budget fields left at legacy keep sampling byte-identical, so a
+    # caller can tune ONLY the inverse without perturbing the sampling lane.
+    schur_inverse_stmt_size: int | None = None
+    schur_matmul_stmt_size: int | None = None
 
     @classmethod
     def legacy(cls) -> "SymbolicBudget":
@@ -361,6 +370,8 @@ class SymbolicBudget:
             defer_covariant=not retain_covariant,
             freeze=False,
             surface_frame=surface_frame,
+            schur_inverse_stmt_size=1 << 62,
+            schur_matmul_stmt_size=1 << 62,
             **overrides,
         )
 
@@ -387,6 +398,8 @@ class SymbolicBudget:
             inverse_max_degree=0,
             einsum_bag_threshold=1,
             freeze=True,
+            schur_inverse_stmt_size=0,
+            schur_matmul_stmt_size=0,
             **overrides,
         )
 
