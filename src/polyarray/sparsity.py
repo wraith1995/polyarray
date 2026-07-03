@@ -191,7 +191,7 @@ class SparsityReport:
         """Mask for the named program input."""
         return self.input_masks[name]
 
-    def mask_for(self, key: "str | SymArray") -> Mask:
+    def mask_for(self, key: str | SymArray) -> Mask:
         """Fetch the mask for a program output / input *name* or a ``SymArray``.
 
         A ``SymArray`` is matched first by identity of its computed cells (so a

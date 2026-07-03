@@ -82,7 +82,7 @@ class SimplifyBudget:
     # -- presets (end-state correspondence in plan 01) ------------------
 
     @classmethod
-    def none(cls) -> "SimplifyBudget":
+    def none(cls) -> SimplifyBudget:
         """All knobs off: numeric fold + DCE only, symbolic structure untouched."""
         return cls()
 
@@ -90,7 +90,7 @@ class SimplifyBudget:
     legacy = none
 
     @classmethod
-    def numeric_only(cls) -> "SimplifyBudget":
+    def numeric_only(cls) -> SimplifyBudget:
         """Collapse every symbolic cell to a numeric/atom (``max_cell_mass=0``).
 
         On the symbolic-cell set this is equivalent to
@@ -99,12 +99,12 @@ class SimplifyBudget:
         return cls(max_cell_mass=0)
 
     @classmethod
-    def balanced(cls, m: int) -> "SimplifyBudget":
+    def balanced(cls, m: int) -> SimplifyBudget:
         """Keep cheap symbolic structure, collapse the heavy tail above ``m``."""
         return cls(max_cell_mass=m, expose="if_under_budget")
 
     @classmethod
-    def expose_symbols(cls, keep: frozenset[str] | set[str] = frozenset()) -> "SimplifyBudget":
+    def expose_symbols(cls, keep: frozenset[str] | set[str] = frozenset()) -> SimplifyBudget:
         """Maximize visible symbols; protect ``keep`` provenance kinds.
 
         ``max_cell_mass=None`` (no per-cell collapse), ``expose="always"``,

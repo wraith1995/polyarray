@@ -23,6 +23,7 @@ flint = ["python-flint>=0.8.0"]
 dev = [
     "cython>=3.0",
     "pytest>=8.0",
+    "mypy>=1.13",
 ]
 
 [tool.setuptools]
@@ -57,3 +58,14 @@ archs = ["x86_64", "aarch64"]
 
 [tool.cibuildwheel.macos]
 archs = ["arm64", "x86_64"]
+
+# mypy — chartLib's config is the model (fem CLAUDE.md rule 3); run: .venv/bin/mypy
+[tool.mypy]
+python_version = "3.13"
+files = ["src"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+strict_optional = true

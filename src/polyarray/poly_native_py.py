@@ -21,7 +21,7 @@ import sympy as sp
 from .poly_native_value import ValueHandle
 
 _VALUE: ValueHandle | None = None
-_RING_CACHE: dict[tuple[str, ...], "_NativePyRing"] = {}
+_RING_CACHE: dict[tuple[str, ...], _NativePyRing] = {}
 _POS_MAP_CACHE: dict[tuple[int, int], tuple[int, ...]] = {}
 
 
@@ -89,28 +89,28 @@ class _NativePyRing:
         return self._n
 
     @property
-    def one(self) -> "_NativePyPoly":
+    def one(self) -> _NativePyPoly:
         return self._one
 
     @property
-    def zero(self) -> "_NativePyPoly":
+    def zero(self) -> _NativePyPoly:
         return self._zero
 
     @property
-    def gens(self) -> tuple["_NativePyPoly", ...]:
+    def gens(self) -> tuple[_NativePyPoly, ...]:
         return self._gens
 
-    def gen(self, i: int) -> "_NativePyPoly":
+    def gen(self, i: int) -> _NativePyPoly:
         return self._gens[i]
 
-    def ground_new(self, value: Any) -> "_NativePyPoly":
+    def ground_new(self, value: Any) -> _NativePyPoly:
         c = self._value.from_python(value)
         if self._value.is_exact_zero(c):
             return self._zero
         one_monom = (0,) * self._n
         return _NativePyPoly._make_raw({one_monom: c}, self)
 
-    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> "_NativePyPoly":
+    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> _NativePyPoly:
         if not terms:
             return self._zero
         from_python = self._value.from_python
@@ -145,7 +145,7 @@ class _NativePyPoly:
 
     @classmethod
     def _make_raw(cls, terms: dict[tuple[int, ...], Any],
-                  ring: _NativePyRing) -> "_NativePyPoly":
+                  ring: _NativePyRing) -> _NativePyPoly:
         """Internal: skip the structural-zero filter.
 
         Callers must guarantee no entries in ``terms`` are
@@ -190,17 +190,17 @@ class _NativePyPoly:
             self._hash = h
         return h
 
-    def __neg__(self) -> "_NativePyPoly":
+    def __neg__(self) -> _NativePyPoly:
         neg = self._ring._value.neg
         # All entries were structurally non-zero; negation preserves that.
         return _NativePyPoly._make_raw(
             {m: neg(c) for m, c in self._terms.items()}, self._ring,
         )
 
-    def _coerce_scalar(self, other: Any) -> "_NativePyPoly":
+    def _coerce_scalar(self, other: Any) -> _NativePyPoly:
         return self._ring.ground_new(other)
 
-    def __add__(self, other: Any) -> "_NativePyPoly":
+    def __add__(self, other: Any) -> _NativePyPoly:
         if isinstance(other, _NativePyPoly):
             if self._ring is not other._ring:
                 return NotImplemented
@@ -223,10 +223,10 @@ class _NativePyPoly:
             return self.__add__(self._coerce_scalar(other))
         return NotImplemented
 
-    def __radd__(self, other: Any) -> "_NativePyPoly":
+    def __radd__(self, other: Any) -> _NativePyPoly:
         return self.__add__(other)
 
-    def __sub__(self, other: Any) -> "_NativePyPoly":
+    def __sub__(self, other: Any) -> _NativePyPoly:
         if isinstance(other, _NativePyPoly):
             if self._ring is not other._ring:
                 return NotImplemented
@@ -250,12 +250,12 @@ class _NativePyPoly:
             return self.__sub__(self._coerce_scalar(other))
         return NotImplemented
 
-    def __rsub__(self, other: Any) -> "_NativePyPoly":
+    def __rsub__(self, other: Any) -> _NativePyPoly:
         if isinstance(other, (int, float)):
             return self._coerce_scalar(other).__sub__(self)
         return NotImplemented
 
-    def __mul__(self, other: Any) -> "_NativePyPoly":
+    def __mul__(self, other: Any) -> _NativePyPoly:
         if isinstance(other, _NativePyPoly):
             if self._ring is not other._ring:
                 return NotImplemented
@@ -294,10 +294,10 @@ class _NativePyPoly:
             return self.__mul__(self._coerce_scalar(other))
         return NotImplemented
 
-    def __rmul__(self, other: Any) -> "_NativePyPoly":
+    def __rmul__(self, other: Any) -> _NativePyPoly:
         return self.__mul__(other)
 
-    def __pow__(self, n: int) -> "_NativePyPoly":
+    def __pow__(self, n: int) -> _NativePyPoly:
         n = int(n)
         if n < 0:
             raise ValueError("negative power not supported")
@@ -337,8 +337,8 @@ class _NativePyPoly:
         leading = max(self._terms)
         return self._ring._value.to_float(self._terms[leading])
 
-    def cancel(self, other: "_NativePyPoly",
-               ) -> tuple["_NativePyPoly", "_NativePyPoly"]:
+    def cancel(self, other: _NativePyPoly,
+               ) -> tuple[_NativePyPoly, _NativePyPoly]:
         if not isinstance(other, _NativePyPoly):
             raise TypeError("cancel expects another _NativePyPoly")
         if self._ring is not other._ring:

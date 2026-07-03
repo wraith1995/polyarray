@@ -19,10 +19,7 @@ import pytest
 
 REPO = "polyarray"
 # Per-rule ERROR ceilings owned by queued fem tasks (shrink-only).
-BASELINE: dict[str, int] = {
-    # fem task #16 (mypy configs + annotation cleanup):
-    "TYPE-STR-ANNOTATION": 157,
-}
+BASELINE: dict[str, int] = {}                       # ERROR-clean (task #16 cleared the annotations)
 
 
 def _harness() -> Path | None:
