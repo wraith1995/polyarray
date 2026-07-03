@@ -43,6 +43,7 @@ from .ir import (
     Stmt,
     SymArray,
     SymArrayRef,
+    WhileOp,
     is_dynamic,
 )
 from .budget import SimplifyBudget, _apply_budget
@@ -52,7 +53,7 @@ from .rational import RationalFunction
 # raw sub-Programs ARE foldable (executed when every operand is numeric — see
 # ``_exec_fn``).  ``SwitchOp`` is fine too: it only resolves once its IntAtom
 # selector is bound, otherwise its inputs stay symbolic and it survives.
-_SKIP_OP_NAMES = frozenset({"WhileOp"})
+_SKIP_OPS = (WhileOp,)
 
 # Recursion ceiling for P6 partial descent into nested sub-Program / CallOp
 # bodies.  Bodies are acyclic in practice; the ``seen`` set already breaks any
@@ -70,7 +71,7 @@ def _simple_stmt(stmt: Stmt) -> bool:
     a runtime-``DimAtom``-sized output cannot be materialised at build time)."""
     if stmt.fn is None:
         return False
-    if type(stmt.fn).__name__ in _SKIP_OP_NAMES:
+    if isinstance(stmt.fn, _SKIP_OPS):
         return False
     for o in stmt.out:
         if o._bulk is not None and is_dynamic(o._bulk.shape):
@@ -311,16 +312,15 @@ def specialize(
       build-time-numeric subcomputation, drops the producing Stmts, and (P6)
       descends into a partially-numeric sub-Program / ``CallOp`` body.
 
-    ``sparsity`` and ``budget`` are accepted for signature stability but are
-    no-op passthrough here (a parallel branch — P4/P5 — implements them).
-    Exactness-preserving.
+    * ``budget`` (a :class:`~polyarray.budget.SimplifyBudget`) — the post-build
+      moderation control surface (P5): after the unconditional numeric-fold
+      floor runs, it collapses / extracts / keeps the residual symbolic
+      structure per ``plans/01-budget-moderated-simplification.md``.
+      ``budget=None`` is the floor only.
 
-    ``budget`` (a :class:`~polyarray.budget.SimplifyBudget`) is the post-build
-    moderation control surface (P5): after the unconditional numeric-fold floor
-    runs, it collapses / extracts / keeps the residual symbolic structure per
-    ``plans/01-budget-moderated-simplification.md``.  ``budget=None`` is the
-    floor only.  ``subs`` (symbolic argument substitution, P3) and ``sparsity``
-    (P4) are accepted for API parity but are no-op passthroughs in this slice.
+    ``sparsity`` (P4) is accepted for API parity but is a no-op passthrough
+    here — use :func:`polyarray.sparsity.propagate_sparsity` directly.
+    Exactness-preserving throughout.
     """
     del sparsity  # P4 sparsity is a separate pass; accepted here for API parity.
     # P3: apply symbolic substitution first, then the bind+fold+descent floor,
