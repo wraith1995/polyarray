@@ -300,7 +300,7 @@ def specialize(
     bind: Mapping[str, Any] | None = None,
     subs: Mapping[str, Any] | None = None,
     sparsity: bool = False,
-    budget: "SimplifyBudget | None" = None,
+    budget: SimplifyBudget | None = None,
 ) -> Program:
     """Partially evaluate ``program`` against optional ``subs`` / ``bind`` values.
 

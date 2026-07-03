@@ -75,6 +75,7 @@ from .ir import (
     SignOp,
     SolveOp,
     SqrtOp,
+    Stmt,
     SvdOp,
     SwitchOp,
     SymArray,
@@ -87,7 +88,7 @@ from .rational import RationalFunction, _poly_to_pyexpr, _ring_names
 __all__ = ["to_numpy_source", "OpRenderer"]
 
 
-def _vmap_body_of(fn: Any) -> "Program | None":
+def _vmap_body_of(fn: Any) -> Program | None:
     """Pull a per-point body :class:`Program` out of a ``vmap`` closure.
 
     Mirrors :func:`polyarray.forward._body_of` but kept local so this module
@@ -165,7 +166,7 @@ class _Emitter:
         program: Program,
         func_name: str,
         op_renderers: Mapping[str, OpRenderer] | None,
-        registry: "_HelperRegistry | None" = None,
+        registry: _HelperRegistry | None = None,
     ) -> None:
         self.prog = program
         self.func_name = func_name
@@ -296,7 +297,7 @@ class _Emitter:
 
     # -- statements -----------------------------------------------------
 
-    def _emit_stmt(self, stmt_idx: int, stmt: "Stmt") -> list[str]:
+    def _emit_stmt(self, stmt_idx: int, stmt: Stmt) -> list[str]:
         if stmt.fn is None:
             return []
         arg_exprs = [self._ref_expr(r) for r in stmt.in_]
@@ -461,7 +462,7 @@ class _Emitter:
         self.registry.defs.append(block)
         return name
 
-    def _emit_nested_vmap_helper(self, fn: Any, body: "Program") -> str:
+    def _emit_nested_vmap_helper(self, fn: Any, body: Program) -> str:
         """Emit a MULTI-var nested vmap (the antisymmetrizer's k-bound-var ``LLam`` lowering) as a
         helper: loop the cartesian product of the ``n_vars`` basis-index axes, run the per-slice
         body, stack into ``(*var_sizes, *cod)``, then move the var axes AFTER the cod axes — exactly

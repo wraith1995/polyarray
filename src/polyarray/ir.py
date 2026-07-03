@@ -53,7 +53,7 @@ _BUDGET_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
 
 
 @contextlib.contextmanager
-def budget_override(budget: "SymbolicBudget | None"):
+def budget_override(budget: SymbolicBudget | None):
     """Within this context, budget-less `Program`s use `budget` (None restores default)."""
     tok = _BUDGET_OVERRIDE.set(budget)
     try:
@@ -62,7 +62,7 @@ def budget_override(budget: "SymbolicBudget | None"):
         _BUDGET_OVERRIDE.reset(tok)
 
 
-def current_budget_override() -> "SymbolicBudget | None":
+def current_budget_override() -> SymbolicBudget | None:
     """The ambient `budget_override` budget, or None. For builders that construct a `Program` with an
     EXPLICIT budget (e.g. chartlib's SymbolicInterpreter) and want to honor the override themselves."""
     return _BUDGET_OVERRIDE.get()
@@ -162,7 +162,7 @@ class SymbolEnv:
 
     # -- copy -----------------------------------------------------------
 
-    def copy(self) -> "SymbolEnv":
+    def copy(self) -> SymbolEnv:
         """Return an independent copy of the env (for sub-program forks)."""
         new = SymbolEnv()
         new._provenance = dict(self._provenance)
@@ -197,7 +197,7 @@ class SymInput:
 
     name: str
     shape: tuple[int | DimAtom, ...]
-    provenance: "Provenance | Callable[[tuple[int, ...]], Provenance]"
+    provenance: Provenance | Callable[[tuple[int, ...]], Provenance]
 
 
 def allocate_input(env: SymbolEnv, spec: SymInput) -> np.ndarray:
@@ -331,7 +331,7 @@ class SymbolicBudget:
     schur_matmul_stmt_size: int | None = None
 
     @classmethod
-    def legacy(cls) -> "SymbolicBudget":
+    def legacy(cls) -> SymbolicBudget:
         """The pre-Plan-B symbolic path (identical to ``SymbolicBudget()``).
 
         Named so callers can *select* the legacy path explicitly and on the
@@ -347,7 +347,7 @@ class SymbolicBudget:
         retain_covariant: bool = False,
         surface_frame: bool | None = None,
         **overrides: Any,
-    ) -> "SymbolicBudget":
+    ) -> SymbolicBudget:
         """Budget-zero: retain the parameterization (chart φ) built from vertices.
 
         Turns off the φ-jet single-operand offload, raises the multi-operand
@@ -376,7 +376,7 @@ class SymbolicBudget:
         )
 
     @classmethod
-    def force_stmts(cls, **overrides: Any) -> "SymbolicBudget":
+    def force_stmts(cls, **overrides: Any) -> SymbolicBudget:
         """The "no symbolic budget" preset: drive every modeled op to a Stmt.
 
         The opposite of :meth:`build_big_symbols`: rather than retaining
@@ -506,7 +506,7 @@ class SymArrayRef:
 
     __slots__ = ("_cells", "_bulk")
 
-    def __init__(self, source: "SymArray | np.ndarray") -> None:
+    def __init__(self, source: SymArray | np.ndarray) -> None:
         self._bulk: BulkOut | None = None
         if isinstance(source, SymArray):
             # Use the placeholder ``_cells`` (NOT the auto-unpacking ``cells``
@@ -581,7 +581,7 @@ class DimAtom:
             object.__setattr__(self, "source", tuple(src))
 
     @staticmethod
-    def from_input(name: str, input_name: str, axis: int) -> "DimAtom":
+    def from_input(name: str, input_name: str, axis: int) -> DimAtom:
         """Construct an input-axis ``DimAtom`` (Stage C)."""
         return DimAtom(name=name, source=("in", input_name, int(axis)))
 
@@ -600,7 +600,7 @@ def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool:
 
 def _resolve_shape(
     shape: tuple[int | DimAtom, ...],
-    dim_bindings: "Mapping[tuple[Any, ...], int]",
+    dim_bindings: Mapping[tuple[Any, ...], int],
 ) -> tuple[int, ...]:
     """Substitute each :class:`DimAtom` in ``shape`` with its bound int.
 
@@ -686,14 +686,14 @@ class SymArray:
     # When set, this SymArray is a *bulk* Stmt output: ``cells`` is a
     # placeholder of the right shape and eval reads the whole tensor from
     # the run-time binding ``_bulk.name`` instead of per-cell atoms.
-    _bulk: "BulkOut | None"
+    _bulk: BulkOut | None
     # Memoised materialisation of a bulk array (see :func:`unpack`).
-    _unpacked: "SymArray | None"
+    _unpacked: SymArray | None
 
     def __init__(
         self,
         cells: Any,
-        program: "Program | None" = None,
+        program: Program | None = None,
         name: str | None = None,
     ) -> None:
         self._bulk = None
@@ -800,7 +800,7 @@ class SymArray:
     # one owning Program.
     # ------------------------------------------------------------------
 
-    def _elementwise(self, other: Any, op: Any) -> "SymArray":
+    def _elementwise(self, other: Any, op: Any) -> SymArray:
         a = self.cells
         if isinstance(other, SymArray):
             b = other.cells
@@ -812,26 +812,26 @@ class SymArray:
             return SymArray(op(a, b), program=prog)
         return SymArray(op(_ensure_object(a), _ensure_object(b)), program=prog)
 
-    def __matmul__(self, other: "SymArray | np.ndarray") -> "SymArray":
+    def __matmul__(self, other: SymArray | np.ndarray) -> SymArray:
         return self.matmul(other)
 
-    def __rmatmul__(self, other: "SymArray | np.ndarray") -> "SymArray":
+    def __rmatmul__(self, other: SymArray | np.ndarray) -> SymArray:
         return SymArray(_to_cells(other), program=self.program).matmul(self)
 
-    def __neg__(self) -> "SymArray":
+    def __neg__(self) -> SymArray:
         a = self.cells
         return SymArray(-a if a.dtype.kind == "f" else -_ensure_object(a), program=self.program)
 
-    def __add__(self, other: Any) -> "SymArray":
+    def __add__(self, other: Any) -> SymArray:
         return self._elementwise(other, lambda x, y: x + y)
 
-    def __radd__(self, other: Any) -> "SymArray":
+    def __radd__(self, other: Any) -> SymArray:
         return self._elementwise(other, lambda x, y: y + x)
 
-    def __sub__(self, other: Any) -> "SymArray":
+    def __sub__(self, other: Any) -> SymArray:
         return self._elementwise(other, lambda x, y: x - y)
 
-    def __rsub__(self, other: Any) -> "SymArray":
+    def __rsub__(self, other: Any) -> SymArray:
         return self._elementwise(other, lambda x, y: y - x)
 
     def __repr__(self) -> str:
@@ -893,16 +893,16 @@ class SymArray:
     # Operation methods (closed-form-or-emit)
     # ------------------------------------------------------------------
 
-    def transpose(self) -> "SymArray":
+    def transpose(self) -> SymArray:
         """Return ``self.T`` as a new SymArray bound to the same program."""
         return SymArray(self.cells.T, program=self.program)
 
     @property
-    def T(self) -> "SymArray":
+    def T(self) -> SymArray:
         """Alias for :meth:`transpose`."""
         return self.transpose()
 
-    def matmul(self, other: "SymArray | np.ndarray") -> "SymArray":
+    def matmul(self, other: SymArray | np.ndarray) -> SymArray:
         """Matrix product ``self @ other``.
 
         Numeric short-circuit when both operands are float arrays;
@@ -915,7 +915,7 @@ class SymArray:
         result = _matmul_cells(_ensure_object(Aa), _ensure_object(Bb))
         return SymArray(result, program=self.program)
 
-    def matvec(self, v: "SymArray | np.ndarray") -> "SymArray":
+    def matvec(self, v: SymArray | np.ndarray) -> SymArray:
         """Matrix–vector product ``self @ v``."""
         Aa = self.cells
         vv = _to_cells(v)
@@ -924,7 +924,7 @@ class SymArray:
         result = _matvec_cells(_ensure_object(Aa), _ensure_object(vv))
         return SymArray(result, program=self.program)
 
-    def det(self, budget: SymbolicBudget | None = None) -> "SymArray":
+    def det(self, budget: SymbolicBudget | None = None) -> SymArray:
         """Return ``det(self)`` as a 0-d SymArray.
 
         Numeric short-circuit; closed-form Bareiss for object cells in
@@ -956,7 +956,7 @@ class SymArray:
         cells[()] = result
         return SymArray(cells, program=self.program)
 
-    def inverse(self, budget: SymbolicBudget | None = None) -> "SymArray":
+    def inverse(self, budget: SymbolicBudget | None = None) -> SymArray:
         """Return ``inv(self)`` as an ``(n, n)`` SymArray.
 
         Numeric short-circuit; closed-form cofactor for object cells in
@@ -984,7 +984,7 @@ class SymArray:
         from .rational import cofactor_inverse
         return SymArray(cofactor_inverse(_ensure_object(self.cells)), program=self.program)
 
-    def pinv(self) -> "SymArray":
+    def pinv(self) -> SymArray:
         """Moore–Penrose pseudoinverse.  Numeric eager; symbolic always emits."""
         if self.cells.dtype.kind == "f":
             return SymArray(np.linalg.pinv(self.cells), program=self.program)
@@ -1004,7 +1004,7 @@ class SymArray:
         )
         return out
 
-    def solve(self, b: "SymArray | np.ndarray") -> "SymArray":
+    def solve(self, b: SymArray | np.ndarray) -> SymArray:
         """Solve ``self @ x = b``.  Numeric eager; symbolic emits ``np.linalg.solve``."""
         Aa = self.cells
         Bb = _to_cells(b)
@@ -1030,7 +1030,7 @@ class SymArray:
     # Scalar Stmt-emitters (sqrt, abs, sign)
     # ------------------------------------------------------------------
 
-    def sqrt(self) -> "SymArray":
+    def sqrt(self) -> SymArray:
         """Element-wise sqrt; numeric eager, symbolic emits a 0-d Stmt per cell.
 
         Restricted to 0-d (scalar) SymArrays in slice B — broader
@@ -1038,15 +1038,15 @@ class SymArray:
         """
         return self._scalar_op(SqrtOp(), "sqrt", float_fn=np.sqrt)
 
-    def abs(self) -> "SymArray":
+    def abs(self) -> SymArray:
         """Element-wise abs; 0-d only in slice B."""
         return self._scalar_op(AbsOp(), "abs", float_fn=np.abs)
 
-    def sign(self) -> "SymArray":
+    def sign(self) -> SymArray:
         """Element-wise sign; 0-d only in slice B."""
         return self._scalar_op(SignOp(), "sign", float_fn=np.sign)
 
-    def _scalar_op(self, stmt_fn, name: str, *, float_fn) -> "SymArray":
+    def _scalar_op(self, stmt_fn, name: str, *, float_fn) -> SymArray:
         if self.cells.dtype.kind == "f":
             return SymArray(np.asarray(float_fn(self.cells)), program=self.program)
         if self.program is None:
@@ -1079,13 +1079,13 @@ class SymArray:
     # Internal: rebinding for Program.copy()
     # ------------------------------------------------------------------
 
-    def _rebind(self, program: "Program") -> "SymArray":
+    def _rebind(self, program: Program) -> SymArray:
         new = SymArray(self._cells, program=program, name=self.name)
         new._bulk = self._bulk
         return new
 
 
-def _program_budget(program: "Program | None") -> "SymbolicBudget":
+def _program_budget(program: Program | None) -> SymbolicBudget:
     """Return the budget on ``program``, or a default ``SymbolicBudget()``."""
     if program is None:
         return SymbolicBudget()
@@ -1389,7 +1389,7 @@ class TensordotOp:
     axes: Any = 2
 
     @classmethod
-    def from_axes(cls, axes: Any) -> "TensordotOp":
+    def from_axes(cls, axes: Any) -> TensordotOp:
         if isinstance(axes, (int, np.integer)):
             return cls(int(axes))
         a, b = axes
@@ -1416,7 +1416,7 @@ class MoveaxisOp:
     destination: Any
 
     @classmethod
-    def from_spec(cls, source: Any, destination: Any) -> "MoveaxisOp":
+    def from_spec(cls, source: Any, destination: Any) -> MoveaxisOp:
         def _norm(x: Any) -> Any:
             if isinstance(x, (int, np.integer)):
                 return int(x)
@@ -1448,7 +1448,7 @@ class MoveaxisOp:
 # identity for the future ``fingerprint`` / partial-eval pass.
 
 
-def _invoke(fn: "Callable[..., Any] | Program", args: Sequence[Any]) -> tuple:
+def _invoke(fn: Callable[..., Any] | Program, args: Sequence[Any]) -> tuple:
     """Run a callable / sub-:class:`Program` on ``args``; return a result tuple.
 
     A :class:`Program` is run with ``args`` mapped to its inputs by position;
@@ -1473,7 +1473,7 @@ class CallOp:
     Frozen + hashable (``fn`` is hashed by identity), like the other typed ops.
     """
 
-    fn: "Callable[..., Any] | Program"
+    fn: Callable[..., Any] | Program
 
     def __call__(self, *operands: Any) -> Any:
         outs = _invoke(self.fn, operands)
@@ -1499,8 +1499,8 @@ class WhileOp:
     single carried value, a tuple otherwise.
     """
 
-    cond: "Callable[..., Any] | Program"
-    body: "Callable[..., Any] | Program"
+    cond: Callable[..., Any] | Program
+    body: Callable[..., Any] | Program
     max_iters: int = 100_000
 
     def __call__(self, *operands: Any) -> Any:
@@ -1571,7 +1571,7 @@ class EinsumOp:
     rhs_bytes: bytes
 
     @classmethod
-    def from_rhs(cls, spec: str, rhs: np.ndarray) -> "EinsumOp":
+    def from_rhs(cls, spec: str, rhs: np.ndarray) -> EinsumOp:
         rhs = np.ascontiguousarray(rhs)
         return cls(
             spec=spec,
@@ -1595,13 +1595,13 @@ class EinsumOp:
 
 def runtime_einsum(
     spec: str,
-    lhs: "np.ndarray | SymArray",
+    lhs: np.ndarray | SymArray,
     rhs: np.ndarray,
     *,
-    program: "Program | None",
+    program: Program | None,
     out_shape: tuple,
     name: str = "einsum",
-) -> "np.ndarray | SymArray":
+) -> np.ndarray | SymArray:
     """Defer a symbolic ``einsum(spec, lhs, rhs)`` to a runtime
     :class:`EinsumOp` Stmt.
 
@@ -1657,7 +1657,7 @@ def _cell_size(cell: Any) -> int:
         return 0
 
 
-def cells_use_only_stmt_atoms(arr: np.ndarray, env: "SymbolEnv") -> bool:
+def cells_use_only_stmt_atoms(arr: np.ndarray, env: SymbolEnv) -> bool:
     """True iff every symbolic cell of ``arr`` is built ONLY from
     runtime (``stmt_out``) atoms.
 
@@ -1955,10 +1955,10 @@ def _einsum_output_shape(
 
 def dispatch_einsum(
     *args: Any,
-    program: "Program | None",
+    program: Program | None,
     name: str = "einsum",
     optimize: bool = True,
-) -> "np.ndarray | SymArray":
+) -> np.ndarray | SymArray:
     """``np.einsum``-compatible signature that dispatches through the offload.
 
     Accepts the string-form ``(spec, *operands)`` or the integer-label
@@ -1986,11 +1986,11 @@ def dispatch_einsum(
 
 def runtime_einsum_multi(
     spec: str,
-    *operands: "np.ndarray | SymArray",
-    program: "Program | None",
+    *operands: np.ndarray | SymArray,
+    program: Program | None,
     out_shape: tuple,
     name: str = "einsum_multi",
-) -> "np.ndarray | SymArray":
+) -> np.ndarray | SymArray:
     """Multi-operand symbolic einsum with size-aware materialisation.
 
     Estimates the per-output-cell monomial count from the contracted
@@ -2054,7 +2054,7 @@ def runtime_einsum_multi(
 def freeze_array_bulk(
     arr: np.ndarray,
     *,
-    program: "Program | None",
+    program: Program | None,
     name: str = "frozen",
 ) -> np.ndarray:
     """Bulk variant: emit a single :class:`Stmt` for the whole tensor.
@@ -2091,7 +2091,7 @@ def freeze_array_bulk(
 def freeze_array(
     arr: np.ndarray,
     *,
-    program: "Program | None",
+    program: Program | None,
     threshold: int = 20,
     name: str = "frozen",
 ) -> np.ndarray:
@@ -2138,7 +2138,7 @@ def freeze_array(
     return out
 
 
-def unpack(sa: Any, *, program: "Program | None" = None) -> Any:
+def unpack(sa: Any, *, program: Program | None = None) -> Any:
     """Materialise a bulk :class:`SymArray` into per-cell atom RFs.
 
     A *bulk* SymArray (``_bulk`` set, produced by ``emit_stmt(bulk=True)``)
@@ -2444,13 +2444,13 @@ class Program:
 
     def emit_stmt(
         self,
-        fn: "Callable[..., Any] | Program",
-        in_refs: Sequence["Ref | SymArray"],
-        out_specs: Sequence["OutSpec"],
+        fn: Callable[..., Any] | Program,
+        in_refs: Sequence[Ref | SymArray],
+        out_specs: Sequence[OutSpec],
         note: str = "",
         bulk: bool = True,
-        provenance: "Provenance | None" = None,
-    ) -> tuple["SymArray", ...]:
+        provenance: Provenance | None = None,
+    ) -> tuple[SymArray, ...]:
         """Append an imperative :class:`Stmt` and return its outputs.
 
         Allocates one fresh atom RF per cell of every declared output
@@ -2545,7 +2545,7 @@ class Program:
     # Copy (for sub-interpreters)
     # ------------------------------------------------------------------
 
-    def copy(self) -> "Program":
+    def copy(self) -> Program:
         """Return an independent copy with all SymArrays rebound to the new program.
 
         Inputs (frozen :class:`SymInput` descriptors) and ring data are
@@ -2821,7 +2821,7 @@ class Program:
 
     def _sub_value_map(
         self,
-        sub: "Program",
+        sub: Program,
         resolved_inputs: list[Any],
     ) -> dict[str, np.ndarray]:
         """Build a ``values`` dict for a sub-program's :meth:`run`."""

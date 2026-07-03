@@ -74,21 +74,21 @@ class _SympyRing:
         return len(self._names)
 
     @property
-    def one(self) -> "_SympyPoly":
+    def one(self) -> _SympyPoly:
         return self._one
 
     @property
-    def zero(self) -> "_SympyPoly":
+    def zero(self) -> _SympyPoly:
         return self._zero
 
     @property
-    def gens(self) -> tuple["_SympyPoly", ...]:
+    def gens(self) -> tuple[_SympyPoly, ...]:
         return self._gens
 
-    def gen(self, i: int) -> "_SympyPoly":
+    def gen(self, i: int) -> _SympyPoly:
         return self._gens[i]
 
-    def ground_new(self, value: Any) -> "_SympyPoly":
+    def ground_new(self, value: Any) -> _SympyPoly:
         if isinstance(value, sp.Rational):
             coerced = _RR.convert(value)
         elif isinstance(value, (int, float)):
@@ -97,7 +97,7 @@ class _SympyRing:
             coerced = value
         return _SympyPoly(self._ring.ground_new(coerced), self)
 
-    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> "_SympyPoly":
+    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> _SympyPoly:
         if not terms:
             return self._zero
         coerced = {m: _RR(c) if not isinstance(c, sp.Rational) else _RR.convert(c)
@@ -141,37 +141,37 @@ class _SympyPoly:
     def __hash__(self) -> int:
         return hash(self._p)
 
-    def __neg__(self) -> "_SympyPoly":
+    def __neg__(self) -> _SympyPoly:
         return _SympyPoly(-self._p, self._ring)
 
-    def __add__(self, other: Any) -> "_SympyPoly":
+    def __add__(self, other: Any) -> _SympyPoly:
         if isinstance(other, _SympyPoly):
             return _SympyPoly(self._p + other._p, self._ring)
         if isinstance(other, (int, float)):
             return _SympyPoly(self._p + _RR(other), self._ring)
         return NotImplemented
 
-    def __radd__(self, other: Any) -> "_SympyPoly":
+    def __radd__(self, other: Any) -> _SympyPoly:
         return self.__add__(other)
 
-    def __sub__(self, other: Any) -> "_SympyPoly":
+    def __sub__(self, other: Any) -> _SympyPoly:
         if isinstance(other, _SympyPoly):
             return _SympyPoly(self._p - other._p, self._ring)
         if isinstance(other, (int, float)):
             return _SympyPoly(self._p - _RR(other), self._ring)
         return NotImplemented
 
-    def __mul__(self, other: Any) -> "_SympyPoly":
+    def __mul__(self, other: Any) -> _SympyPoly:
         if isinstance(other, _SympyPoly):
             return _SympyPoly(self._p * other._p, self._ring)
         if isinstance(other, (int, float)):
             return _SympyPoly(self._p * _RR(other), self._ring)
         return NotImplemented
 
-    def __rmul__(self, other: Any) -> "_SympyPoly":
+    def __rmul__(self, other: Any) -> _SympyPoly:
         return self.__mul__(other)
 
-    def __pow__(self, n: int) -> "_SympyPoly":
+    def __pow__(self, n: int) -> _SympyPoly:
         return _SympyPoly(self._p ** int(n), self._ring)
 
     def total_degree(self) -> int:
@@ -192,7 +192,7 @@ class _SympyPoly:
             return _RR(0)
         return self._p.LC
 
-    def cancel(self, other: "_SympyPoly") -> tuple["_SympyPoly", "_SympyPoly"]:
+    def cancel(self, other: _SympyPoly) -> tuple[_SympyPoly, _SympyPoly]:
         n2, d2 = self._p.cancel(other._p)
         return _SympyPoly(n2, self._ring), _SympyPoly(d2, self._ring)
 
@@ -309,21 +309,21 @@ class _FlintRing:
         return len(self._names)
 
     @property
-    def one(self) -> "_FlintPoly":
+    def one(self) -> _FlintPoly:
         return self._one
 
     @property
-    def zero(self) -> "_FlintPoly":
+    def zero(self) -> _FlintPoly:
         return self._zero
 
     @property
-    def gens(self) -> tuple["_FlintPoly", ...]:
+    def gens(self) -> tuple[_FlintPoly, ...]:
         return self._gens
 
-    def gen(self, i: int) -> "_FlintPoly":
+    def gen(self, i: int) -> _FlintPoly:
         return self._gens[i]
 
-    def ground_new(self, value: Any) -> "_FlintPoly":
+    def ground_new(self, value: Any) -> _FlintPoly:
         if not self._names:
             return _FlintPoly(self._ctx.from_dict({(): _float_to_fmpq(value)}), self)
         one_monom = (0,) * len(self._names)
@@ -331,7 +331,7 @@ class _FlintRing:
             self._ctx.from_dict({one_monom: _float_to_fmpq(value)}), self
         )
 
-    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> "_FlintPoly":
+    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> _FlintPoly:
         if not terms:
             return self._zero
         coerced = {m: _float_to_fmpq(c) for m, c in terms.items()}
@@ -366,37 +366,37 @@ class _FlintPoly:
         # fmpq_mpoly may not hash; fall back to repr identity.
         return hash(repr(self._p))
 
-    def __neg__(self) -> "_FlintPoly":
+    def __neg__(self) -> _FlintPoly:
         return _FlintPoly(-self._p, self._ring)
 
-    def __add__(self, other: Any) -> "_FlintPoly":
+    def __add__(self, other: Any) -> _FlintPoly:
         if isinstance(other, _FlintPoly):
             return _FlintPoly(self._p + other._p, self._ring)
         if isinstance(other, (int, float)):
             return _FlintPoly(self._p + _float_to_fmpq(other), self._ring)
         return NotImplemented
 
-    def __radd__(self, other: Any) -> "_FlintPoly":
+    def __radd__(self, other: Any) -> _FlintPoly:
         return self.__add__(other)
 
-    def __sub__(self, other: Any) -> "_FlintPoly":
+    def __sub__(self, other: Any) -> _FlintPoly:
         if isinstance(other, _FlintPoly):
             return _FlintPoly(self._p - other._p, self._ring)
         if isinstance(other, (int, float)):
             return _FlintPoly(self._p - _float_to_fmpq(other), self._ring)
         return NotImplemented
 
-    def __mul__(self, other: Any) -> "_FlintPoly":
+    def __mul__(self, other: Any) -> _FlintPoly:
         if isinstance(other, _FlintPoly):
             return _FlintPoly(self._p * other._p, self._ring)
         if isinstance(other, (int, float)):
             return _FlintPoly(self._p * _float_to_fmpq(other), self._ring)
         return NotImplemented
 
-    def __rmul__(self, other: Any) -> "_FlintPoly":
+    def __rmul__(self, other: Any) -> _FlintPoly:
         return self.__mul__(other)
 
-    def __pow__(self, n: int) -> "_FlintPoly":
+    def __pow__(self, n: int) -> _FlintPoly:
         return _FlintPoly(self._p ** int(n), self._ring)
 
     def total_degree(self) -> int:
@@ -421,7 +421,7 @@ class _FlintPoly:
             return fmpq(0)
         return self._p.leading_coefficient()
 
-    def cancel(self, other: "_FlintPoly") -> tuple["_FlintPoly", "_FlintPoly"]:
+    def cancel(self, other: _FlintPoly) -> tuple[_FlintPoly, _FlintPoly]:
         # Flint exposes ``gcd`` on fmpq_mpoly; ``self / gcd`` is exact
         # division.  Skip the gcd call (which is non-trivial) when either
         # operand is one — ``a / 1 == a``.
@@ -454,10 +454,10 @@ class _FlintPoly:
         return f"_FlintPoly({self._p!r})"
 
 
-_FLINT_RING_CACHE: dict[tuple[str, ...], "_FlintRing"] = {}
+_FLINT_RING_CACHE: dict[tuple[str, ...], _FlintRing] = {}
 
 
-def _flint_make_ring(names: Sequence[str]) -> "_FlintRing":
+def _flint_make_ring(names: Sequence[str]) -> _FlintRing:
     if not _FLINT_AVAILABLE:
         raise RuntimeError("python-flint is not installed; cannot use flint backend")
     key = tuple(names)
@@ -470,7 +470,7 @@ def _flint_make_ring(names: Sequence[str]) -> "_FlintRing":
     return ring
 
 
-def _flint_lift(poly: "_FlintPoly", target: "_FlintRing") -> "_FlintPoly":
+def _flint_lift(poly: _FlintPoly, target: _FlintRing) -> _FlintPoly:
     src = poly._ring
     if src is target:
         return poly

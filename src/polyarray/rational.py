@@ -86,7 +86,7 @@ def eager_cancel(den_degree_threshold: int = 2):
         _EAGER_CANCEL.reset(tok)
 
 
-def _maybe_cancel(rf: "RationalFunction") -> "RationalFunction":
+def _maybe_cancel(rf: RationalFunction) -> RationalFunction:
     thr = _EAGER_CANCEL.get()
     if thr and isinstance(rf, RationalFunction):
         try:
@@ -260,7 +260,7 @@ class RationalFunction:
     # ------------------------------------------------------------------
 
     @classmethod
-    def constant(cls, value: NumericLike, ring: Ring | None = None) -> "RationalFunction":
+    def constant(cls, value: NumericLike, ring: Ring | None = None) -> RationalFunction:
         """Build a constant ``RationalFunction`` with the given value.
 
         When ``ring`` is omitted, a 0-generator ring is allocated.
@@ -270,7 +270,7 @@ class RationalFunction:
         return cls(r.ground_new(c), r.one)
 
     @classmethod
-    def generator(cls, ring: Ring, name: str) -> "RationalFunction":
+    def generator(cls, ring: Ring, name: str) -> RationalFunction:
         """Return the rational function ``g`` for the named generator of ``ring``."""
         names = ring.names
         try:
@@ -282,7 +282,7 @@ class RationalFunction:
         return cls(ring.gens[i], ring.one)
 
     @classmethod
-    def atom(cls, name: str) -> "RationalFunction":
+    def atom(cls, name: str) -> RationalFunction:
         """Build the rational function ``x`` for a fresh single-generator ring named ``name``.
 
         Convenience wrapper around :meth:`generator` that allocates the
@@ -296,7 +296,7 @@ class RationalFunction:
         cls,
         num: Poly,
         den: Poly | None = None,
-    ) -> "RationalFunction":
+    ) -> RationalFunction:
         """Build a :class:`RationalFunction` from raw polynomials."""
         return cls(num, den)
 
@@ -364,7 +364,7 @@ class RationalFunction:
     # Arithmetic helpers
     # ------------------------------------------------------------------
 
-    def _coerce(self, other: Any) -> "RationalFunction":
+    def _coerce(self, other: Any) -> RationalFunction:
         """Bring ``other`` into a ``RationalFunction`` over the same ring as ``self``."""
         if isinstance(other, RationalFunction):
             if other._ring is self._ring:
@@ -377,7 +377,7 @@ class RationalFunction:
             return RationalFunction.constant(other, self._ring)
         return NotImplemented
 
-    def _aligned(self, other: "RationalFunction") -> tuple["RationalFunction", "RationalFunction"]:
+    def _aligned(self, other: RationalFunction) -> tuple[RationalFunction, RationalFunction]:
         """Return ``(self, other)`` rebuilt over a common ring."""
         if self._ring is other._ring:
             return self, other
@@ -390,13 +390,13 @@ class RationalFunction:
     # Arithmetic
     # ------------------------------------------------------------------
 
-    def __neg__(self) -> "RationalFunction":
+    def __neg__(self) -> RationalFunction:
         return RationalFunction(-self._num, self._den)
 
-    def __pos__(self) -> "RationalFunction":
+    def __pos__(self) -> RationalFunction:
         return self
 
-    def __add__(self, other: Any) -> "RationalFunction":
+    def __add__(self, other: Any) -> RationalFunction:
         # Short-circuit on either operand being zero — saves the
         # ``_coerce`` / ``_aligned`` / ring-arithmetic cost in the
         # ``Σ ... + ...`` accumulators that drive ``compose_jets`` and
@@ -426,10 +426,10 @@ class RationalFunction:
             return _maybe_cancel(RationalFunction(a._num + b._num, a._den))
         return _maybe_cancel(RationalFunction(a._num * b._den + b._num * a._den, a._den * b._den))
 
-    def __radd__(self, other: Any) -> "RationalFunction":
+    def __radd__(self, other: Any) -> RationalFunction:
         return self.__add__(other)
 
-    def __sub__(self, other: Any) -> "RationalFunction":
+    def __sub__(self, other: Any) -> RationalFunction:
         coerced = self._coerce(other)
         if coerced is NotImplemented:
             return NotImplemented
@@ -438,13 +438,13 @@ class RationalFunction:
             return _maybe_cancel(RationalFunction(a._num - b._num, a._den))
         return _maybe_cancel(RationalFunction(a._num * b._den - b._num * a._den, a._den * b._den))
 
-    def __rsub__(self, other: Any) -> "RationalFunction":
+    def __rsub__(self, other: Any) -> RationalFunction:
         coerced = self._coerce(other)
         if coerced is NotImplemented:
             return NotImplemented
         return coerced.__sub__(self)
 
-    def __mul__(self, other: Any) -> "RationalFunction":
+    def __mul__(self, other: Any) -> RationalFunction:
         # Short-circuit on either operand being zero — same identity
         # as ``a * 0 = 0`` and ``0 * b = 0``; saves the ring
         # multiplication on the carrier polynomials.
@@ -458,10 +458,10 @@ class RationalFunction:
         a, b = self._aligned(coerced)
         return _maybe_cancel(RationalFunction(a._num * b._num, a._den * b._den))
 
-    def __rmul__(self, other: Any) -> "RationalFunction":
+    def __rmul__(self, other: Any) -> RationalFunction:
         return self.__mul__(other)
 
-    def __truediv__(self, other: Any) -> "RationalFunction":
+    def __truediv__(self, other: Any) -> RationalFunction:
         coerced = self._coerce(other)
         if coerced is NotImplemented:
             return NotImplemented
@@ -470,13 +470,13 @@ class RationalFunction:
             raise ZeroDivisionError("division by zero RationalFunction")
         return RationalFunction(a._num * b._den, a._den * b._num)
 
-    def __rtruediv__(self, other: Any) -> "RationalFunction":
+    def __rtruediv__(self, other: Any) -> RationalFunction:
         coerced = self._coerce(other)
         if coerced is NotImplemented:
             return NotImplemented
         return coerced.__truediv__(self)
 
-    def __pow__(self, exponent: int) -> "RationalFunction":
+    def __pow__(self, exponent: int) -> RationalFunction:
         if not isinstance(exponent, (int, sp.Integer)):
             raise TypeError(f"RationalFunction exponent must be int; got {type(exponent).__name__}")
         n = int(exponent)
@@ -587,7 +587,7 @@ class RationalFunction:
     # Symbolic substitution (build-time `compose`)
     # ------------------------------------------------------------------
 
-    def compose(self, name: str, repl: "RationalFunction") -> "RationalFunction":
+    def compose(self, name: str, repl: RationalFunction) -> RationalFunction:
         """Substitute generator ``name`` with the rational function ``repl``.
 
         ``repl`` is a :class:`RationalFunction` over *other* generators.
@@ -621,8 +621,8 @@ class RationalFunction:
         return new_num / new_den
 
     def compose_multi(
-        self, mapping: Mapping[str, "RationalFunction"]
-    ) -> "RationalFunction":
+        self, mapping: Mapping[str, RationalFunction]
+    ) -> RationalFunction:
         """Substitute several generators at once (see :meth:`compose`).
 
         Each ``repl`` must be over generators *disjoint* from ``mapping``'s
@@ -740,7 +740,7 @@ class RationalFunction:
             _weighted_total_degree(self._den, weights),
         )
 
-    def try_cancel(self, max_den_degree: int = 1) -> "RationalFunction":
+    def try_cancel(self, max_den_degree: int = 1) -> RationalFunction:
         """Cancel common factors when the denominator is "cheap enough".
 
         Runs :meth:`clean` only when the denominator's total degree is
@@ -754,7 +754,7 @@ class RationalFunction:
             return self.clean()
         return self
 
-    def clean(self, tol: float = 0.0) -> "RationalFunction":
+    def clean(self, tol: float = 0.0) -> RationalFunction:
         """Cancel common factors of numerator and denominator.
 
         ``tol`` is reserved for a future numeric-zeroing pass; today it
@@ -980,9 +980,9 @@ def _compose_poly(
     poly: Poly,
     src_names: tuple[str, ...],
     name_pos: int,
-    repl_t: "RationalFunction",
+    repl_t: RationalFunction,
     target: Ring,
-) -> "RationalFunction":
+) -> RationalFunction:
     """Substitute the generator at ``name_pos`` with ``repl_t`` in ``poly``.
 
     The symbolic analogue of :func:`_partial_substitute`: iterate ``poly``'s
@@ -1000,7 +1000,7 @@ def _compose_poly(
         0: RationalFunction.constant(1, target)
     }
 
-    def repl_pow(e: int) -> "RationalFunction":
+    def repl_pow(e: int) -> RationalFunction:
         p = pow_cache.get(e)
         if p is None:
             p = repl_t ** e
@@ -1053,7 +1053,7 @@ def simple_zero(value: Any) -> bool:
 # Bareiss determinant (fraction-free elimination)
 # ---------------------------------------------------------------------------
 
-def bareiss_det(matrix: np.ndarray) -> "RationalFunction | float":
+def bareiss_det(matrix: np.ndarray) -> RationalFunction | float:
     """Return ``det(matrix)`` over :class:`RationalFunction` cells.
 
     ``matrix`` is an ``(n, n)`` ndarray of cells (``RationalFunction``

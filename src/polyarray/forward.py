@@ -32,7 +32,7 @@ from .rational import RationalFunction
 # Descent into nested programs (sub-Programs + vmap closure bodies)
 # ---------------------------------------------------------------------------
 
-def _body_of(fn) -> "Program | None":
+def _body_of(fn) -> Program | None:
     """Pull a per-point body :class:`Program` out of a ``vmap`` closure."""
     for c in getattr(fn, "__closure__", None) or ():
         try:
