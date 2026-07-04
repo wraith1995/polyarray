@@ -220,6 +220,27 @@ def partial_eval(program: Program, *, max_cell_size: int) -> Program
     # partial_eval(p).run(x) == p.run(x).
 ```
 
+## Degree estimation (`degree.py`)
+
+```python
+def program_degree(program: Program, seed: Mapping[str, float], *,
+                   gen_deg: Callable[[str], int] | None = None,
+                   zero_ops: frozenset[str] = frozenset(),
+                   passthrough_ops: frozenset[str] = frozenset(),
+                   multilinear_ops: frozenset[str] = frozenset()) -> float
+    # Whole-program POLYNOMIAL degree of the output in the seeded inputs
+    # (fem task #9, lifted from pointwise). Sound over-estimation:
+    # multilinear ops SUM, passthrough/additive MAX, all-constant
+    # operands short-circuit to 0, det of an (n,n) degree-d operand is
+    # n*d, CallOp (vmap) bodies are unwrapped and recursed; genuinely
+    # rational/algebraic ops (inv/pinv/solve/sqrt/svd/...) on a
+    # seed-dependent value give inf — the caller supplies its own order
+    # there. The *_ops sets EXTEND the native categories with a front
+    # end's op names (the `to_numpy_source(op_renderers=)` pattern);
+    # domain seeding (FE degrees, affine geometry gates) stays with the
+    # caller (pointwise `estimate_degree`).
+```
+
 ## Backends
 
 Selected at import time of `polyarray.poly_backend` from the
