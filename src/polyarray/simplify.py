@@ -407,6 +407,143 @@ def bind_inputs(program: Program, bind: Mapping[str, Any]) -> Program:
     return specialize(program, bind=bind)
 
 
+def _read_stmt_outs(stmt: Stmt, bindings: Mapping[str, Any]) -> list[np.ndarray] | None:
+    """Read a Stmt's OUTPUT arrays back from a completed run's ``bindings`` (the dict
+    ``Program.build_runtime_bindings`` returns): a bulk output under its bulk name, a
+    per-cell output assembled from its cell atoms. ``None`` when any piece is absent
+    (e.g. a dynamic shape this pass does not handle)."""
+    outs: list[np.ndarray] = []
+    for bound in stmt.out:
+        if bound._bulk is not None:
+            val = bindings.get(bound._bulk.name)
+            if val is None:
+                return None
+            outs.append(np.asarray(val, dtype=float))
+            continue
+        cells = np.asarray(bound.cells)
+        arr = np.empty(cells.shape, dtype=float)
+        for idx in (np.ndindex(*cells.shape) if cells.shape else [()]):
+            cell = cells[idx] if cells.shape else cells[()]
+            if isinstance(cell, RationalFunction):
+                key = cell.gens[0] if cell.gens else None
+                if key is None or key not in bindings:
+                    return None
+                arr[idx] = float(bindings[key])
+            else:
+                try:
+                    arr[idx] = float(cell)
+                except (TypeError, ValueError):
+                    return None
+        outs.append(arr)
+    return outs
+
+
+def _partial_eval_numeric(
+    program: Program, *, probes: int, seed: int, rtol: float, atol: float,
+) -> "tuple[Program, dict]":
+    """Probe-and-freeze partial evaluation: fold every Stmt whose outputs are
+    NUMERICALLY INVARIANT under the program's symbolic inputs.
+
+    ``fold_numeric`` folds only numeric-CLOSED subcomputations (dataflow: no symbolic
+    ancestor). This pass folds the strictly larger class of subcomputations whose
+    outputs merely do not DEPEND on the symbolic inputs — discovered by running the
+    program under ``probes`` random input bindings and freezing every Stmt output that
+    is bit-finite and equal (``rtol``/``atol``) across all runs. The canonical case: a
+    chain ``inv(A) → A·inv(A)`` is identically ``I`` for every ``A`` — dataflow says
+    symbolic, probing says constant. (The FEEC motivation: a metric-free DOF's nested
+    grass program is fed one vertex-symbolic Jacobian buffer whose contribution
+    provably cancels; this pass collapses the whole ``grass_dof`` Stmt to its
+    reference value, making the symbolic Vandermonde STRUCTURALLY constant.)
+
+    SOUNDNESS: probabilistic (polynomial identity testing), NOT exact-by-construction
+    like ``specialize`` — a cell equal at every probe by coincidence would be frozen
+    wrongly. Probes are i.i.d. over a continuous box, so for the rational-function
+    cells this IR produces, false freezes have measure zero; raise ``probes`` for
+    belt-and-braces. Statement granularity: an intermediate that genuinely varies
+    (a per-probe ``Q`` factor, say) stays symbolic even when a DOWNSTREAM output is
+    invariant — the downstream Stmt still folds on its own.
+
+    Static inputs only (a ``DimAtom``-shaped input raises ``NotImplementedError``).
+    Inputs are never dropped — unused ones simply go unread at ``run`` time.
+    """
+    if probes < 2:
+        raise ValueError(f"partial_eval_numeric needs ≥ 2 probes, got {probes}")
+    for inp in program.inputs:
+        for dim in inp.shape:
+            if not isinstance(dim, int):
+                raise NotImplementedError(
+                    f"partial_eval_numeric: dynamic input {inp.name!r} (DimAtom axis) unsupported")
+
+    rng = np.random.default_rng(seed)
+    runs: list[Mapping[str, Any]] = []
+    for _ in range(probes):
+        vals = {inp.name: rng.uniform(0.6, 1.6, size=tuple(inp.shape))
+                for inp in program.inputs}
+        runs.append(program.build_runtime_bindings(vals))
+
+    per_probe_outs: list[list[list[np.ndarray] | None]] = [
+        [_read_stmt_outs(stmt, b) for stmt in program.statements] for b in runs
+    ]
+
+    new = program.copy()
+    known: dict[str, Any] = {}
+    foldable: set[int] = set()
+    for i, stmt in enumerate(new.statements):
+        outs0 = per_probe_outs[0][i]
+        if outs0 is None or any(not np.all(np.isfinite(o)) for o in outs0):
+            continue
+        invariant = all(
+            per_probe_outs[p][i] is not None
+            and all(np.allclose(a, b, rtol=rtol, atol=atol)
+                    for a, b in zip(outs0, per_probe_outs[p][i], strict=True))
+            for p in range(1, probes)
+        )
+        if not invariant:
+            continue
+        try:
+            staged = dict(known)
+            _record_known(stmt, outs0, staged)
+        except ValueError:
+            continue
+        known = staged
+        foldable.add(i)
+
+    survivors = [i for i in range(len(new.statements)) if i not in foldable]
+    idx_map = {old: new_i for new_i, old in enumerate(survivors)}
+    new_statements: list[Stmt] = []
+    for i in survivors:
+        st = new.statements[i]
+        new_in = tuple(_fold_ref(new, r, i, known, idx_map) for r in st.in_)
+        new_statements.append(Stmt(fn=st.fn, in_=new_in, out=st.out, note=st.note,
+                                   provenance=st.provenance, inline=st.inline))
+    new.statements = new_statements
+    new.outputs = {k: _fold_symarray(sa, known, new, k) for k, sa in new.outputs.items()}
+    return new, known
+
+
+def partial_eval_numeric(
+    program: Program, *, probes: int = 3, seed: int = 0,
+    rtol: float = 1e-9, atol: float = 1e-12,
+) -> Program:
+    new, _known = _partial_eval_numeric(program, probes=probes, seed=seed, rtol=rtol, atol=atol)
+    return new
+
+
+def partial_eval_numeric_symarray(
+    sa: "SymArray", *, probes: int = 3, seed: int = 0,
+    rtol: float = 1e-9, atol: float = 1e-12,
+) -> "SymArray":
+    """:func:`partial_eval_numeric` for a ``SymArray`` whose CELLS reference the
+    program's atoms (e.g. a symbolic Vandermonde whose cells are ``grass_dof.result``
+    refs): folds the threaded program AND the cells together, so an invariant atom
+    becomes a numeric cell — the STRUCTURAL form of the array."""
+    from .ir import SymArray
+    if sa.program is None:
+        return sa
+    new, known = _partial_eval_numeric(sa.program, probes=probes, seed=seed, rtol=rtol, atol=atol)
+    return SymArray(_fold_cells(np.asarray(sa.cells), known), program=new)
+
+
 # ---------------------------------------------------------------------------
 # P3: symbolic argument substitution (`subs`)
 # ---------------------------------------------------------------------------
