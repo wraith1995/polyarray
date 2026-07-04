@@ -257,3 +257,58 @@ def test_outputref_reindex_after_fold() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------------------------
+# partial_eval_numeric: probe-and-freeze — folds INVARIANT (not just numeric-
+# closed) subcomputations. Canonical case: A·inv(A) ≡ I for every A.
+# ---------------------------------------------------------------------------
+
+def test_partial_eval_numeric_freezes_invariant_chain() -> None:
+    from polyarray import InvOp, partial_eval_numeric
+
+    prog = Program("painv", inputs=[SymInput("A", (2, 2), _prov("A"))])
+    [B] = prog.emit_stmt(InvOp(), [prog.input("A")], [OutSpec("B", (2, 2))], bulk=False)
+    [C] = prog.emit_stmt(
+        TensordotOp.from_axes(([1], [0])),
+        [prog.input("A"), OutputRef(0, 0)],
+        [OutSpec("C", (2, 2))],
+        bulk=False,
+    )
+    prog.add_output("C", C.cells)
+
+    # fold_numeric cannot touch it (A is symbolic everywhere) …
+    assert len(fold_numeric(prog).statements) == 2
+    # … probing discovers C ≡ I and freezes BOTH stmts (inv(A) varies, so it
+    # survives only if referenced — here its sole consumer folded too, but we
+    # keep statement-level granularity: the inv stmt itself VARIES per probe).
+    folded = partial_eval_numeric(prog)
+    rng = np.random.default_rng(7)
+    A = rng.uniform(0.5, 1.5, (2, 2)) + np.eye(2)
+    np.testing.assert_allclose(folded.run({"A": A})["C"], np.eye(2), atol=1e-9)
+    # the matmul stmt folded away; C's cells are numeric constants
+    assert len(folded.statements) < 2 or all(
+        not isinstance(c, type(prog.outputs["C"].cells.ravel()[0]))
+        for c in np.asarray(folded.outputs["C"].cells).ravel()
+    ) or np.allclose(np.asarray(folded.outputs["C"].cells, dtype=float), np.eye(2))
+
+
+def test_partial_eval_numeric_keeps_genuinely_variant_outputs() -> None:
+    from polyarray import partial_eval_numeric
+
+    prog = Program(
+        "var",
+        inputs=[SymInput("A", (2, 3), _prov("A")), SymInput("B", (3, 4), _prov("B"))],
+    )
+    [C] = prog.emit_stmt(
+        TensordotOp.from_axes(([1], [0])),
+        [prog.input("A"), prog.input("B")],
+        [OutSpec("C", (2, 4))],
+        bulk=False,
+    )
+    prog.add_output("C", C.cells)
+    folded = partial_eval_numeric(prog)
+    assert len(folded.statements) == 1              # A·B genuinely varies — untouched
+    rng = np.random.default_rng(1)
+    vals = {"A": rng.standard_normal((2, 3)), "B": rng.standard_normal((3, 4))}
+    np.testing.assert_allclose(folded.run(vals)["C"], prog.run(vals)["C"])
