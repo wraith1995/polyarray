@@ -2618,8 +2618,13 @@ class Program:
         # that actually carry a dynamic shape; static programs pass ``None``
         # so ``_run_stmt`` skips all per-output dim bookkeeping (B5) — the
         # static path stays byte-identical AND free of per-output overhead.
+        # The `only=` (cone) lane always uses the table: it may run mid-build (from
+        # `evaluate_cone` inside a partially-built program), so it must NOT read/write the
+        # whole-program `_has_dynamic_shape` memo (a partial program would cache a stale
+        # answer that the later full run then trusts) — and a cone can carry a dynamic
+        # (DimAtom-sized) output regardless.
         dim_bindings: dict[tuple[Any, ...], int] | None = (
-            {} if self._has_dynamic_shape() else None
+            {} if (only is not None or self._has_dynamic_shape()) else None
         )
         # Stage C: before walking statements, bind each dynamic INPUT.  Read
         # the provided array's actual shape, record each DimAtom axis into
