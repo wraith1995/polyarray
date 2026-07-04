@@ -440,7 +440,7 @@ def _read_stmt_outs(stmt: Stmt, bindings: Mapping[str, Any]) -> list[np.ndarray]
 
 def _partial_eval_numeric(
     program: Program, *, probes: int, seed: int, rtol: float, atol: float,
-) -> "tuple[Program, dict]":
+) -> tuple[Program, dict]:
     """Probe-and-freeze partial evaluation: fold every Stmt whose outputs are
     NUMERICALLY INVARIANT under the program's symbolic inputs.
 
@@ -530,9 +530,9 @@ def partial_eval_numeric(
 
 
 def partial_eval_numeric_symarray(
-    sa: "SymArray", *, probes: int = 3, seed: int = 0,
+    sa: SymArray, *, probes: int = 3, seed: int = 0,
     rtol: float = 1e-9, atol: float = 1e-12,
-) -> "SymArray":
+) -> SymArray:
     """:func:`partial_eval_numeric` for a ``SymArray`` whose CELLS reference the
     program's atoms (e.g. a symbolic Vandermonde whose cells are ``grass_dof.result``
     refs): folds the threaded program AND the cells together, so an invariant atom
