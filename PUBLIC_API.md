@@ -230,6 +230,16 @@ def partial_eval_numeric_symarray(sa: SymArray, **kw) -> SymArray
     # Strictly stronger than the dataflow fold_numeric: collapses e.g. A·inv(A) ≡ I
     # and a metric-free grass_dof whose symbolic Jacobian input provably cancels.
     # The _symarray form also folds the cells (invariant atom -> numeric cell).
+
+def dependency_cone(program: Program, target: SymArray) -> set[int]
+    # The statement indices `target` transitively depends on (via input Refs +
+    # DimAtom shape sources).
+def evaluate_cone(program: Program, target: SymArray, values: Mapping) -> np.ndarray
+    # Evaluate `target` by running ONLY its dependency cone at `values` — statements
+    # outside the cone are NEVER executed, so a singular / failing op elsewhere in a
+    # (possibly partially-built) shared program cannot crash or affect the probe.
+    # Equals target.evaluate(values) whenever the full run would succeed.
+    # (Program.build_runtime_bindings gained `only=<stmt indices>` for this lane.)
 ```
 ```
 

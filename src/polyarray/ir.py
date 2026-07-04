@@ -27,7 +27,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Union
 
@@ -2594,7 +2594,7 @@ class Program:
         return out
 
     def build_runtime_bindings(
-        self, values: Mapping[str, Any],
+        self, values: Mapping[str, Any], *, only: Iterable[int] | None = None,
     ) -> dict[str, float]:
         """Run statements and return the full per-atom bindings dict.
 
@@ -2602,6 +2602,13 @@ class Program:
         evaluating outputs — exposed so a :class:`SymArray` can resolve
         its Stmt-output atoms via :meth:`SymArray.evaluate` without
         going through full :meth:`run`.
+
+        ``only`` (a set of statement indices) runs ONLY those statements,
+        in program order — the dependency-cone lane
+        (:func:`~polyarray.simplify.evaluate_cone`): a caller that wants one
+        SymArray's value without executing unrelated statements (e.g. a
+        singular op elsewhere in the program) passes the target's cone.
+        ``None`` (the default) runs every statement, byte-identical to before.
         """
         bindings = self._bindings_from_values(values)
         # Runtime dimension table: maps a producing output ``(stmt_idx,
@@ -2648,8 +2655,9 @@ class Program:
                             f"{int(dim)}; got {int(arr.shape[axis])}"
                         )
                 bindings[inp.name] = arr  # type: ignore[assignment]
-        for stmt_idx, stmt in enumerate(self.statements):
-            self._run_stmt(stmt_idx, stmt, bindings, dim_bindings)
+        order = range(len(self.statements)) if only is None else sorted(only)
+        for stmt_idx in order:
+            self._run_stmt(stmt_idx, self.statements[stmt_idx], bindings, dim_bindings)
         return bindings
 
     def _has_dynamic_shape(self) -> bool:
