@@ -218,6 +218,19 @@ def partial_eval(program: Program, *, max_cell_size: int) -> Program
     # monomial bound become IdentityOp atoms re-evaluated at run time.
     # max_cell_size=0 collapses all symbolic outputs to numeric.
     # partial_eval(p).run(x) == p.run(x).
+
+```python
+def partial_eval_numeric(program: Program, *, probes: int = 3, seed: int = 0,
+                         rtol: float = 1e-9, atol: float = 1e-12) -> Program
+def partial_eval_numeric_symarray(sa: SymArray, **kw) -> SymArray
+    # Probe-and-freeze (simplify.py): fold every Stmt whose outputs are numerically
+    # INVARIANT under the symbolic inputs — discovered by running the program at
+    # `probes` random bindings (polynomial identity testing; probabilistic, NOT
+    # exact-by-construction; measure-zero false freezes for rational cells).
+    # Strictly stronger than the dataflow fold_numeric: collapses e.g. A·inv(A) ≡ I
+    # and a metric-free grass_dof whose symbolic Jacobian input provably cancels.
+    # The _symarray form also folds the cells (invariant atom -> numeric cell).
+```
 ```
 
 ## Degree estimation (`degree.py`)
