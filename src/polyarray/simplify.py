@@ -35,6 +35,7 @@ import numpy as np
 from .ir import (
     CallOp,
     Const,
+    DimAtom,
     InputRef,
     IntAtomRef,
     OutputRef,
@@ -688,3 +689,119 @@ def substitute(program: Program, subs: Mapping[str, Any]) -> Program:
     for nm in dropped:
         new.input_arrays.pop(nm, None)
     return new
+
+
+# ---------------------------------------------------------------------------
+# Dependency-cone evaluation — evaluate ONE SymArray without running the whole
+# program (so an unrelated singular / failing op elsewhere never runs).
+# ---------------------------------------------------------------------------
+
+
+def _symarray_atoms(sa: SymArray) -> set:
+    """The run-time binding-key atoms a SymArray reads: its bulk name, or its
+    cells' RationalFunction generators (the keys ``SymArray.evaluate`` resolves)."""
+    bulk = getattr(sa, "_bulk", None)
+    if bulk is not None:
+        return {bulk.name}
+    cells = np.asarray(sa._cells, dtype=object)
+    atoms: set = set()
+    for c in (np.ravel(cells) if cells.shape else [cells[()]]):
+        if isinstance(c, RationalFunction):
+            atoms.update(c.gens)
+    return atoms
+
+
+def _dimatom_stmt(d) -> int | None:
+    """The producing stmt index of a ``DimAtom`` sourced from a prior Stmt output."""
+    src = getattr(d, "source", None)
+    if isinstance(src, tuple) and len(src) == 3 and src[0] == "stmt":
+        return int(src[1])
+    if isinstance(src, tuple) and len(src) == 2 and isinstance(src[0], int):
+        return int(src[0])                                   # legacy (stmt_idx, out_idx)
+    return None
+
+
+def _ref_deps(ref) -> tuple[set, set]:
+    """The (atom names, direct stmt indices) one input Ref pulls in."""
+    if isinstance(ref, OutputRef):
+        return set(), {ref.stmt_idx}
+    if isinstance(ref, SymArrayRef):
+        bulk = ref._bulk
+        if bulk is not None:
+            return {bulk.name}, set()
+        cells = np.asarray(ref._cells, dtype=object)
+        atoms: set = set()
+        for c in (np.ravel(cells) if cells.shape else [cells[()]]):
+            if isinstance(c, RationalFunction):
+                atoms.update(c.gens)
+        return atoms, set()
+    if isinstance(ref, RationalRef):
+        return set(ref.rf.gens), set()
+    if isinstance(ref, IntAtomRef):
+        return {ref.name}, set()
+    return set(), set()                                      # InputRef / Const → no stmt dep
+
+
+def _shape_dim_stmts(shape) -> set:
+    out: set = set()
+    for d in shape or ():
+        if not isinstance(d, int):
+            s = _dimatom_stmt(d)
+            if s is not None:
+                out.add(s)
+    return out
+
+
+def dependency_cone(program: Program, target: SymArray) -> set:
+    """The set of statement indices ``target`` transitively depends on (its cone)."""
+    producers: dict = {}
+    for i, stmt in enumerate(program.statements):
+        for out in stmt.out:
+            for a in _symarray_atoms(out):
+                producers.setdefault(a, i)
+
+    cone: set = set()
+    stack: list = list(producers[a] for a in _symarray_atoms(target) if a in producers)
+    tbulk = getattr(target, "_bulk", None)
+    if tbulk is not None:
+        stack.extend(_shape_dim_stmts(tbulk.shape))
+    while stack:
+        i = stack.pop()
+        if i in cone:
+            continue
+        cone.add(i)
+        stmt = program.statements[i]
+        for ref in stmt.in_:
+            atoms, stmts = _ref_deps(ref)
+            stack.extend(stmts)
+            stack.extend(producers[a] for a in atoms if a in producers)
+        for out in stmt.out:
+            b = getattr(out, "_bulk", None)
+            if b is not None:
+                stack.extend(_shape_dim_stmts(b.shape))
+    return cone
+
+
+def _read_symarray(program: Program, sa: SymArray, bindings: dict[str, float]) -> np.ndarray:
+    bulk = getattr(sa, "_bulk", None)
+    if bulk is not None:
+        return np.asarray(bindings[bulk.name], dtype=float)
+    return np.asarray(program._evaluate_cells(np.asarray(sa._cells), bindings), dtype=float)
+
+
+def evaluate_cone(program: Program, target: SymArray, values: Mapping[str, Any]) -> np.ndarray:
+    """Evaluate ``target`` by running ONLY its dependency cone at ``values``.
+
+    Statements outside :func:`dependency_cone` are NEVER executed — so a singular
+    / failing op elsewhere in ``program`` (a common hazard when probing a
+    partially-built shared program at a generic feed) cannot affect, or crash,
+    the evaluation of ``target``.  Returns ``target``'s float ndarray.
+
+    Semantics: equal to ``target.evaluate(values)`` WHENEVER the full run would
+    succeed; but it also succeeds when the full run would raise on an unrelated
+    statement.  ``values`` must bind every program input (the unused ones simply
+    go unread).
+    """
+    cone = dependency_cone(program, target)
+    bindings = program.build_runtime_bindings(values, only=cone)
+    return _read_symarray(program, target, bindings)
