@@ -275,6 +275,42 @@ requires the built Cython `.so` (ship via wheels or `make cython`) and
 falls back with a clear error if absent; `flint` requires the optional
 `python-flint` and is auto-detected (default when present).
 
+## Code emission
+
+Two optional, additive lowerings turn a `Program` into runnable code. Both
+keep their target dependency **out of `import polyarray`** (front-end ops are
+supplied by the caller, never imported by polyarray):
+
+- `numpy_source.to_numpy_source(program, func_name="f", op_renderers=None)` —
+  a standalone numpy `.py` source string. Front-end Stmt ops emit via
+  `op_renderers` keyed by op class name.
+- `pyab` — lower a `Program` to **PyArrayBackend IR** (torch-compilable).
+  Requires `pyarraybackend` (imported lazily); `torch` only when compiling
+  through the torch backend. Public surface:
+  `pyab.lower_program_into(program, builder, arg_exprs, *, opts)` (inline a
+  program into a PyAB `StmtBuilder`), `pyab.as_function_def(program, name, opts)`
+  (emit a callable `FunctionDefStmt` + helper defs),
+  `pyab.call_lowered(program, builder, arg_exprs, *, place, in_dims, out_dim, ...)`
+  (emit a callable + a *placed* call — `place="plain"|"vmap"|"fuse"` chosen at
+  the call site), and `pyab.compile_torch` / `pyab.compile_numpy` conveniences.
+  `pyab.LowerOpts(target=, small_qr=, op_lowerings=)` configures it;
+  `SmallQrOpts(max_dim=4)` intercepts small fixed-size `QrOp` as unrolled scalar
+  Householder QR (LAPACK sign convention) instead of a `linalg.qr` call. The
+  full op vocabulary lowers, including `SvdOp`/`GSvdOp` (composite cholesky/svd/
+  solve + FFS split — the data-dependent rank runs eager, i.e. a `@torch.compile`
+  fusion boundary, not a hard failure), `WhileOp` (→ `torch.while_loop`, cond/body
+  must be sub-Programs) and nested (multi-var) `vmap` (→ nested `torch.vmap`). A
+  `Program` op with no lowering raises `NotImplementedError` (extend via
+  `op_lowerings`). **Backend prep** (`pyab.prepare(program)`, run automatically
+  before lowering; opt out via `LowerOpts(collapse_vmap=/simplify_gsvd=False)`)
+  eliminates avoidable work: `pyab.collapse_vmap` replaces a `vmap` over a single
+  leading-batch op (det/inv/pinv/solve/sqrt/abs/sign/einsum) with the batched op
+  applied directly — **numerically verified equivalent on a probe before
+  rewriting** (so e.g. numpy-2.0 vector-`solve`, which no longer batches, is left
+  alone); and identity metrics fold out of a `GSvdOp` (collapsing it toward a
+  plain SVD). Both are semantics-preserving and also speed up `Program.run` /
+  `to_numpy_source`.
+
 ## Not included
 
 `Program.fingerprint()` — referenced in chartlib comments but never
