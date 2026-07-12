@@ -924,6 +924,27 @@ class SymArray:
         result = _matvec_cells(_ensure_object(Aa), _ensure_object(vv))
         return SymArray(result, program=self.program)
 
+    def einsum(self, subscripts: str, *others: SymArray | np.ndarray) -> SymArray:
+        """``np.einsum(subscripts, self, *others)`` on the cells, threading the program — a general
+        axis-specified contraction (the DOF-axis recombinations pointwise's sampler needs, e.g.
+        ``"mi...,ip->mp..."``). Numeric short-circuit when every operand is a float array; object
+        cell-arithmetic (``RationalFunction`` ``*``/``+``) otherwise. One program, two lanes (as
+        :meth:`matmul`). The bound program is ``self``'s; any ``SymArray`` operand must share it (or be
+        program-less / numeric)."""
+        prog = self.program
+        cells = [self.cells]
+        for o in others:
+            if isinstance(o, SymArray):
+                if o.program is not None and prog is not None and o.program is not prog:
+                    raise ValueError("SymArray.einsum: operands bind different programs")
+                prog = prog or o.program
+                cells.append(o.cells)
+            else:
+                cells.append(_to_cells(o))
+        if all(c.dtype.kind == "f" for c in cells):                # numeric lane
+            return SymArray(np.einsum(subscripts, *cells), program=prog)
+        return SymArray(np.einsum(subscripts, *[_ensure_object(c) for c in cells]), program=prog)  # object lane
+
     def det(self, budget: SymbolicBudget | None = None) -> SymArray:
         """Return ``det(self)`` as a 0-d SymArray.
 
