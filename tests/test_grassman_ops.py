@@ -358,3 +358,20 @@ def test_force_stmts_is_symbolic_budget() -> None:
     # overrides flow through
     bud2 = SymbolicBudget.force_stmts(iszero_tol=1e-9)
     assert bud2.iszero_tol == 1e-9
+
+
+def test_symarray_einsum_numeric_and_symbolic() -> None:
+    """SymArray.einsum threads the program (both lanes): numeric == np.einsum; a symbolic sample
+    contracted by a numeric matrix EVALUATES to the numeric contraction (the DOF-axis recombination)."""
+    rng = np.random.default_rng(3)
+    A = rng.standard_normal((2, 4))                      # (M, N_dof)
+    K = rng.standard_normal((4, 3))                      # (N_dof, dim_P)
+    # numeric lane
+    rn = SymArray(A).einsum("mi,ip->mp", K)
+    assert np.allclose(np.asarray(rn), A @ K)
+    # symbolic lane: object RationalFunction cells + a numeric K → evaluate == numeric
+    prog = Program("einsum")
+    sa, values = _sym_matrix(prog, A, "a")
+    rs = sa.einsum("mi,ip->mp", K)
+    assert isinstance(rs, SymArray) and not rs.is_numeric and rs.program is prog
+    assert np.allclose(np.asarray(rs.evaluate(values)), A @ K)
