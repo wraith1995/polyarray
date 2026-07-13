@@ -64,6 +64,9 @@ from .budget import SimplifyBudget
 from .sparsity import propagate_sparsity, block_zero_mask, SparsityReport
 from .degree import program_degree
 
+# --- Linear algebra ---------------------------------------------------------
+from .schur import symbolic_inverse
+
 # --- Batched execution ------------------------------------------------------
 from .ir import vmap
 
@@ -125,6 +128,8 @@ __all__ = [
     "propagate_sparsity",
     "block_zero_mask",
     "SparsityReport",
+    # linear algebra
+    "symbolic_inverse",
     # code generation
     "to_numpy_source",
 ]
