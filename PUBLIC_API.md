@@ -103,6 +103,19 @@ class RationalFunction:          # num / den over a poly ring (the rational lane
     # + ring arithmetic (+, -, *, /), clean()/try_cancel, structural-zero preds
 ```
 
+## Linear algebra
+
+```python
+def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None = None) -> SymArray
+    # Block-triangular Schur inverse — the SPARSITY-AWARE sibling of SymArray.inverse. Exploits a
+    # (row-reordered) block-lower-triangular / block-diagonal structure so a structurally sparse symbolic
+    # matrix inverts to small RationalFunctions instead of a dense cofactor blow-up (or a numeric InvOp).
+    # `mask` steers the split (a caller's cheap/exact sparsity); omitted → resolved by deterministic probing
+    # of a program-carrying SymArray, else syntactic simple_zero. A conservative (denser) mask is never
+    # wrong, only less aggressive. Leaf inverses / Schur-combine products above
+    # SymbolicBudget.schur_{inverse,matmul}_stmt_size defer to numeric Stmts.
+```
+
 ## Op vocabulary (the `Stmt.fn` types)
 
 All frozen / hashable dataclasses.
