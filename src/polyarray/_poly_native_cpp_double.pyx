@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import numpy as np
 cimport numpy as cnp
+cimport cython
 
 import sympy as sp
 
@@ -103,6 +104,8 @@ cdef class CppRing_double:
         cdef cnp.ndarray cf = np.array([c], dtype=np.float64)
         return _make_poly(self, e, cf)
 
+    @cython.wraparound(True)   # this method indexes Python lists with [-1]; the file-level
+    #                            wraparound=False would read index -1 literally (OOB → crash).
     def from_dict(self, terms):
         cdef double cf
         cdef double new_c

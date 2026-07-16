@@ -78,6 +78,34 @@ def test_backend_matches_reference(env_overrides, label):
         err_msg=f"backend {label} mismatch (stderr: {proc.stderr})")
 
 
+# Regression: native_cpp `from_dict` with >=2 terms used to crash — the file-level
+# `wraparound=False` made `out_m[-1]` (Python list negative index) read index -1 literally
+# (OOB -> SystemError / segfault). It only triggered with 2+ terms (the first iteration
+# short-circuits on the empty coalesce list), so single-term Lagrange builds slipped through
+# while multi-term (Morley/FEEC) symbolic Vandermondes crashed.
+_CHILD_FROMDICT = r"""
+from polyarray.poly_backend import make_ring
+r = make_ring(('x', 'y'))
+p = r.from_dict({(1, 0): 2.0, (2, 1): 3.0, (0, 0): -1.0})   # 3 terms -> the coalesce path
+assert p._n_terms == 3, p._n_terms
+q = r.from_dict({(1, 0): 2.0, (1, 0): 3.0})                 # single distinct monomial after dedup
+print("OK")
+"""
+
+
+@pytest.mark.parametrize("coeff", ["double", "mpf"])
+def test_native_cpp_from_dict_multiterm_no_crash(coeff):
+    env = dict(os.environ)
+    env.update({"CHARTLIB_POLY_BACKEND": "native_cpp", "CHARTLIB_POLY_COEFF": coeff})
+    proc = subprocess.run([sys.executable, "-c", _CHILD_FROMDICT],
+                          capture_output=True, text=True, env=env)
+    if proc.returncode != 0 and "Cython extension" in proc.stderr:
+        pytest.skip(f"native_cpp/{coeff}: extension not built")
+    assert proc.returncode == 0, (
+        f"native_cpp/{coeff} from_dict crashed (rc={proc.returncode}):\n{proc.stderr}")
+    assert proc.stdout.strip().splitlines()[-1] == "OK"
+
+
 def test_at_least_sympy_and_native_py_run():
     # Sanity: the always-available pure-Python backends must work.
     for env_overrides, label in _BACKENDS[:3]:
