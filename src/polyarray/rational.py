@@ -713,9 +713,13 @@ class RationalFunction:
         if total_exp == 1 and max(monom) == 1:
             i = monom.index(1)
             name = names[i]
+            # No ``float(...)`` cast: for a scalar binding the value is numerically identical (``float(x)==x``),
+            # and dropping it makes the fast path ARRAY-safe — a ``(B,)`` batched binding broadcasts through,
+            # which the vectorized (batched-program) evaluator relies on (the general codegen path is already
+            # array-safe). ``eval_numeric_fast`` thus returns whatever dtype the binding carries.
             if c == 1.0:
-                return lambda __b, _n=name: float(__b[_n])
-            return lambda __b, _n=name, _c=c: _c * float(__b[_n])
+                return lambda __b, _n=name: __b[_n]
+            return lambda __b, _n=name, _c=c: _c * __b[_n]
         return None
 
     # ------------------------------------------------------------------
