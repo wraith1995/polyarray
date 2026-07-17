@@ -34,6 +34,71 @@ def torch_available() -> bool:
     return u.find_spec("torch") is not None and u.find_spec("pyarraybackend") is not None
 
 
+# --- pyab op-lowerings for the front-end (grassmann-origin) ops the FEEC residual carries ------------
+# These render each op's PER-ELEMENT semantics to pyab AST (``torch.vmap`` supplies the batch axis, so no
+# batch bookkeeping here). Keyed by op CLASS NAME and supplied to pyab via ``LowerOpts.op_lowerings`` — so
+# the knowledge lives in polyarray (this module), pyab stays generic, and grassmann is never imported.
+# A renderer has signature ``(op, builder, args, lowerer) -> list[expr]`` (see pyab `_render_op`).
+
+def _reshape_low(fn, _b, args, low):                         # _ReshapeOp(shape): A.reshape(shape)
+    c = low.core
+    return [c.ReshapeExpr(a=args[0], shape=tuple(c.IntLit(value=int(d)) for d in fn.shape))]
+
+
+def _axislen_low(fn, _b, args, low):                         # _AxisLenOp(axis): x.shape[axis] (0-d int)
+    c = low.core
+    return [c.AccessExpr(base=c.ShapeExpr(x=args[0]), index=(c.IntLit(value=int(fn.axis)),))]
+
+
+def _firstcols_low(_fn, _b, args, low):                      # _FirstColsOp: A[:, :int(rank)]
+    c = low.core
+    rank = c.CallExpr(fn=c.Var(name="int"), args=(args[1],))
+    return [c.AccessExpr(base=args[0], index=(c.Slice(), c.Slice(stop=rank)))]
+
+
+def _project_low(_fn, _b, args, low):                        # _ProjectOp: P.T @ v.reshape(-1)
+    c = low.core
+    p_t = c.TransposeExpr(a=args[0], axes=None)
+    v_flat = c.ReshapeExpr(a=args[1], shape=(c.IntLit(value=-1),))
+    return [c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=p_t, rhs=v_flat)]
+
+
+def _embed_low(fn, _b, args, low):                           # _EmbedOp(shape): (P @ vsub).reshape(shape)
+    c = low.core
+    mm = c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=args[0], rhs=args[1])
+    if fn.shape:
+        return [c.ReshapeExpr(a=mm, shape=tuple(c.IntLit(value=int(d)) for d in fn.shape))]
+    return [mm]
+
+
+def _add_low(_fn, _b, args, low):                            # _AddOp: a + b
+    c = low.core
+    return [c.BinaryExpr(op=c.BinaryOp.ADD, lhs=args[0], rhs=args[1])]
+
+
+def _scale_low(fn, _b, args, low):                           # _ScaleOp(factor): factor * a
+    c = low.core
+    return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.FloatLit(value=float(fn.factor)), rhs=args[0])]
+
+
+def _assert_low(_fn, _b, args, low):                         # AssertOp: runtime check → value passthrough
+    return [args[0]]
+
+
+def feec_op_lowerings() -> dict:
+    """pyab ``op_lowerings`` for the grassmann-origin ops in the FEEC residual (by class name)."""
+    return {
+        "_ReshapeOp": _reshape_low,
+        "_AxisLenOp": _axislen_low,
+        "_FirstColsOp": _firstcols_low,
+        "_ProjectOp": _project_low,
+        "_EmbedOp": _embed_low,
+        "_AddOp": _add_low,
+        "_ScaleOp": _scale_low,
+        "AssertOp": _assert_low,
+    }
+
+
 def ensure_torch_pg(port: int = 29591) -> None:
     """Pre-initialize a 1-rank ``gloo`` ``torch.distributed`` process group.
 
@@ -67,7 +132,8 @@ def batched_torch(program: Program, values: Mapping[str, Any]) -> np.ndarray:
 
     from . import pyab
     ensure_torch_pg()
-    cm = pyab.compile_torch(program, name="f")
+    opts = pyab.LowerOpts(op_lowerings=feec_op_lowerings())    # lower the FEEC front-end ops (by name)
+    cm = pyab.compile_torch(program, name="f", opts=opts)
     fn = cm.module.f
     args = [torch.as_tensor(np.asarray(values[inp.name], dtype=float)) for inp in program.inputs]
     out = torch.vmap(fn)(*args)
