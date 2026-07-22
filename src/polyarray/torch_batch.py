@@ -85,6 +85,11 @@ def _assert_low(_fn, _b, args, low):                         # AssertOp: runtime
     return [args[0]]
 
 
+def _const_low(fn, _b, _args, low):                          # _ConstOp: rematerialize the frozen constant
+    arr = np.frombuffer(fn.data_bytes, dtype=fn.dtype).reshape(fn.shape)
+    return [low._const_expr(np.asarray(arr, dtype=float))]
+
+
 def feec_op_lowerings() -> dict:
     """pyab ``op_lowerings`` for the grassmann-origin ops in the FEEC residual (by class name)."""
     return {
@@ -96,6 +101,7 @@ def feec_op_lowerings() -> dict:
         "_AddOp": _add_low,
         "_ScaleOp": _scale_low,
         "AssertOp": _assert_low,
+        "_ConstOp": _const_low,
     }
 
 
