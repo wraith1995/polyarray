@@ -32,7 +32,7 @@ from typing import cast
 
 import numpy as np
 
-from .ir import OutSpec, SymArray, current_budget_override, is_dynamic
+from .ir import EinsumStmtOp, InvOp, OutSpec, Program, SymArray, current_budget_override, is_dynamic
 from .rational import RationalFunction, cofactor_inverse, simple_zero
 
 
@@ -78,8 +78,12 @@ def _deferred_matmul(*arrs: SymArray) -> SymArray:
         rows, inner, cols = _dim(result.shape[0]), _dim(result.shape[1]), _dim(nxt.shape[1])
         big = max(rows, inner, cols) >= mm_thresh
         if program is not None and big and not (result.is_numeric and nxt.is_numeric):
+            # A TYPED matmul op (2-D einsum `ij,jk->ik`), NOT an opaque ``lambda a, b: a @ b``: the typed op
+            # lowers through EVERY backend — ``Program.run`` (numeric), ``to_numpy_source``, AND
+            # ``pyab``/torch (a grounded-symbolic ``P(T)`` compiled into savo's vmapped value kernel) — where
+            # an opaque python callable raises "no lowering for op 'function'".
             (out,) = program.emit_stmt(
-                lambda a, b: np.asarray(a, dtype=float) @ np.asarray(b, dtype=float),
+                EinsumStmtOp(spec="ij,jk->ik"),
                 [result, nxt],
                 [OutSpec("schur_mm", (rows, cols))],
                 note="schur_matmul", bulk=False,
@@ -97,8 +101,11 @@ def _base_inverse(arr: SymArray) -> SymArray:
     n = _dim(arr.shape[0])
     program = arr.program
     if program is not None and not arr.is_numeric and n >= _defer_thresholds()[1]:
+        # A TYPED ``InvOp`` (the SAME op :meth:`SymArray.inverse` defers to), NOT an opaque
+        # ``lambda a: np.linalg.inv(a)``: lowers through Program.run / to_numpy_source / pyab-torch alike,
+        # so a grounded-symbolic ``P(T)`` compiles into savo's value kernel (an opaque callable cannot).
         (out,) = program.emit_stmt(
-            lambda a: np.linalg.inv(np.asarray(a, dtype=float)),
+            InvOp(),
             [arr],
             [OutSpec("schur_inv", (n, n))],
             note="schur_inverse", bulk=False,
@@ -306,7 +313,8 @@ def _schur_combine(M: SymArray, k: int, mask: np.ndarray) -> SymArray:
     return SymArray(out, program=M.program)
 
 
-def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None = None) -> SymArray:
+def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None = None,
+                     program: object = None) -> SymArray:
     """Invert a (square) matrix via the block-triangular Schur recursion — the sparsity-aware sibling of
     :meth:`SymArray.inverse`.
 
@@ -318,8 +326,26 @@ def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None =
     ``mask`` is the boolean nonzero mask steering the block split. Pass it when the caller can compute the
     sparsity cheaply/exactly; when omitted it is resolved from ``matrix`` by DETERMINISTIC probing (a
     program-carrying SymArray) or the syntactic ``simple_zero`` fallback. A conservative (denser) mask only
-    makes the split less aggressive, never wrong."""
+    makes the split less aggressive, never wrong.
+
+    ``program`` (GROUNDED SYMBOLIC): the SHARED ``Program`` the block-triangular inverse should be GROUNDED
+    onto — so a symbolic ``P(T)`` lowers through a value kernel compiled from that shared program (savo's
+    block program) rather than leaving Stmts stranded on an ephemeral by-product program. When ``matrix``
+    already rides ``program`` (or ``program`` is ``None``, or ``matrix`` is numeric / program-less) this is a
+    no-op and the Stmts emit into ``matrix``'s own program as before (backward compatible). Otherwise the
+    block-split mask is resolved on ``matrix``'s OWN program FIRST — its inputs are the clean generic-cell
+    generators the deterministic structural probe needs — and only then is ``matrix`` GRAFTED onto
+    ``program`` (:meth:`Program.graft`): ``matrix``'s cells may reference not only shared input atoms but
+    also *its program's own producing Stmts* (e.g. the world-Vandermonde's grassmann-lowered derivative-DOF
+    ``grass_dof`` Stmts), so a bare relabel would strand those; the graft emits ``matrix``'s program as a
+    sub-Program Stmt of ``program`` (fresh dedup'd outputs). The recursion's own deferred leaf-inverse /
+    Schur-combine Stmts (``schur_inverse``/``schur_matmul``) then emit natively onto ``program`` (mask
+    threaded so it never re-probes on the shared program), and several elements' ``P(T)``s grounded on one
+    shared program do not collide."""
     M = matrix if isinstance(matrix, SymArray) else SymArray(matrix)
+    if program is not None and M.program is not None and M.program is not program:
+        mask = _resolve_mask(M, mask)                       # probe on M's OWN (clean-input) program first
+        M = cast(Program, program).graft(M)                 # bring M's producing Stmts onto `program`
     return _invert(M, mask=mask)
 
 

@@ -1200,6 +1200,37 @@ def lower_program_into(
     return low.defs, out_exprs
 
 
+# Soft ceilings for the eager-materialization backstop. A HEALTHY (mostly-bulk) program reports ~0
+# symbolic output mass (``analyze`` skips bulk cells — ``forward._row``), so these fire ONLY on genuine
+# blow-ups (per-cell RF scatter / a live data-independent solve expanded per cell), before the expensive
+# render/codegen that would otherwise OOM. Tunable; kept generous so it is signal, not noise.
+_IR_MASS_CEILING = 100_000        # Σ monomials over symbolic output cells (all programs + nested bodies)
+_IR_CELLS_CEILING = 8192          # number of symbolic output cells (eager per-cell scatter)
+
+
+def _warn_if_ir_oversized(program: Program, name: str) -> None:
+    """Emit ONE warning when ``program``'s IR is pathologically large — the fingerprint of an eager
+    materialization that should have stayed a deferred ``bulk`` node (or a data-independent solve that
+    should have been constant-folded). Rides :func:`polyarray.forward.analyze` (cheap on bulk programs,
+    which it skips; the asymmetry is the signal). Never raises — a cost report must not break a compile."""
+    try:
+        from . import forward
+        import warnings
+        rep = forward.analyze(program)
+        n_cells = sum(r.n_output_cells for r in rep.rows)
+        if rep.total_mass > _IR_MASS_CEILING or n_cells > _IR_CELLS_CEILING:
+            warnings.warn(
+                f"pyab.as_function_def({name!r}): oversized IR "
+                f"(mass={rep.total_mass}, output_cells={n_cells}) — likely an EAGER materialization that "
+                f"should be a deferred `bulk` node (route contractions through `runtime_einsum_multi`, emit "
+                f"large-shape outputs `bulk=True`, keep `.shape`/`.ndim` off `.cells`), or a data-independent "
+                f"solve/SVD that should be constant-folded. Report:\n{rep}",
+                stacklevel=2,
+            )
+    except Exception:                                   # a cost report must NEVER break a compile
+        pass
+
+
 def as_function_def(
     program: Program,
     *,
@@ -1215,6 +1246,7 @@ def as_function_def(
     """
     opts = opts or LowerOpts()
     program, _ = prepare(program, opts=opts)
+    _warn_if_ir_oversized(program, name)                # backstop: catch eager-materialization blow-ups
     core = _core()
     params = tuple(core.Param(name=_safe(inp.name)) for inp in program.inputs)
     params += tuple(core.Param(name=_safe(a)) for a in program.int_atoms)
