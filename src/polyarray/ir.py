@@ -2463,6 +2463,53 @@ class Program:
         self.statements.append(stmt)
         return idx
 
+    def graft(self, foreign: SymArray, *, note: str = "graft") -> SymArray:
+        """Re-home a value COMPUTED ON ANOTHER program onto ``self`` — WITH its producing Stmts.
+
+        ``foreign`` is a :class:`SymArray` whose cells are :class:`RationalFunction`s over
+        ``foreign.program``'s generators — some of which may be **Stmt outputs** (deferred numeric ops:
+        matrix inverse / matmul, a grassmann-lowered sub-Program, …), not just shared input atoms. A bare
+        ``SymArray(foreign.cells, program=self)`` relabel carries the CELLS but strands those producing
+        Stmts on the by-product program, so a later lowering of ``self`` references generators ``self``
+        never produces ("no binding"). :meth:`graft` instead emits ``foreign.program`` as ONE sub-Program
+        :class:`Stmt` of ``self`` (the same mechanism a grassmann-lowered DOF body uses to compose onto the
+        shared sampling program), whose fresh atom outputs carry ``foreign``'s value on ``self`` — so the
+        whole foreign Stmt DAG runs when ``self`` runs/lowers, and the fresh outputs are dedup'd by
+        ``self``'s env (several grafts of like-named by-product programs do not collide).
+
+        ``foreign.program`` and ``self`` must be built over the SAME shared symbolic inputs (e.g. the
+        cell-vertex atoms of one ``make_symbolic_geometry`` reference): the sub-Program is fed ``foreign``'s
+        own input atoms relabeled onto ``self``, so ``self`` resolves their leaf generators (``V_0_0``…) by
+        name when it lowers — a generator ``self`` cannot produce surfaces downstream as an unbound generator.
+        A program-less ``foreign`` (numeric, or already inline on ``self``) needs no Stmts and is a plain
+        relabel. Idempotent on ``self``'s own arrays (``foreign.program is self`` ⇒ returned unchanged)."""
+        src = foreign.program
+        if src is self:
+            return foreign
+        if src is None:
+            return SymArray(foreign.cells, program=self)
+        # A one-output VIEW of `src` (share env / inputs / Stmts / budget — never mutate the possibly-cached
+        # source), whose single output is `foreign`'s cells; `_invoke` runs it and returns that output.
+        view = Program.__new__(Program)
+        view.name = src.name
+        view.env = src.env
+        view.inputs = src.inputs
+        view.input_arrays = src.input_arrays
+        view.statements = src.statements
+        view.budget = src.budget
+        view.int_atoms = src.int_atoms
+        view.outputs = {"grafted": SymArray(foreign.cells, program=view, name="grafted")}
+        # Operands feeding the sub-Program's inputs (by position): each is `src`'s own input atoms RELABELED
+        # onto `self`. The two programs are BUILT OVER THE SAME shared symbolic inputs (e.g. the cell-vertex
+        # atoms of one ``make_symbolic_geometry`` reference), so `src`'s input generators (``V_0_0``…) are the
+        # SAME names `self` produces — `self` resolves them by name when it lowers, without `self` needing to
+        # DECLARE those inputs itself (its own value kernel binds them at compile). A `src` input whose
+        # generators `self` cannot produce is a genuine mismatch, caught downstream as an unbound generator.
+        operands = [SymArray(src.input(inp.name).cells, program=self) for inp in src.inputs]
+        (out,) = self.emit_stmt(
+            view, operands, [OutSpec(note, tuple(foreign.cells.shape))], note=note, bulk=False)
+        return out
+
     def emit_stmt(
         self,
         fn: Callable[..., Any] | Program,

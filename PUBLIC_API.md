@@ -234,6 +234,20 @@ def partial_eval(program: Program, *, max_cell_size: int) -> Program
     # partial_eval(p).run(x) == p.run(x).
 
 ```python
+def specialize(program, *, bind=None, subs=None, budget=None) -> Program
+def fold_numeric(program) -> Program        # = specialize (empty bind)
+def bind_inputs(program, bind) -> Program   # = specialize(bind=...)
+    # Exactness-preserving partial evaluation (simplify.py): folds every Stmt whose
+    # inputs all resolve numeric, dropping it; folds `known` into surviving refs /
+    # outputs; descends partially-numeric sub-Program / CallOp bodies.
+    # Dynamic dims: a Stmt that CREATES a runtime δ (DimAtom) — SvdOp/GSvdOp/QrOp/
+    # pinv/FFS/… — is folded UNIFORMLY when its inputs are all numeric (a value-
+    # invariant map with a statically-knowable rank). The δ it creates is resolved
+    # from the concrete folded-output shape and SUBSTITUTED (→ concrete int) across
+    # every remaining shape (later Stmt outputs, bulk handles, input refs), so no
+    # dynamic δ lingers downstream. A δ from a Stmt with a symbolic input is NOT
+    # folded — it survives unchanged (conservative; static path byte-identical).
+
 def partial_eval_numeric(program: Program, *, probes: int = 3, seed: int = 0,
                          rtol: float = 1e-9, atol: float = 1e-12) -> Program
 def partial_eval_numeric_symarray(sa: SymArray, **kw) -> SymArray

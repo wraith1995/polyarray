@@ -33,6 +33,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from .ir import (
+    BulkOut,
     CallOp,
     Const,
     DimAtom,
@@ -68,15 +69,19 @@ _MAX_DESCENT_DEPTH = 32
 
 def _simple_stmt(stmt: Stmt) -> bool:
     """A Stmt we may try to execute at build time: a callable fn / typed Op /
-    sub-Program (not a loop), with statically-shaped outputs (per-cell or bulk;
-    a runtime-``DimAtom``-sized output cannot be materialised at build time)."""
+    sub-Program (not a loop).
+
+    A *dynamic* (runtime-``DimAtom``-sized) bulk output is now foldable too: when
+    the Stmt's inputs are all numeric it is a value-invariant map (e.g. a
+    constant SVD/GSVD/QR/pinv whose numerical rank is statically knowable), so we
+    execute it, read the concrete output shape, and resolve the ``DimAtom``s it
+    created (see :func:`_resolve_stmt_dims` / :func:`_substitute_dims`).  When its
+    inputs are *not* all numeric the fold loop simply skips it and the dynamic δ
+    survives unchanged — byte-identical to the pre-fold behaviour."""
     if stmt.fn is None:
         return False
     if isinstance(stmt.fn, _SKIP_OPS):
         return False
-    for o in stmt.out:
-        if o._bulk is not None and is_dynamic(o._bulk.shape):
-            return False
     return True
 
 
@@ -189,16 +194,59 @@ def _seed_bind(
     return known, dropped
 
 
-def _record_known(stmt: Stmt, outs: list[Any], known: dict[str, Any]) -> None:
+def _resolve_stmt_dims(
+    stmt: Stmt, stmt_idx: int, outs: list[Any], dim_subst: dict[tuple[Any, ...], int],
+) -> None:
+    """From a *folded* Stmt's concrete output arrays, resolve each ``DimAtom``
+    that (first) sizes one of those outputs to its concrete axis size, recording
+    ``source -> int`` in ``dim_subst``.
+
+    This is the build-time mirror of :meth:`Program._bind_output`'s run-time
+    behaviour: a not-yet-bound ``DimAtom`` in a bulk output's declared shape is
+    bound from the realised array's actual axis size, keyed by the atom's
+    hashable ``source`` (first realised output wins) — so :func:`_substitute_dims`
+    can substitute it into every remaining shape.  Note the ``source`` is a
+    logical forward-link (it may *name* a producing Stmt whose own output does not
+    carry the axis — e.g. an SVD ``rank`` output whose δ physically sizes a
+    downstream ``take_cols`` output); binding follows where the axis actually
+    appears, exactly as at run time.  A δ already resolved by an earlier fold is
+    left untouched (first-wins), matching ``d.source not in dim_bindings``."""
+    for k, bound in enumerate(stmt.out):
+        if bound._bulk is None or not is_dynamic(bound._bulk.shape):
+            continue
+        arr = np.asarray(outs[k])
+        for axis, d in enumerate(bound._bulk.shape):
+            if isinstance(d, DimAtom) and d.source not in dim_subst:
+                if axis >= arr.ndim:
+                    raise ValueError("folded dynamic output: dim axis out of range")
+                dim_subst[d.source] = int(arr.shape[axis])
+
+
+def _record_known(
+    stmt: Stmt, outs: list[Any], known: dict[str, Any],
+    dim_subst: Mapping[tuple[Any, ...], int] | None = None,
+) -> None:
     """Record a folded Stmt's numeric outputs into ``known`` (raises on shape
     mismatch so the caller can discard a bad fold).
 
     A bulk output records its whole tensor under the bulk handle name (resolved
-    directly by ``_resolve_ref``); a per-cell output records each cell's atom."""
+    directly by ``_resolve_ref``); a per-cell output records each cell's atom.
+    A *dynamic* bulk output's declared shape (carrying ``DimAtom`` entries) is
+    resolved against ``dim_subst`` before validating the produced tensor's shape
+    — a KeyError there means an unresolved δ, which the caller treats as a failed
+    fold (keep the Stmt symbolic)."""
     for k, bound in enumerate(stmt.out):
         arr = np.asarray(outs[k], dtype=float)
         if bound._bulk is not None:
-            expected = tuple(bound._bulk.shape)
+            if is_dynamic(bound._bulk.shape):
+                if dim_subst is None:
+                    raise ValueError("dynamic bulk output without resolved dims")
+                expected = tuple(
+                    int(dim_subst[d.source]) if isinstance(d, DimAtom) else int(d)
+                    for d in bound._bulk.shape
+                )
+            else:
+                expected = tuple(bound._bulk.shape)
             if tuple(arr.shape) != expected:
                 raise ValueError("bulk fold output shape mismatch")
             known[bound._bulk.name] = arr
@@ -211,6 +259,101 @@ def _record_known(stmt: Stmt, outs: list[Any], known: dict[str, Any]) -> None:
             cell = cells[idx] if shape else cells[()]
             if isinstance(cell, RationalFunction):
                 known[cell.gens[0]] = float(arr[idx] if shape else arr)
+
+
+# ---------------------------------------------------------------------------
+# DimAtom → concrete-int substitution (the one new uniform helper)
+# ---------------------------------------------------------------------------
+
+def _subst_shape(
+    shape: tuple[Any, ...], dim_subst: Mapping[tuple[Any, ...], int],
+) -> tuple[tuple[Any, ...], bool]:
+    """Replace every resolved ``DimAtom`` in ``shape`` with its concrete int.
+
+    Returns ``(new_shape, changed)``.  A ``DimAtom`` not in ``dim_subst`` (a δ
+    from a Stmt that did *not* fold — genuinely data-dependent) passes through
+    untouched; concrete entries are unchanged.  ``changed`` lets callers avoid
+    rebuilding shared frozen objects when nothing was substituted."""
+    if not is_dynamic(shape):
+        return shape, False
+    out: list[Any] = []
+    changed = False
+    for d in shape:
+        if isinstance(d, DimAtom) and d.source in dim_subst:
+            out.append(int(dim_subst[d.source]))
+            changed = True
+        else:
+            out.append(d)
+    return tuple(out), changed
+
+
+def _subst_bulk_symarray(
+    sa: SymArray, dim_subst: Mapping[tuple[Any, ...], int],
+) -> SymArray:
+    """A fresh SymArray with its bulk shape's resolved δ's substituted, or ``sa``
+    unchanged when there is nothing to substitute (never mutates in place — the
+    old bulk handle may be shared)."""
+    if sa._bulk is None:
+        return sa
+    new_shape, changed = _subst_shape(sa._bulk.shape, dim_subst)
+    if not changed:
+        return sa
+    out = SymArray(sa._cells, program=sa.program, name=sa.name)
+    out._bulk = BulkOut(name=sa._bulk.name, shape=new_shape)
+    return out
+
+
+def _subst_ref_dims(
+    ref: Any, dim_subst: Mapping[tuple[Any, ...], int],
+) -> Any:
+    """A surviving input ref with any resolved δ in a bulk handle substituted."""
+    if isinstance(ref, SymArrayRef) and ref._bulk is not None:
+        new_shape, changed = _subst_shape(ref._bulk.shape, dim_subst)
+        if changed:
+            out = SymArrayRef(ref._cells)
+            out._bulk = BulkOut(name=ref._bulk.name, shape=new_shape)
+            return out
+    return ref
+
+
+def _substitute_dims(
+    program: Program, dim_subst: Mapping[tuple[Any, ...], int],
+) -> None:
+    """Substitute every resolved ``DimAtom`` (→ concrete int) across ALL remaining
+    shapes of ``program`` **in place** (operates on a freshly-``copy``'d program,
+    so this touches no shared upstream state): dynamic inputs, statement input
+    refs, statement output SymArrays, and program outputs.
+
+    This is what makes a folded constant SVD/GSVD/… uniformly eliminate its δ:
+    once its rank is resolved from the concrete output shape, downstream shapes
+    that were sized by that δ (a later Stmt's output, a Vandermonde's axis, an
+    AssertOp's operand) become static and consistent — no lingering δ.
+
+    Program **inputs are deliberately left untouched**: a dynamic bulk input is
+    bound (as a whole tensor) only via ``build_runtime_bindings``' dynamic-input
+    path, which is gated on the input's shape being dynamic (``is_dynamic``).
+    Resolving its δ to a static int would drop it from that path so its bulk value
+    would never bind (KeyError at run time).  A stmt-sourced δ in an input shape
+    that now points at a folded-away Stmt is harmless: at run time the fed array is
+    bound directly and that δ is never resolved (the producing Stmt would have, but
+    the input itself is validated axis-by-axis, skipping stmt-sourced dims)."""
+    if not dim_subst:
+        return
+    # Statements: input refs + output SymArrays.
+    for idx, stmt in enumerate(program.statements):
+        new_in = tuple(_subst_ref_dims(r, dim_subst) for r in stmt.in_)
+        new_out = tuple(_subst_bulk_symarray(o, dim_subst) for o in stmt.out)
+        if any(a is not b for a, b in zip(new_in, stmt.in_)) or any(
+            a is not b for a, b in zip(new_out, stmt.out)
+        ):
+            program.statements[idx] = Stmt(
+                fn=stmt.fn, in_=new_in, out=new_out, note=stmt.note,
+                provenance=stmt.provenance, inline=stmt.inline,
+            )
+    # Program outputs.
+    program.outputs = {
+        k: _subst_bulk_symarray(sa, dim_subst) for k, sa in program.outputs.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +488,9 @@ def _specialize(
     seen_here = seen | {id(program), id(new)}
 
     foldable: set[int] = set()
+    # Forward-linked resolution of dynamic dims (δ) created by a folded Stmt:
+    # ``source-tuple -> concrete int`` (see _resolve_stmt_dims / _substitute_dims).
+    dim_subst: dict[tuple[Any, ...], int] = {}
     for i, stmt in enumerate(new.statements):
         if not _simple_stmt(stmt):
             continue
@@ -360,12 +506,20 @@ def _specialize(
             continue
         try:
             outs = _exec_fn(stmt.fn, resolved)
+            staged_dims: dict[tuple[Any, ...], int] = dict(dim_subst)
+            _resolve_stmt_dims(stmt, i, outs, staged_dims)
             staged: dict[str, Any] = dict(known)
-            _record_known(stmt, outs, staged)
+            _record_known(stmt, outs, staged, staged_dims)
         except Exception:
             continue  # any failure -> keep the Stmt symbolic
         known = staged
+        dim_subst = staged_dims
         foldable.add(i)
+
+    # Resolve every δ a folded Stmt created into its concrete rank across all
+    # remaining shapes, so a folded constant SVD/GSVD/… leaves no lingering
+    # dynamic dim downstream (the FEEC Vandermonde stays square, etc.).
+    _substitute_dims(new, dim_subst)
 
     survivors = [i for i in range(len(new.statements)) if i not in foldable]
     idx_map = {old: new_i for new_i, old in enumerate(survivors)}
