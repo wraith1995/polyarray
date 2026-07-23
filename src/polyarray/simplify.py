@@ -106,13 +106,38 @@ def _try_eval_ref(
         return None
 
 
+def _cells_touch_known(cells: np.ndarray, known: Mapping[str, float]) -> bool:
+    """True iff some ``RationalFunction`` cell references a generator in ``known`` — i.e.
+    folding ``known`` into ``cells`` would actually substitute something.  When False the
+    fold is a structural no-op on these cells (see :func:`_fold_cells`)."""
+    if not known:
+        return False
+    for c in cells.reshape(-1):
+        if isinstance(c, RationalFunction) and any(g in known for g in c.gens):
+            return True
+    return False
+
+
 def _fold_cells(cells: np.ndarray, known: Mapping[str, float]) -> np.ndarray:
     """Fold ``known`` into an ndarray of cells via partial ``RF.eval``.
 
     Returns a float array when every cell becomes numeric, else an object array
-    of floats / smaller RationalFunctions (residual symbols)."""
+    of floats / smaller RationalFunctions (residual symbols).
+
+    STRUCTURE-TRANSPARENT no-op: when no cell references a folded (``known``) generator
+    the fold changes nothing, so the ORIGINAL ``cells`` object is returned unchanged —
+    never a fresh copy.  This keeps ``id(cells)`` stable across the fold, which a
+    downstream identity-based structural read depends on: the pointwise/grassmann
+    quadrature-degree walker (``polyarray.program_degree``) links a Stmt's producer to its
+    consumer by ``id(ref._cells) == id(out._cells)`` and, on a miss, falls back to scoring
+    the cells' generators by NAME — a fallback that knows FIELD degrees but not the
+    geometry/position generators, so a broken link silently drops the position's degree
+    (the Koszul ``κ = x·`` factor) and under-integrates the FEEC drop-Vandermonde.  A fold
+    that substitutes nothing must therefore leave the cell array's identity intact."""
     if cells.dtype.kind == "f":
         return cells.copy()
+    if not _cells_touch_known(cells, known):
+        return cells
     out = np.empty(cells.shape, dtype=object)
     flat_in = cells.reshape(-1)
     flat_out = out.reshape(-1)
