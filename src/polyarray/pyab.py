@@ -355,7 +355,8 @@ class _Lowerer:
             # Predicate guard; passthrough the first operand (matches numpy_source).
             return ("single", args[0])
         if isinstance(fn, SwitchOp):
-            return ("single", self._switch_expr(fn, args))
+            scrutinee_ref = in_refs[0] if in_refs else None
+            return ("single", self._switch_expr(fn, args, scrutinee_ref))
         if isinstance(fn, QrOp):
             return self._qr(fn, args, out)
         if isinstance(fn, SvdOp):
@@ -371,20 +372,81 @@ class _Lowerer:
         vbody = _vmap_body_of(fn)
         if vbody is not None:
             return self._call_vmap(fn, vbody, args, out)
+        # Op-carried lowering hook (the sanctioned twin of ``numpy_source``'s
+        # ``__numpy_source__``): a front-end op above polyarray defines
+        # ``__pyab_lower__(self, builder, args, low) -> list[expr]`` on its class
+        # and pyab discovers it here — ONE canonical path, no ``op_lowerings``
+        # dict threading. Consulted LAST (after the explicit ``op_lowerings``
+        # override at line ~319, the builtin isinstance vocabulary, and the
+        # CallOp/Program/vmap-closure unwraps), so a native op's canonical
+        # lowering can never be shadowed by a stray hook. Renderers use only the
+        # passed-in ``low`` (``low.core``, ``low._const_expr``, ``low._dtype_f64``)
+        # — never importing pyab from the op's module — keeping the layering clean.
+        hook = getattr(fn, "__pyab_lower__", None)
+        if hook is not None:
+            return ("exprs", hook(self.b, args, self))
         raise NotImplementedError(
             f"pyab: no lowering for op {type(fn).__name__!r}. "
-            "Supply LowerOpts(op_lowerings={'"
-            f"{type(fn).__name__}': ...}}) or extend pyab._Lowerer._render_op."
+            f"Define ``{type(fn).__name__}.__pyab_lower__(self, builder, args, low)`` "
+            "on the op's class (the canonical op-carried hook), or supply "
+            "LowerOpts(op_lowerings={'"
+            f"{type(fn).__name__}': ...}}), or extend pyab._Lowerer._render_op."
         )
 
-    def _switch_expr(self, fn: Any, args: list[Any]) -> Any:
+    def _unwrap_int_call(self, expr: Any) -> Any:
+        """Strip the ``int(...)`` wrapper pyab puts on an :class:`IntAtomRef`.
+
+        :meth:`_ref_expr` renders an :class:`~polyarray.ir.IntAtomRef` scrutinee as
+        ``CallExpr(fn=Var("int"), args=(o_var,))`` — the ``int(tensor)`` is exactly
+        what breaks ``torch.vmap`` (it calls ``.item()`` on a batched tensor).
+        Recover the raw ``o_var`` so the one-hot switch lowers as pure arithmetic.
+        Passthrough if not so wrapped."""
         c = self.core
-        scrutinee, branches = args[0], args[1:]
-        picker = c.AccessExpr(
-            base=c.TupleExpr(elts=tuple(branches)),
-            index=(c.CallExpr(fn=c.Var(name="int"), args=(scrutinee,)),),
-        )
-        return c.ArrayExpr(obj=picker, dtype=self._dtype_f64())
+        if isinstance(expr, c.CallExpr) and isinstance(expr.fn, c.Var) and expr.fn.name == "int":
+            return expr.args[0]
+        return expr
+
+    def _switch_expr(self, fn: Any, args: list[Any], scrutinee_ref: Any = None) -> Any:
+        """Canonical :class:`~polyarray.ir.SwitchOp` lowering — ``branch[scrutinee]``.
+
+        Two lanes, chosen by whether the scrutinee is STATICALLY a concrete int:
+
+        * **Concrete-int fast path** — the scrutinee ref is a :class:`~polyarray.ir.Const`
+          holding an integer scalar (a bound compile-time value, NOT a batched/dynamic
+          ref). Emit the direct branch pick ``branches[k]`` — preserving that branch's
+          exact shape AND dtype (heterogeneous branches are fine; no f64 cast).
+
+        * **One-hot vmap-safe default** — for a dynamic/batched scrutinee (an
+          :class:`~polyarray.ir.IntAtomRef` — the per-cell orientation id, a BATCHED
+          integer tensor under ``torch.vmap``) the direct pick's ``int(scrutinee)`` /
+          advanced index is illegal (it ``.item()``s a batched tensor). Instead stack
+          the ``N`` branches → ``(N, *S)``, build a one-hot ``arange(N) == scrutinee``
+          (broadcasts a batched 0-d scrutinee to a batched ``(N,)`` selector), cast to
+          f64, and contract the branch axis by ``einsum('n,n...->...')`` — pure
+          arithmetic, so it lowers under ``torch.vmap`` (and works unbatched too).
+          This is the safe default whenever the scrutinee is NOT a static ``Const``:
+          pyab cannot know if the caller will vmap, and the one-hot is universally
+          correct (it inherently needs the uniform branch shape that the vmap case has).
+          Branch order matches the ``select_x`` scrutinee domain (chartlib
+          ``SymbolicInterpreter.select_x``).
+        """
+        c = self.core
+        if isinstance(scrutinee_ref, Const):
+            v = scrutinee_ref.value
+            arr = np.asarray(v)
+            if arr.ndim == 0 and np.issubdtype(arr.dtype, np.integer):
+                k = int(arr)
+                return args[1 + k]                      # direct branch pick (exact dtype/shape)
+        # Dynamic / batched scrutinee ⇒ one-hot · stacked branches (vmap-safe).
+        scrutinee = self._unwrap_int_call(args[0])
+        branch_exprs = tuple(args[1:])
+        n = fn.n_branches
+        stacked = c.StackExpr(arrays=branch_exprs, axis=0)                         # (N, *S)
+        idx = c.ArangeExpr(start=c.IntLit(value=0), stop=c.IntLit(value=int(n)),
+                           step=c.IntLit(value=1), dtype=None)                     # (N,) int
+        eq = c.BinaryExpr(op=c.BinaryOp.EQ, lhs=idx, rhs=scrutinee)                # (N,) bool selector
+        onehot = c.ArrayExpr(obj=eq, dtype=self._dtype_f64())                      # f64, matches branches
+        return c.EinsumExpr(subscripts="n,n...->...", operands=(onehot, stacked))
 
     # -- SVD / GSVD (data-dependent rank -> eager fusion boundary) ---------
     #

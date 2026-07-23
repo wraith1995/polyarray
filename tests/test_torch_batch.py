@@ -11,7 +11,7 @@ pytest.importorskip("pyarraybackend")
 from dataclasses import dataclass
 
 from polyarray import Program
-from polyarray.ir import SymInput, Provenance, SymbolicBudget, OutSpec
+from polyarray.ir import SymInput, Provenance, SymbolicBudget, OutSpec, SwitchOp
 from polyarray.batch import batched_run
 from polyarray.torch_batch import batched_torch, torch_available
 
@@ -36,13 +36,18 @@ def test_batched_torch_matches_batched_run():
     np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-9)
 
 
-# Mocks of the grassmann-origin FEEC front-end ops (same class names + attrs pyab dispatches on), to
-# exercise the `feec_op_lowerings` renderers. The real ops are validated byte-identically on the FEEC
-# residual; these give in-repo coverage without a grassmann dependency.
+# Mocks of the grassmann-origin FEEC front-end ops carrying the canonical `__pyab_lower__` op-carried
+# lowering hook (the twin of `numpy_source`'s `__numpy_source__`), which pyab's `_render_op` discovers by
+# getattr — so plain `LowerOpts()` lowers them (no `op_lowerings` dict). The real ops are validated
+# byte-identically on the FEEC residual; these give in-repo coverage without a grassmann dependency.
 @dataclass(frozen=True)
 class _ReshapeOp:
     shape: tuple
     def __call__(self, A): return np.asarray(A, float).reshape(self.shape)
+
+    def __pyab_lower__(self, builder, args, low):
+        c = low.core
+        return [c.ReshapeExpr(a=args[0], shape=tuple(c.IntLit(value=int(d)) for d in self.shape))]
 
 
 @dataclass(frozen=True)
@@ -50,10 +55,18 @@ class _ScaleOp:
     factor: float
     def __call__(self, A): return self.factor * np.asarray(A, float)
 
+    def __pyab_lower__(self, builder, args, low):
+        c = low.core
+        return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.FloatLit(value=float(self.factor)), rhs=args[0])]
+
 
 @dataclass(frozen=True)
 class _AddOp:
     def __call__(self, a, b): return np.asarray(a, float) + np.asarray(b, float)
+
+    def __pyab_lower__(self, builder, args, low):
+        c = low.core
+        return [c.BinaryExpr(op=c.BinaryOp.ADD, lhs=args[0], rhs=args[1])]
 
 
 @pytest.mark.skipif(not torch_available(), reason="torch/pyarraybackend not available")
@@ -69,4 +82,54 @@ def test_feec_op_lowerings_reshape_scale_add():
     got = batched_torch(p, {"x": xs})
     ref = batched_run(p, {"x": xs})
     assert got.shape == ref.shape
+    np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-9)
+
+
+# A canonical fold-ALL-operands lowering hook (the shape the real grassmann `_AddOp` uses): pyab must pass
+# every operand to the hook so it can fold n > 2. Guards the consolidation's `_AddOp` fix — the old
+# torch renderer summed only args[0]+args[1] and silently dropped args[2:] for n >= 3.
+@dataclass(frozen=True)
+class _SumOp:
+    def __call__(self, *xs): return np.sum([np.asarray(x, float) for x in xs], axis=0)
+
+    def __pyab_lower__(self, builder, args, low):
+        c = low.core
+        acc = args[0]
+        for a in args[1:]:
+            acc = c.BinaryExpr(op=c.BinaryOp.ADD, lhs=acc, rhs=a)
+        return [acc]
+
+
+@pytest.mark.skipif(not torch_available(), reason="torch/pyarraybackend not available")
+def test_pyab_hook_folds_all_operands_n_gt_2():
+    # a 3-operand sum through a __pyab_lower__ hook (plain LowerOpts, no op_lowerings dict).
+    p = Program("sum3", inputs=[SymInput(n, (4,), _prov(n)) for n in ("x", "y", "z")])
+    (s,) = p.emit_stmt(_SumOp(), [p.input("x"), p.input("y"), p.input("z")], [OutSpec("s", (4,))])
+    p.add_output("result", s.cells)
+    B = 8
+    rng = np.random.default_rng(5)
+    binds = {n: rng.standard_normal((B, 4)) for n in ("x", "y", "z")}
+    got = batched_torch(p, binds)
+    ref = binds["x"] + binds["y"] + binds["z"]                    # all three, not just x+y
+    np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-9)
+
+
+@pytest.mark.skipif(not torch_available(), reason="torch/pyarraybackend not available")
+def test_switch_op_vmap_onehot_dynamic_scrutinee():
+    # A per-lane (batched) integer scrutinee selects a branch under torch.vmap — the vmap-safe one-hot
+    # lowering (the old `branches[int(scrutinee)]` .item()s a batched tensor and is illegal under vmap).
+    p = Program("swd", inputs=[SymInput("s", (), _prov("s"))]
+                + [SymInput(n, (2,), _prov(n)) for n in ("a", "b", "c")],
+                budget=SymbolicBudget.force_stmts())
+    (o,) = p.emit_stmt(SwitchOp(n_branches=3),
+                       [p.input("s"), p.input("a"), p.input("b"), p.input("c")], [OutSpec("o", (2,))])
+    p.add_output("result", o.cells)
+    B = 6
+    rng = np.random.default_rng(6)
+    svals = np.array([0, 1, 2, 2, 1, 0], dtype=float)
+    binds = {"s": svals, "a": rng.standard_normal((B, 2)),
+             "b": rng.standard_normal((B, 2)), "c": rng.standard_normal((B, 2))}
+    got = batched_torch(p, binds)
+    branches = np.stack([binds["a"], binds["b"], binds["c"]], axis=0)     # (3, B, 2)
+    ref = np.stack([branches[int(svals[i]), i] for i in range(B)])
     np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-9)
