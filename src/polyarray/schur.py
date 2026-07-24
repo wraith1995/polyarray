@@ -28,6 +28,7 @@ Driver structure:
    (``_choose_split``), recurse on the two diagonal blocks, combine, and undo the reordering.
 """
 
+import os
 from typing import cast
 
 import numpy as np
@@ -190,13 +191,31 @@ def _syntactic_mask(cells: np.ndarray) -> np.ndarray:
 
 
 def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
-    """The nonzero mask steering the recursion: an explicitly-threaded sub-mask if given, else a
-    deterministically-probed structural mask of ``matrix``, else the syntactic ``simple_zero`` fallback."""
+    """The nonzero mask steering the recursion — SOUND by default (§certainty).
+
+    An explicitly-threaded sub-mask wins. Otherwise the syntactic ``simple_zero`` mask: it marks a cell
+    zero ONLY when its numerator polynomial is coefficient-zero, so it can NEVER false-zero a truly-
+    nonzero cell (at worst it is conservative — dense — when it cannot prove a cell zero, which is always
+    safe: a denser mask only makes the block split less aggressive, never wrong).
+
+    The numeric probe ``_structural_mask`` is UNSOUND and NO LONGER the default: it marks a cell zero when
+    it is merely SMALL (< ``_MASK_TOL``) at a few sample points, so a *tiny-but-nonzero* cell is dropped
+    and the Schur split silently returns a WRONG inverse (proven on Argyris/Bell — the symbolic ``P(T)``
+    came out ``5e20`` off the true ``inv(C)``; adding sample points does not help, the cells are tiny at
+    every point). It survives only behind an explicit, self-labelled-unsound opt-in
+    (``POLYARRAY_SCHUR_UNSOUND_PROBE_MASK``) for a large element whose cancellation-sparsity a sound exact
+    fold cannot yet recover — and only ever with the numeric-vs-symbolic ``P(T)`` backstop watching it."""
     if mask is not None:
         return mask
-    probed = _structural_mask(matrix)
-    if probed is not None:
-        return probed
+    if os.environ.get("POLYARRAY_SCHUR_UNSOUND_PROBE_MASK", "") not in ("", "0"):
+        probed = _structural_mask(matrix)
+        if probed is not None:
+            import warnings
+            warnings.warn(
+                "schur: POLYARRAY_SCHUR_UNSOUND_PROBE_MASK is set — the numeric sparsity probe is UNSOUND "
+                "(it drops tiny-but-nonzero cells, giving a WRONG inverse; proven on Argyris/Bell). Use "
+                "only with the numeric-vs-symbolic P(T) backstop.", stacklevel=2)
+            return probed
     return _syntactic_mask(matrix.cells)
 
 
