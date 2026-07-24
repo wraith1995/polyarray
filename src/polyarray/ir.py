@@ -2189,6 +2189,27 @@ def _einsum_bag_threshold() -> int:
         return _EINSUM_BAG_THRESHOLD_DEFAULT
 
 
+# Contraction paths depend only on (spec, optimize, operand shapes), never on values, but
+# ``np.einsum(..., optimize=True)`` recomputes the path on EVERY call — ~28 µs of pure
+# planning that dominated symbolic-Vandermonde builds (hundreds of thousands of identical
+# small einsums at high FEEC degree). Cache the path by that key and pass it back: numpy
+# then skips the planning and runs the SAME contraction order ⇒ bit-identical results.
+_EINSUM_PATH_CACHE: dict[tuple[str, object, tuple[tuple[int, ...], ...]], Any] = {}
+
+
+def _cached_einsum(spec: str, operands: tuple[np.ndarray, ...], optimize: object) -> np.ndarray:
+    if optimize is False:
+        return np.einsum(spec, *operands, optimize=False)
+    key = (spec, optimize, tuple(o.shape for o in operands))
+    path = _EINSUM_PATH_CACHE.get(key)
+    if path is None:
+        if len(_EINSUM_PATH_CACHE) > 8192:               # bounded; distinct keys are few per element
+            _EINSUM_PATH_CACHE.clear()
+        path, _ = np.einsum_path(spec, *operands, optimize=optimize)
+        _EINSUM_PATH_CACHE[key] = path
+    return np.einsum(spec, *operands, optimize=path)
+
+
 @dataclass(frozen=True)
 class EinsumStmtOp:
     """Stmt-compatible einsum over an arbitrary number of symbolic operands.
@@ -2211,11 +2232,7 @@ class EinsumStmtOp:
     optimize: bool = True
 
     def __call__(self, *operands: np.ndarray) -> np.ndarray:
-        return np.einsum(
-            self.spec,
-            *(np.asarray(op) for op in operands),
-            optimize=self.optimize,
-        )
+        return _cached_einsum(self.spec, tuple(np.asarray(op) for op in operands), self.optimize)
 
 
 @dataclass(frozen=True)
