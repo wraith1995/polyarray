@@ -80,3 +80,21 @@ def test_explicit_mask_is_honored():
     rng = np.arange(1, 17, dtype=float) * 0.5 + 0.3
     Mn = np.asarray(M.evaluate({"v": rng}), float)
     assert np.allclose(np.asarray(inv.evaluate({"v": rng}), float) @ Mn, np.eye(4), atol=1e-9)
+
+
+def test_general_split_pivots_singular_midpoint_block():
+    # An 8×8 (> BASE) block ANTI-diagonal `[[0, X],[Y, 0]]` — non-singular (det = ±detX·detY) but whose
+    # MIDPOINT principal block A (top-left 4×4) is ZERO ⇒ singular. A DENSE mask forces it onto the general
+    # Schur split, which must PIVOT columns so A is non-singular; without pivoting A⁻¹ blows up and the
+    # inverse is WRONG even though M is invertible. Regression (2026-07-24): the plate-element P(T) hit this
+    # via a conservative sparse mask (Hermite symbolic P(T) → 2.4e30 off inv(C)).
+    rng = np.random.default_rng(0)
+    X = rng.uniform(1.0, 2.0, (4, 4)) + 5.0 * np.eye(4)
+    Y = rng.uniform(1.0, 2.0, (4, 4)) + 5.0 * np.eye(4)
+    M = np.zeros((8, 8))
+    M[:4, 4:] = X
+    M[4:, :4] = Y
+    for mask in (np.ones((8, 8), dtype=bool), None):   # dense (conservative) AND resolved — both correct
+        inv = symbolic_inverse(SymArray(M), mask=mask)
+        got = np.asarray(inv.cells, dtype=float)
+        assert np.allclose(got @ M, np.eye(8), atol=1e-10), f"mask_dense={mask is not None}"

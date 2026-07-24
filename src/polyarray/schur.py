@@ -53,8 +53,8 @@ BASE = 6
 # symbolic; the leaf inverses and Schur-combine matrix products are where the rational explodes. At/above
 # these sizes we emit `np.linalg.inv` / `@` as a deferred Stmt; smaller blocks stay exact-rational. DEFAULTS:
 # a caller dials exact-vs-fast per call via the ambient `SymbolicBudget` (see `_defer_thresholds`).
-_DEFER_INVERSE = 4   # a base-case inverse this size or larger → numeric InvOp Stmt (2×2/3×3 stay rational)
-_DEFER_MATMUL = 4    # a Schur-combine product with any dim ≥ this → numeric matmul Stmt
+_DEFER_INVERSE = 2   # a base-case inverse this size or larger → numeric InvOp Stmt (only 1×1 stays inline)
+_DEFER_MATMUL = 2    # a Schur-combine product with any dim ≥ this → numeric matmul Stmt
 
 
 def _defer_thresholds() -> tuple[int, int]:
@@ -182,11 +182,32 @@ def _structural_mask(matrix: SymArray) -> np.ndarray | None:
     return mask
 
 
+def _approx_zero(cell: object) -> bool:
+    """The SOUND roundoff-accepting zero test for the sparsity mask. A cell is zero iff it is a SYNTACTIC
+    (coefficient) zero, OR it is a CONSTANT (a number, or a total-degree-0 ``RationalFunction``) whose
+    magnitude is ``< _MASK_TOL`` — a true zero landed as float ROUNDOFF (a numeric ``Vref⁻¹`` over the
+    irrational normalized basis makes the P(T) value rows ``~1e-17``, not exact ``0``).
+
+    Roundoff is applied ONLY to CONSTANTS: a constant does not vary, so ``|const| < tol`` is genuinely a
+    rounded zero. This is the crucial soundness distinction from the retired numeric probe, which read a
+    SYMBOLIC cell's magnitude at a few generic points — where a tiny-but-nonzero cell gave a WRONG inverse
+    (the 5e20 Argyris bug). A vertex-dependent ``RationalFunction`` stays EXACT (``simple_zero``, no
+    roundoff, no sampling). Guarded end-to-end by the numeric-vs-symbolic P(T) backstop."""
+    if simple_zero(cell):
+        return True
+    if isinstance(cell, (int, float, np.floating, np.integer)):
+        return abs(float(cell)) < _MASK_TOL
+    if isinstance(cell, RationalFunction) and cell.is_constant():
+        return abs(float(cell.to_constant())) < _MASK_TOL
+    return False
+
+
 def _syntactic_mask(cells: np.ndarray) -> np.ndarray:
-    """Conservative fallback mask: a cell is nonzero unless it is *syntactically* zero."""
+    """Conservative mask: a cell is nonzero unless it is a syntactic OR roundoff-constant zero
+    (:func:`_approx_zero`)."""
     out = np.empty(cells.shape, dtype=bool)
     for idx in np.ndindex(cells.shape):
-        out[idx] = not simple_zero(cells[idx])
+        out[idx] = not _approx_zero(cells[idx])
     return out
 
 
@@ -403,14 +424,17 @@ def _invert(M: SymArray, mask: np.ndarray | None = None) -> SymArray:
     # trivial sparsity.
     new_order, sizes, reordered, reordered_mask = _by_row_zeros(M, mask)
     split = _choose_split(n, sizes)
-    if split is None:
-        if n <= BASE:
-            return _base_inverse(M)
-        # No beneficial block structure — split in place at the midpoint (general Schur).
-        reordered, reordered_mask, new_order, split = M, mask, list(range(n)), n // 2
-
-    rinv = _schur_combine(reordered, split, reordered_mask)
-    # reordered = M[new_order] (row permutation P); reordered⁻¹ = M⁻¹ Pᵀ, so M⁻¹ = reordered⁻¹ P = a COLUMN
-    # permutation of rinv by the inverse order.
-    inv_order = np.argsort(new_order)
-    return rinv[:, inv_order]
+    if split is not None:
+        # Block-lower-triangular split (top-right block structurally zero): the diagonal blocks A, D are
+        # non-singular (det M = det A · det D ≠ 0 with B = 0), so no pivot is needed. `reordered = M[new_
+        # order]` (row perm P) ⇒ reordered⁻¹ = M⁻¹Pᵀ, so M⁻¹ = a column permutation of the result.
+        rinv = _schur_combine(reordered, split, reordered_mask)
+        return rinv[:, np.argsort(new_order)]
+    # No beneficial block structure REMAINS here (no triangular split, single bipartite component): the
+    # block is effectively DENSE, so recursing a general midpoint split would only churn symbolic
+    # RationalFunction arithmetic on a dense high-degree block — the plate (degree-5 Argyris/Bell) blow-up.
+    # Instead DEFER THE WHOLE BLOCK (any size) to a NUMERIC `InvOp` Stmt that evaluates per cell (§14, Teo:
+    # "stop recursing when the block-zeros stop being useful; defer everywhere"). This also sidesteps the
+    # un-pivoted general-Schur singular-pivot bug — `np.linalg.inv` pivots internally. `_base_inverse` emits
+    # the numeric InvOp for a symbolic block riding a program (`_DEFER_INVERSE`), else the exact cofactor.
+    return _base_inverse(M)
