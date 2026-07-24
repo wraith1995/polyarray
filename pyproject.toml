@@ -24,6 +24,7 @@ dev = [
     "cython>=3.0",
     "pytest>=8.0",
     "pytest-xdist>=3.5",
+    "pytest-timeout>=2.1",
     "mypy>=1.13",
 ]
 
@@ -32,6 +33,12 @@ dev = [
 # gloo group (tests/conftest.py) binds a distinct free port per worker — no MASTER_PORT
 # collision. Override with `-n0` for a serial run / debugger.
 addopts = "-n auto"
+# Per-test wall-clock budget (pytest-timeout; §E1 blow-up blocker-avoidance): an IR blow-up FAILS FAST
+# instead of hanging/OOMing. `thread` method (NOT SIGALRM — the torch gloo init above uses signals).
+# 300 s is generous (≫ any legit single test, ≪ a real blow-up); tighten with `--durations` follow-up.
+# Override with `--timeout=N`; a heavier test raises its own bar with `@pytest.mark.timeout(N)`.
+timeout = 300
+timeout_method = "thread"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
