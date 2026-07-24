@@ -75,20 +75,36 @@ def feec_op_lowerings() -> dict:
     return {}
 
 
-def ensure_torch_pg(port: int = 29591) -> None:
+def _free_tcp_port() -> int:
+    """A currently-free localhost TCP port (bind to :0, read the OS-assigned port, release).
+
+    There is a tiny window between release and ``init_process_group`` rebinding it, but the
+    port is per-process and ephemeral, so parallel xdist workers / concurrent runs each get a
+    distinct one — unlike a fixed port, which they all collide on (hang / silent dead PG)."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def ensure_torch_pg(port: int | None = None) -> None:
     """Pre-initialize a 1-rank ``gloo`` ``torch.distributed`` process group.
 
     ``pyab``'s torch backend calls ``ensure_pg()`` at generated-module load, which bootstraps the process
     group from mpi4py. That check short-circuits when ``torch.distributed`` is already initialized (BEFORE
     importing mpi4py), so initializing a 1-rank group here avoids the mpi4py / MPI dependency for
-    single-process use. Idempotent."""
+    single-process use. Idempotent.
+
+    ``port`` defaults to a FREE ephemeral port (was a fixed 29591, which collided under
+    ``pytest -n auto`` / concurrent agents). An already-set ``MASTER_PORT`` env still wins
+    (``setdefault``), so a hand-pinned port is honoured."""
     import torch.distributed as td
     if td.is_initialized():
         return
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", str(port))
+    os.environ.setdefault("MASTER_PORT", str(port if port is not None else _free_tcp_port()))
     td.init_process_group(backend="gloo", rank=0, world_size=1)
 
 

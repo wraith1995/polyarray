@@ -23,8 +23,15 @@ flint = ["python-flint>=0.8.0"]
 dev = [
     "cython>=3.0",
     "pytest>=8.0",
+    "pytest-xdist>=3.5",
     "mypy>=1.13",
 ]
+
+[tool.pytest.ini_options]
+# Parallel by default (pytest-xdist): each worker is its own process, so the torch 1-rank
+# gloo group (tests/conftest.py) binds a distinct free port per worker — no MASTER_PORT
+# collision. Override with `-n0` for a serial run / debugger.
+addopts = "-n auto"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
