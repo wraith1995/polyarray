@@ -45,9 +45,51 @@ from .forward import _body_of
 
 _INF = float("inf")
 
-# polyarray's NATIVE op categories. Front-end ops (grassmann/chartlib/pointwise `_…Op`s)
-# are supplied per call via the keyword sets; ops in no category fall to the
-# nonlinear/unknown branch (`inf` on a seed-dependent operand — over-estimation is safe).
+# polyarray's NATIVE op degree categories, keyed by the CLASS OBJECT (not its name
+# string). Type-keying is the robustness fix: a rename/relocation of a builtin breaks
+# LOUDLY here at import instead of silently mis-degreeing — the failure mode that shipped
+# when the grassmann→polyarray op relocation renamed ~40 ops and a name-string category
+# table went stale ⇒ unknown op ⇒ `inf` degree ⇒ OverflowError / wrong quadrature order.
+# Every Stmt.fn op class in `ir` must appear here (guarded by tests/test_degree_coverage.py).
+#   zero        — output depends on SHAPES/structure, not values      ⇒ 0
+#   passthrough — reorder / select / additive / scale-by-constant     ⇒ MAX(operands)
+#   multilinear — products / contractions                             ⇒ SUM(operands)
+#   rational    — genuinely rational / algebraic / non-polynomial     ⇒ inf on a seed
+#   special     — richer handling in `program_degree` (DetOp, CallOp), not a flat category
+DEG_ZERO, DEG_PASS, DEG_MULT, DEG_RAT, DEG_SPECIAL = (
+    "zero", "passthrough", "multilinear", "rational", "special")
+
+DEFAULT_DEGREE_KINDS: dict[type, str] = {
+    # zero — structural / constant (degree 0 whatever the operands)
+    _ir.AxisLenOp: DEG_ZERO, _ir.CompRankOp: DEG_ZERO, _ir.ConstOp: DEG_ZERO,
+    _ir.DynEyeOp: DEG_ZERO, _ir.DynEyeTensorOp: DEG_ZERO, _ir.DynZerosOp: DEG_ZERO,
+    _ir.EyeOp: DEG_ZERO, _ir.MulAxisDimOp: DEG_ZERO, _ir.ProdDimOp: DEG_ZERO,
+    _ir.ProdShapeOp: DEG_ZERO, _ir.RankOp: DEG_ZERO, _ir.ScaleAxisDimOp: DEG_ZERO,
+    _ir.SumDimOp: DEG_ZERO, _ir.SumShapeOp: DEG_ZERO,
+    # passthrough — reorder / select / additive / scale-by-constant
+    _ir.AddOp: DEG_PASS, _ir.AssertOp: DEG_PASS, _ir.BlockDiagOp: DEG_PASS,
+    _ir.BlockRepeatOp: DEG_PASS, _ir.ColStackOp: DEG_PASS, _ir.ConcatOp: DEG_PASS,
+    _ir.DynBlockRepeatOp: DEG_PASS, _ir.FirstColsOp: DEG_PASS, _ir.HStackOp: DEG_PASS,
+    _ir.IdentityOp: DEG_PASS, _ir.LastColsOp: DEG_PASS, _ir.MoveaxisOp: DEG_PASS,
+    _ir.ReshapeOp: DEG_PASS, _ir.ScaleOp: DEG_PASS, _ir.SwitchOp: DEG_PASS,
+    _ir.TransposeOp: DEG_PASS,
+    # multilinear — products / contractions (degree = SUM of operands)
+    _ir.ComposeViaStdOp: DEG_MULT, _ir.EinsumOp: DEG_MULT, _ir.EinsumStmtOp: DEG_MULT,
+    _ir.EmbedOp: DEG_MULT, _ir.KronFreeOp: DEG_MULT, _ir.KronOp: DEG_MULT,
+    _ir.ProjectOp: DEG_MULT, _ir.ScaleByOp: DEG_MULT, _ir.TensordotOp: DEG_MULT,
+    # rational / algebraic / non-polynomial ⇒ inf on a seed-dependent operand
+    _ir.AbsOp: DEG_RAT, _ir.GSvdFullOp: DEG_RAT, _ir.GSvdOp: DEG_RAT, _ir.InvOp: DEG_RAT,
+    _ir.InvTransposeOp: DEG_RAT, _ir.MetricOrthonormalOp: DEG_RAT, _ir.PinvOp: DEG_RAT,
+    _ir.QrOp: DEG_RAT, _ir.SignOp: DEG_RAT, _ir.SinvFullOp: DEG_RAT, _ir.SolveOp: DEG_RAT,
+    _ir.SqrtOp: DEG_RAT, _ir.SqrtSpdOp: DEG_RAT, _ir.SvdOp: DEG_RAT, _ir.WhileOp: DEG_RAT,
+    # special — DetOp (≤ n·d) and CallOp (recurse) are handled in `program_degree`
+    _ir.DetOp: DEG_SPECIAL, _ir.CallOp: DEG_SPECIAL,
+}
+
+# Legacy NAME-string category sets — kept only for callers that still pass FRONT-END op
+# names via `program_degree`'s ``*_ops`` kwargs (front-end ops polyarray must not import).
+# polyarray's OWN builtins are covered type-safely by ``DEFAULT_DEGREE_KINDS`` above and no
+# longer need listing here; a front end may ALSO tag an op class with ``_DEGREE_KIND``.
 DEFAULT_ZERO_OPS: frozenset[str] = frozenset()
 DEFAULT_PASSTHROUGH_OPS: frozenset[str] = frozenset({"AssertOp", "IdentityOp", "MoveaxisOp"})
 DEFAULT_MULTILINEAR_OPS: frozenset[str] = frozenset({"EinsumStmtOp", "EinsumOp", "TensordotOp"})
@@ -55,9 +97,14 @@ DEFAULT_MULTILINEAR_OPS: frozenset[str] = frozenset({"EinsumStmtOp", "EinsumOp",
 
 def _op_degree(fn: Any, in_degs: list[float], zero: frozenset[str],
                passthrough: frozenset[str], multilinear: frozenset[str]) -> float:
-    """Output degree of a non-``CallOp`` statement from its operand degrees."""
+    """Output degree of a non-``CallOp`` statement from its operand degrees.
+
+    Category resolution (robust, in order): the type-keyed native map, then an op-carried
+    ``_DEGREE_KIND`` tag (a front-end op may declare its own), then the legacy per-call
+    NAME sets. Unknown ⇒ ``inf`` (safe over-estimate)."""
+    kind = DEFAULT_DEGREE_KINDS.get(type(fn)) or getattr(fn, "_DEGREE_KIND", None)
     name = type(fn).__name__
-    if name in zero:
+    if kind == DEG_ZERO or name in zero:
         return 0.0
     if not in_degs:
         return 0.0
@@ -65,11 +112,11 @@ def _op_degree(fn: Any, in_degs: list[float], zero: frozenset[str],
         return 0.0
     if any(d == _INF for d in in_degs):
         return _INF
-    if name in passthrough:
+    if kind == DEG_PASS or name in passthrough:
         return float(max(in_degs))
-    if name in multilinear:
+    if kind == DEG_MULT or name in multilinear:
         return float(sum(in_degs))
-    return _INF                                                   # nonlinear/rational/unknown on a seed
+    return _INF                                                   # rational/nonlinear/unknown on a seed
 
 
 def program_degree(
