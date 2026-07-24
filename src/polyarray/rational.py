@@ -583,6 +583,24 @@ class RationalFunction:
             self._compiled = fn
         return fn(bindings)
 
+    def eval_numeric_direct(self, bindings: Mapping[str, float]) -> float:
+        """Numeric evaluation at a FULL binding by direct term-summation — NO per-RF Python
+        codegen / ``compile``.
+
+        Returns the same ``float`` as :meth:`eval_numeric_fast` (same terms in the same order,
+        same ``_coeff_to_float`` coercion, so bit-identical), but with O(#terms) arithmetic
+        instead of building and ``exec``-ing a reusable Python evaluator. That codegen
+        amortizes over MANY evaluations (the vmap build-once path, an RF run at M query
+        points) but is pure waste for a FEW: the 3-point structural-mask probe
+        (:func:`polyarray.schur._structural_mask`) compiled every cell of a degree-5 ``C`` and
+        used it 3× — ~31 s (``_compile_eval``: ``builtins.compile`` + ``_poly_term_strings``)
+        of the ~36 s Argyris symbolic-P(T) build, for nothing. Byte-identical ⇒ identical mask."""
+        names = _ring_names(self._ring)
+        if not names:
+            return self._eval_constant_to_float()
+        return (_eval_poly_full(self._num, names, bindings)
+                / _eval_poly_full(self._den, names, bindings))
+
     # ------------------------------------------------------------------
     # Symbolic substitution (build-time `compose`)
     # ------------------------------------------------------------------
@@ -938,6 +956,25 @@ def _poly_term_strings(
         else:
             terms.append("*".join([repr(c), *factors]))
     return terms
+
+
+def _eval_poly_full(poly: Poly, names: Sequence[str], bindings: Mapping[str, Any]) -> float:
+    """Sum ``poly`` at a FULL numeric binding: Σ coeff · Π binding[var]**exp over its terms.
+
+    The no-``compile`` numeric evaluator behind :meth:`RationalFunction.eval_numeric_direct`.
+    Walks ``poly.terms()`` in the same order and with the same ``_coeff_to_float`` coercion as
+    :func:`_poly_term_strings` (the source the compiled evaluator is built from), so the result
+    is bit-identical to running that compiled evaluator — a skipped zero-coefficient term
+    contributes ``0.0`` (a float no-op), so omitting it (as the string builder does) changes
+    nothing."""
+    total = 0.0
+    for monom, coeff in poly.terms():
+        c = _coeff_to_float(coeff)
+        for src_pos, exp in enumerate(monom):
+            if exp:
+                c *= float(bindings[names[src_pos]]) ** int(exp)
+        total += c
+    return total
 
 
 def _partial_substitute(
