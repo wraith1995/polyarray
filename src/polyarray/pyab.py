@@ -55,30 +55,67 @@ import numpy as np
 
 from .ir import (
     AbsOp,
+    AddOp,
     AssertOp,
+    AxisLenOp,
+    BlockDiagOp,
+    BlockRepeatOp,
     CallOp,
+    ColStackOp,
+    CompRankOp,
+    ComposeViaStdOp,
+    ConcatOp,
     Const,
+    ConstOp,
     DetOp,
+    DynBlockRepeatOp,
+    DynEyeOp,
+    DynEyeTensorOp,
+    DynZerosOp,
     EinsumOp,
     EinsumStmtOp,
+    EmbedOp,
+    EyeOp,
+    FirstColsOp,
+    GSvdFullOp,
     GSvdOp,
+    HStackOp,
     IdentityOp,
     InputRef,
     IntAtomRef,
     InvOp,
+    InvTransposeOp,
+    KronFreeOp,
+    KronOp,
+    LastColsOp,
+    MetricOrthonormalOp,
     MoveaxisOp,
+    MulAxisDimOp,
     OutputRef,
     PinvOp,
+    ProdDimOp,
+    ProdShapeOp,
     Program,
+    ProjectOp,
     QrOp,
+    RankOp,
     RationalRef,
+    ReshapeOp,
+    ScaleAxisDimOp,
+    ScaleByOp,
+    ScaleOp,
     SignOp,
+    SinvFullOp,
+    SqrtSpdOp,
+    SumDimOp,
+    SumShapeOp,
     SolveOp,
     SqrtOp,
     SvdOp,
     SwitchOp,
     SymArrayRef,
     TensordotOp,
+    TransposeOp,
     WhileOp,
     is_dynamic,
 )
@@ -162,6 +199,449 @@ def _builder_mod() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# pyab renderers for polyarray's relocated generic array ops.  Each
+# ``(op, builder, args, low) -> list[expr]`` renderer builds PyAB IR from
+# ``low.core`` primitives only (the same signature/behaviour as an op-carried
+# ``__pyab_lower__`` hook), and is registered in the type-keyed
+# ``_ARRAY_OP_LOWERINGS`` table consulted inside ``_Lowerer._render_op``.
+# ---------------------------------------------------------------------------
+
+
+def _axis_len(low: Any, x: Any, axis: int) -> Any:
+    """Runtime length of ``x``'s axis ``axis`` as a pyab int expr (``x.shape[axis]``)."""
+    c = low.core
+    return c.AccessExpr(base=c.ShapeExpr(x=x), index=(c.IntLit(value=int(axis)),))
+
+
+def _f64_scalar(low: Any, v: float) -> Any:
+    c = low.core
+    return c.ArrayExpr(obj=c.FloatLit(value=float(v)), dtype=low._dtype_f64())
+
+
+def _static_eye(low: Any, n_expr: Any) -> Any:
+    """An ``n×n`` f64-exact identity ``where(arange(n)[:,None]==arange(n)[None,:], 1, 0)``.
+
+    Built without a namespace ``eye`` (whose torch default is float32); ``n_expr`` may be a
+    static ``IntLit`` or a runtime int expr, so one builder serves static and dynamic ``n``.
+    """
+    c = low.core
+    r = c.ArangeExpr(start=c.IntLit(value=0), stop=n_expr)
+    ri = c.AccessExpr(base=r, index=(c.Slice(), c.NewAxisTok()))
+    rj = c.AccessExpr(base=r, index=(c.NewAxisTok(), c.Slice()))
+    eq = c.BinaryExpr(op=c.BinaryOp.EQ, lhs=ri, rhs=rj)
+    return c.WhereExpr(cond=eq, x=_f64_scalar(low, 1.0), y=_f64_scalar(low, 0.0))
+
+
+def _render_transpose(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``A.T`` — full-reverse transpose (``axes=None``)."""
+    c = low.core
+    return [c.TransposeExpr(a=args[0], axes=None)]
+
+
+def _render_sinv_full(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``out[i,j] = 1/Sᵢ`` on the diagonal for ``i < rank`` else 0 (an ``nrows×ncols`` array).
+
+    Built as ``where(eye_nm, recip_row[:,None], 0)`` where ``recip_row`` is ``1/Sᵢ`` masked to
+    zero beyond ``rank`` (and guarded against 1/0 by substituting 1 in the masked band),
+    padded/truncated to length ``nrows`` so it broadcasts onto the rectangular diagonal.
+    """
+    c = low.core
+    S, rank = args
+    n, m = int(op.nrows), int(op.ncols)
+    f64 = low._dtype_f64()
+    n_lit, m_lit = c.IntLit(value=n), c.IntLit(value=m)
+    ar_n = c.ArangeExpr(start=c.IntLit(value=0), stop=n_lit)
+    ar_m = c.ArangeExpr(start=c.IntLit(value=0), stop=m_lit)
+    ri = c.AccessExpr(base=ar_n, index=(c.Slice(), c.NewAxisTok()))
+    rj = c.AccessExpr(base=ar_m, index=(c.NewAxisTok(), c.Slice()))
+    eye = c.BinaryExpr(op=c.BinaryOp.EQ, lhs=ri, rhs=rj)
+    rk = c.CallExpr(fn=c.Var(name="int"), args=(rank,))
+    within = c.BinaryExpr(op=c.BinaryOp.LT, lhs=ar_n, rhs=rk)   # (n,) bool
+    # Pad/truncate S to length n: concat with ones then slice [:n] (len S = min(n,m) <= n).
+    ones_n = c.OnesExpr(shape=(n_lit,), dtype=f64)
+    s_pad = c.ConcatExpr(arrays=(S, ones_n), axis=0)
+    s_padn = c.AccessExpr(base=s_pad, index=(c.Slice(stop=n_lit),))
+    one, zero = _f64_scalar(low, 1.0), _f64_scalar(low, 0.0)
+    s_safe = c.WhereExpr(cond=within, x=s_padn, y=one)          # no 1/0 outside the used band
+    recip = c.WhereExpr(
+        cond=within,
+        x=c.BinaryExpr(op=c.BinaryOp.TRUEDIV, lhs=one, rhs=s_safe),
+        y=zero,
+    )                                                           # (n,), zero beyond rank
+    recip_col = c.AccessExpr(base=recip, index=(c.Slice(), c.NewAxisTok()))
+    return [c.WhereExpr(cond=eye, x=recip_col, y=zero)]
+
+
+def _render_gsvd_full(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``GSvdOp`` then re-concatenate ``[U|UI]`` / ``[V|VI]`` — reuses the pyab ``_gsvd``
+    composite (whiten / svd / rank-threshold / de-whiten) so behaviour matches the native
+    GSVD lowering; ``_gsvd`` reads the operand refs off ``low._cur_in_refs``."""
+    c = low.core
+    u, ui, v, vi, s, rank = low._gsvd(GSvdOp(rcond=op.rcond), args, None, low._cur_in_refs)
+    ufull = c.ConcatExpr(arrays=(u, ui), axis=1)
+    vfull = c.ConcatExpr(arrays=(v, vi), axis=1)
+    return [ufull, vfull, s, rank]
+
+
+def _render_block_diag(op: Any, builder: Any, args: list, low: Any) -> list:
+    """Block-diagonal ``diag(A, B, …)`` from zero-padded row-blocks concatenated on axis 0
+    (block sizes read off runtime ``ShapeExpr`` — vmap-safe / dynamic-shape correct)."""
+    c = low.core
+    f64 = low._dtype_f64()
+    col_widths = [_axis_len(low, x, 1) for x in args]
+
+    def add(a: Any, b: Any) -> Any:
+        return c.BinaryExpr(op=c.BinaryOp.ADD, lhs=a, rhs=b)
+
+    row_blocks = []
+    for i, x in enumerate(args):
+        ri = _axis_len(low, x, 0)
+        pieces = []
+        left = col_widths[:i]
+        right = col_widths[i + 1:]
+        if left:
+            w = left[0]
+            for extra in left[1:]:
+                w = add(w, extra)
+            pieces.append(c.ZerosExpr(shape=(ri, w), dtype=f64))
+        pieces.append(x)
+        if right:
+            w = right[0]
+            for extra in right[1:]:
+                w = add(w, extra)
+            pieces.append(c.ZerosExpr(shape=(ri, w), dtype=f64))
+        row_blocks.append(
+            pieces[0] if len(pieces) == 1 else c.ConcatExpr(arrays=tuple(pieces), axis=1))
+    return [row_blocks[0] if len(row_blocks) == 1
+            else c.ConcatExpr(arrays=tuple(row_blocks), axis=0)]
+
+
+def _render_block_repeat(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``n`` block-diagonal copies of ``A`` = ``kron(eye(n), A)`` (static ``n``)."""
+    eye = _static_eye(low, low.core.IntLit(value=int(op.n)))
+    return [low._ns_call("kron", (eye, args[0]))]
+
+
+def _render_dyn_block_repeat(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``int(n)`` block-diagonal copies of ``A`` = ``kron(eye(int(n)), A)`` (runtime ``n``)."""
+    c = low.core
+    nn = c.CallExpr(fn=c.Var(name="int"), args=(args[1],))
+    eye = _static_eye(low, nn)
+    return [low._ns_call("kron", (eye, args[0]))]
+
+
+# --- Batch-2 relocated generic array-op lowerings ---------------------------
+# Bodies moved verbatim from grassmann's ``__pyab_lower__`` hooks, adapting only
+# the signature; ``_shape_axis_expr``/``_dyn_eye_expr`` become the identical
+# polyarray helpers ``_axis_len``/``_static_eye``.
+
+
+def _render_dyn_eye(op: Any, builder: Any, args: list, low: Any) -> list:
+    """Runtime ``eye(ref.shape[axis])`` sized by ``ref``'s (un-batched) axis."""
+    return [_static_eye(low, _axis_len(low, args[0], int(op.axis)))]
+
+
+def _render_dyn_zeros(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``zeros((d₀, d₁, …))`` with each ``dᵢ`` a runtime axis of ``refs[i]``."""
+    c = low.core
+    shape = tuple(_axis_len(low, args[i], int(ax)) for i, ax in enumerate(op.axes))
+    return [c.ZerosExpr(shape=shape, dtype=low._dtype_f64())]
+
+
+def _render_dyn_eye_tensor(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``eye(∏dᵢ).reshape(∏dᵢ, d₀, …)`` with each ``dᵢ`` a runtime axis of ``refs[i]``."""
+    c = low.core
+    dims = [_axis_len(low, args[i], int(ax)) for i, ax in enumerate(op.axes)]
+    prod: Any = c.IntLit(value=1)
+    for d in dims:
+        prod = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=prod, rhs=d)
+    prod = builder.assign_new(prod, base="eyeT_prod")   # reuse in eye size AND reshape
+    eye = _static_eye(low, prod)
+    return [c.ReshapeExpr(a=eye, shape=(prod, *dims))]
+
+
+def _render_prod_shape(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``static · ∏ refs[i].shape[axes[i]]`` as a runtime 0-d int."""
+    c = low.core
+    out: Any = c.IntLit(value=int(op.static))
+    for i, ax in enumerate(op.axes):
+        out = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=out, rhs=_axis_len(low, args[i], int(ax)))
+    return [out]
+
+
+def _render_sum_shape(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``static + Σ refs[i].shape[axes[i]]`` as a runtime 0-d int."""
+    c = low.core
+    out: Any = c.IntLit(value=int(op.static))
+    for i, ax in enumerate(op.axes):
+        out = c.BinaryExpr(op=c.BinaryOp.ADD, lhs=out, rhs=_axis_len(low, args[i], int(ax)))
+    return [out]
+
+
+def _render_sum_dim(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``Σ mats[i].shape[axis]`` as a runtime 0-d int."""
+    c = low.core
+    out: Any = c.IntLit(value=0)
+    for x in args:
+        out = c.BinaryExpr(op=c.BinaryOp.ADD, lhs=out, rhs=_axis_len(low, x, int(op.axis)))
+    return [out]
+
+
+def _render_prod_dim(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``∏ mats[i].shape[axis]`` as a runtime 0-d int."""
+    c = low.core
+    out: Any = c.IntLit(value=1)
+    for x in args:
+        out = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=out, rhs=_axis_len(low, x, int(op.axis)))
+    return [out]
+
+
+def _render_scale_axis_dim(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``n · mat.shape[axis]`` as a runtime 0-d int."""
+    c = low.core
+    return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.IntLit(value=int(op.n)),
+                         rhs=_axis_len(low, args[0], int(op.axis)))]
+
+
+def _render_mul_axis_dim(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``int(n) · mat.shape[axis]`` as a runtime 0-d int."""
+    c = low.core
+    n = c.CallExpr(fn=c.Var(name="int"), args=(args[0],))
+    return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=n, rhs=_axis_len(low, args[1], int(op.axis)))]
+
+
+def _render_comp_rank(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``ambient − int(rank)`` as a runtime 0-d int."""
+    c = low.core
+    rank = c.CallExpr(fn=c.Var(name="int"), args=(args[0],))
+    return [c.BinaryExpr(op=c.BinaryOp.SUB, lhs=c.IntLit(value=int(op.ambient)), rhs=rank)]
+
+
+def _render_hstack(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``[A | B | …]`` — concat 2-D matrices along axis 1."""
+    c = low.core
+    return [c.ConcatExpr(arrays=tuple(args), axis=1)]
+
+
+def _render_col_stack(op: Any, builder: Any, args: list, low: Any) -> list:
+    """Flatten each operand then stack as columns on axis 1."""
+    c = low.core
+    flat = [c.ReshapeExpr(a=x, shape=(c.IntLit(value=-1),)) for x in args]
+    return [c.StackExpr(arrays=tuple(flat), axis=1)]
+
+
+def _render_scale(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``factor · x``."""
+    c = low.core
+    return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.FloatLit(value=float(op.factor)), rhs=args[0])]
+
+
+def _render_scale_by(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``s · x`` (runtime scalar)."""
+    c = low.core
+    return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=args[1], rhs=args[0])]
+
+
+def _render_add(op: Any, builder: Any, args: list, low: Any) -> list:
+    """Left-fold ``x0 + x1 + …`` over the operands."""
+    c = low.core
+    out = args[0]
+    for x in args[1:]:
+        out = c.BinaryExpr(op=c.BinaryOp.ADD, lhs=out, rhs=x)
+    return [out]
+
+
+def _render_concat(op: Any, builder: Any, args: list, low: Any) -> list:
+    """Flatten each operand then concatenate on axis 0."""
+    c = low.core
+    flat = [c.ReshapeExpr(a=x, shape=(c.IntLit(value=-1),)) for x in args]
+    return [c.ConcatExpr(arrays=tuple(flat), axis=0)]
+
+
+def _render_axis_len(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``x.shape[axis]`` as a 0-d int."""
+    return [_axis_len(low, args[0], int(op.axis))]
+
+
+def _render_reshape(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``A.reshape(shape)`` (static shape)."""
+    c = low.core
+    return [c.ReshapeExpr(a=args[0], shape=tuple(c.IntLit(value=int(d)) for d in op.shape))]
+
+
+def _render_const(op: Any, builder: Any, args: list, low: Any) -> list:
+    """Rematerialize the frozen constant as a pyab f64 array literal."""
+    arr = np.frombuffer(op.data_bytes, dtype=op.dtype).reshape(op.shape)
+    return [low._const_expr(np.asarray(arr, dtype=float))]
+
+
+def _render_eye(op: Any, builder: Any, args: list, low: Any) -> list:
+    """The static ``n×n`` identity (built f64-exactly)."""
+    return [_static_eye(low, low.core.IntLit(value=int(op.n)))]
+
+
+def _render_first_cols(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``A[:, :int(rank)]``."""
+    c = low.core
+    rank = c.CallExpr(fn=c.Var(name="int"), args=(args[1],))
+    return [c.AccessExpr(base=args[0], index=(c.Slice(), c.Slice(stop=rank)))]
+
+
+def _render_last_cols(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``A[:, int(rank):]`` — the complementary (trailing) columns."""
+    c = low.core
+    rank = c.CallExpr(fn=c.Var(name="int"), args=(args[1],))
+    return [c.AccessExpr(base=args[0], index=(c.Slice(), c.Slice(start=rank)))]
+
+
+# --- Batch-3 relocated generic array / linalg lowerings ---------------------
+# Bodies moved verbatim from grassmann's ``__pyab_lower__`` hooks; ``_ns_call``
+# routes ``linalg.*`` / ``kron`` / ``sqrt`` through the array namespace (numpy
+# AND torch), and ``torch.vmap`` supplies the batch axis around the plain 2-D
+# linalg. ``_shape_axis_expr`` becomes the identical polyarray helper ``_axis_len``.
+
+
+def _render_project(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``P.T @ v.reshape(-1)`` — project ambient coords onto the sub-basis."""
+    c = low.core
+    p_t = c.TransposeExpr(a=args[0], axes=None)
+    v_flat = c.ReshapeExpr(a=args[1], shape=(c.IntLit(value=-1),))
+    return [c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=p_t, rhs=v_flat)]
+
+
+def _render_embed(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``(P @ vsub).reshape(shape)`` — pad sub-coords into the ambient layout."""
+    c = low.core
+    mm = c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=args[0], rhs=args[1])
+    if op.shape:
+        return [c.ReshapeExpr(a=mm, shape=tuple(c.IntLit(value=int(d)) for d in op.shape))]
+    return [mm]
+
+
+def _render_kron(op: Any, builder: Any, args: list, low: Any) -> list:
+    """Chained Kronecker product ``kron(kron(a0, a1), …)``."""
+    acc = args[0]
+    for m in args[1:]:
+        acc = low._ns_call("kron", (acc, m))
+    return [acc]
+
+
+def _render_kron_free(op: Any, builder: Any, args: list, low: Any) -> list:
+    """Block-Kron on the two space axes with an outer product on the (disjoint) trailing
+    free axes.  Reshapes read the runtime ``df/cf/dg/cg`` and free axes off ``ShapeExpr``
+    (vmap-safe)."""
+    c = low.core
+    f, g = args
+    one = c.IntLit(value=1)
+
+    def ax(x: Any, i: int) -> Any:
+        return _axis_len(low, x, i)
+    df, cf = ax(f, 0), ax(f, 1)
+    dg, cg = ax(g, 0), ax(g, 1)
+    ff = [ax(f, 2 + i) for i in range(op.nf_free)]
+    gg = [ax(g, 2 + i) for i in range(op.ng_free)]
+    fr = c.ReshapeExpr(a=f, shape=(df, one, cf, one, *ff, *([one] * op.ng_free)))
+    gr = c.ReshapeExpr(a=g, shape=(one, dg, one, cg, *([one] * op.nf_free), *gg))
+    prod = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=fr, rhs=gr)
+    mul = c.BinaryOp.MUL
+    out_shape = (c.BinaryExpr(op=mul, lhs=df, rhs=dg),
+                 c.BinaryExpr(op=mul, lhs=cf, rhs=cg), *ff, *gg)
+    return [c.ReshapeExpr(a=prod, shape=out_shape)]
+
+
+def _render_inv_transpose(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``inv(A).T`` — the dual-basis inverse-transpose."""
+    c = low.core
+    return [c.TransposeExpr(a=low._ns_call("linalg.inv", (args[0],)), axes=None)]
+
+
+def _render_compose_via_std(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``solve(R_to, R_from)`` — compose two changes-of-basis through the std rep."""
+    return [low._ns_call("linalg.solve", (args[0], args[1]))]
+
+
+def _render_sqrt_spd(op: Any, builder: Any, args: list, low: Any) -> list:
+    """The SPD square root ``(V·√w)·Vᵀ`` from ``eigh`` of the symmetrized ``G``.  The SPD
+    guard is a runtime assert that does not change the returned data, so (like ``AssertOp``)
+    it is omitted from the emitted data path; ``torch.vmap`` batches the plain 2-D eigh."""
+    c = low.core
+    g = args[0]
+    sym = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.FloatLit(value=0.5),
+                       rhs=c.BinaryExpr(op=c.BinaryOp.ADD, lhs=g,
+                                        rhs=c.TransposeExpr(a=g, axes=None)))
+    sym = builder.assign_new(sym, base="symG")
+    wv, vv = (builder.fresh_var(base=nm) for nm in ("w_spd", "V_spd"))
+    builder.assign(c.TupleExpr(elts=(wv, vv)), low._ns_call("linalg.eigh", (sym,)))
+    vscaled = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=vv, rhs=low._ns_call("sqrt", (wv,)))
+    return [c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=vscaled, rhs=c.TransposeExpr(a=vv, axes=None))]
+
+
+def _render_rank(op: Any, builder: Any, args: list, low: Any) -> list:
+    """The numeric column rank of ``A`` as a 0-d int.  ``matrix_rank`` has the same name in
+    numpy and torch; the absolute-tol kwarg (``tol=`` numpy / ``atol=`` torch) is passed per
+    namespace."""
+    c = low.core
+    kw = (c.KwArg(name="tol" if low.opts.target != "torch" else "atol",
+                  value=c.FloatLit(value=float(op.tol))),)
+    return [low._ns_call("linalg.matrix_rank", (args[0],), kw)]
+
+
+def _render_metric_orthonormal(op: Any, builder: Any, args: list, low: Any) -> list:
+    """``A · L⁻ᵀ`` with ``L Lᵀ = AᵀGA`` (Cholesky) — metric orthonormalization."""
+    c = low.core
+
+    def mm(x: Any, y: Any) -> Any:
+        return c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=x, rhs=y)
+    a, g = args
+    at = c.TransposeExpr(a=a, axes=None)
+    gram = builder.assign_new(mm(mm(at, g), a), base="gram_mo")
+    lchol = low._ns_call("linalg.cholesky", (gram,))
+    linvt = c.TransposeExpr(a=low._ns_call("linalg.inv", (lchol,)), axes=None)
+    return [mm(a, linvt)]
+
+
+_ARRAY_OP_LOWERINGS: dict[type, Any] = {
+    TransposeOp: _render_transpose,
+    SinvFullOp: _render_sinv_full,
+    GSvdFullOp: _render_gsvd_full,
+    BlockDiagOp: _render_block_diag,
+    BlockRepeatOp: _render_block_repeat,
+    DynBlockRepeatOp: _render_dyn_block_repeat,
+    DynEyeOp: _render_dyn_eye,
+    DynZerosOp: _render_dyn_zeros,
+    DynEyeTensorOp: _render_dyn_eye_tensor,
+    ProdShapeOp: _render_prod_shape,
+    SumShapeOp: _render_sum_shape,
+    SumDimOp: _render_sum_dim,
+    ProdDimOp: _render_prod_dim,
+    ScaleAxisDimOp: _render_scale_axis_dim,
+    MulAxisDimOp: _render_mul_axis_dim,
+    CompRankOp: _render_comp_rank,
+    HStackOp: _render_hstack,
+    ColStackOp: _render_col_stack,
+    ScaleOp: _render_scale,
+    ScaleByOp: _render_scale_by,
+    AddOp: _render_add,
+    ConcatOp: _render_concat,
+    AxisLenOp: _render_axis_len,
+    ReshapeOp: _render_reshape,
+    ConstOp: _render_const,
+    EyeOp: _render_eye,
+    FirstColsOp: _render_first_cols,
+    LastColsOp: _render_last_cols,
+    ProjectOp: _render_project,
+    EmbedOp: _render_embed,
+    KronOp: _render_kron,
+    KronFreeOp: _render_kron_free,
+    InvTransposeOp: _render_inv_transpose,
+    ComposeViaStdOp: _render_compose_via_std,
+    SqrtSpdOp: _render_sqrt_spd,
+    RankOp: _render_rank,
+    MetricOrthonormalOp: _render_metric_orthonormal,
+}
+
+
+# ---------------------------------------------------------------------------
 # The lowerer — a structural mirror of numpy_source._Emitter that produces PyAB
 # IR nodes (via a StmtBuilder) instead of Python source strings.
 # ---------------------------------------------------------------------------
@@ -198,6 +678,10 @@ class _Lowerer:
         self.outvar: dict[tuple[int, int], Any] = {}
         self.extra = dict(opts.op_lowerings or {})
         self.array_ns = self.core.Var(name="torch" if opts.target == "torch" else "np")
+        # In-refs of the Stmt currently being rendered — set by ``_render_op`` just
+        # before the ``_ARRAY_OP_LOWERINGS`` table dispatch, so a table renderer that
+        # needs operand refs (e.g. ``GSvdFullOp`` reusing ``_gsvd``) can read them.
+        self._cur_in_refs: Any = ()
 
     # -- namespace helpers ------------------------------------------------
 
@@ -319,6 +803,13 @@ class _Lowerer:
         renderer = self.extra.get(type(fn).__name__)
         if renderer is not None:
             return ("exprs", renderer(fn, self.b, args, self))
+        # polyarray-owned array-op lowerings (type-keyed, no string dispatch): the
+        # relocated generic array builtins (transpose / block-diag / GSVD-full / …).
+        # Consulted after the front-end override and before the isinstance vocabulary.
+        array_renderer = _ARRAY_OP_LOWERINGS.get(type(fn))
+        if array_renderer is not None:
+            self._cur_in_refs = in_refs
+            return ("exprs", array_renderer(fn, self.b, args, self))
 
         if isinstance(fn, DetOp):
             return ("single", self._ns_call("linalg.det", args))
