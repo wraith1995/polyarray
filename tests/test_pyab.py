@@ -564,3 +564,44 @@ def test_numpy_lane_runs_with_torch_unimportable():
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "ok" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# §E2 oversized-IR backstop — blow-ups fail FAST + LOUD, not slow + silent
+# ---------------------------------------------------------------------------
+
+def _small_symbolic_program():
+    """A tiny genuinely-symbolic program (det of a 3×3 input → a nonzero-mass output cell)."""
+    p = Program("det3", inputs=[SymInput("A", (3, 3), _prov())])
+    p.add_output("result", p.input("A").det().cells)
+    return p
+
+
+def test_ir_ceiling_raise_mode_fails_fast(monkeypatch):
+    """`PYAB_IR_CEILING=raise` turns an oversized IR into an instant, ATTRIBUTED failure at compile
+    time (with a top-offenders breakdown) instead of a slow OOM/hang downstream (§E2)."""
+    monkeypatch.setenv("PYAB_IR_CEILING", "raise")
+    monkeypatch.setenv("PYAB_IR_MASS_CEILING", "0")     # any symbolic mass now counts as oversized
+    monkeypatch.setenv("PYAB_IR_CELLS_CEILING", "0")
+    with pytest.raises(pyab.PyabIROversizedError, match="oversized IR") as ei:
+        pyab.as_function_def(_small_symbolic_program(), name="f")
+    assert "Top sub-programs by symbolic mass" in str(ei.value)   # the breakdown localizes the blow-up
+
+
+def test_ir_ceiling_off_and_warn_modes(monkeypatch):
+    """`off` never reacts; `warn` (the DEFAULT — behaviour-preserving) surfaces one warning but the
+    compile proceeds."""
+    monkeypatch.setenv("PYAB_IR_MASS_CEILING", "0")
+    monkeypatch.setenv("PYAB_IR_CELLS_CEILING", "0")
+    monkeypatch.setenv("PYAB_IR_CEILING", "off")
+    pyab.as_function_def(_small_symbolic_program(), name="f")      # no raise, no warning
+    monkeypatch.setenv("PYAB_IR_CEILING", "warn")
+    with pytest.warns(UserWarning, match="oversized IR"):
+        pyab.as_function_def(_small_symbolic_program(), name="f")
+
+
+def test_ir_ceiling_healthy_program_no_false_trip(monkeypatch):
+    """Even in `raise` mode a HEALTHY small program stays well under the generous default ceilings —
+    the backstop is signal (real blow-ups), not noise."""
+    monkeypatch.setenv("PYAB_IR_CEILING", "raise")                 # default ceilings (100k / 8192)
+    pyab.as_function_def(_small_symbolic_program(), name="f")      # det3 mass ≪ 100k ⇒ no raise
