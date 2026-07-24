@@ -156,6 +156,35 @@ def _fold_cells(cells: np.ndarray, known: Mapping[str, float]) -> np.ndarray:
     return out.astype(float) if all_numeric else out
 
 
+def _numify_constant_cells(cells: np.ndarray) -> np.ndarray:
+    """Reduce CONSTANT ``RationalFunction`` cells (no live generators) to plain floats.
+
+    A structural fold that collapsed a cell to a constant should present it AS numeric: a
+    fully-constant array then has float dtype, so :meth:`SymArray.evaluate` reads it directly
+    (``dtype.kind == 'f'``) WITHOUT requiring the program's now-unused input bindings — the
+    ``partial_eval_numeric`` intent that "unused inputs simply go unread". A cell that still
+    carries a live generator (genuinely vertex-dependent) is left as an ``RF``, so a
+    cell-dependent array stays object-dtype and ``evaluate({})`` still raises — which the
+    ``affine_invariance`` / ``P(T)`` gates read as "does not fold to a constant"."""
+    if cells.dtype.kind == "f":
+        return cells
+    out = np.empty(cells.shape, dtype=object)
+    flat_in, flat_out = cells.reshape(-1), out.reshape(-1)
+    all_numeric = True
+    for i, c in enumerate(flat_in):
+        if isinstance(c, RationalFunction):
+            v = c.eval({})                       # float iff the RF has no live generators
+            flat_out[i] = v
+            if isinstance(v, RationalFunction):
+                all_numeric = False
+        elif isinstance(c, (int, float)):
+            flat_out[i] = float(c)
+        else:
+            flat_out[i] = c
+            all_numeric = False
+    return out.astype(float) if all_numeric else out
+
+
 def _fold_symarray(
     sa: SymArray, known: Mapping[str, Any], program: Program, name: str | None,
 ) -> SymArray:
@@ -721,7 +750,8 @@ def partial_eval_numeric_symarray(
     if sa.program is None:
         return sa
     new, known = _partial_eval_numeric(sa.program, probes=probes, seed=seed, rtol=rtol, atol=atol)
-    return SymArray(_fold_cells(np.asarray(sa.cells), known), program=new)
+    folded = _numify_constant_cells(_fold_cells(np.asarray(sa.cells), known))
+    return SymArray(folded, program=new)
 
 
 # ---------------------------------------------------------------------------
