@@ -187,6 +187,98 @@ class WhileOp:
 
 @dataclass(frozen=True) class IdentityOp             # capture heavy intermediate as atom
 
+# Generic array builtins (relocated front-end lowering ops; both lanes render).
+@dataclass(frozen=True) class TransposeOp            # A.T (full reverse; value-preserving)
+
+@dataclass(frozen=True)
+class SinvFullOp:                # rectangular-diagonal S⁻¹: 1/Sᵢ (i<rank) else 0
+    nrows: int; ncols: int       # __call__(S, rank) -> (nrows×ncols)
+
+@dataclass(frozen=True)
+class GSvdFullOp:                # GSvdOp then [U|UI],[V|VI]; -> (Ufull, Vfull, S, rank); 4-output
+    rcond: float | None = None   # __call__(A, M_V, M_W); full-width de-whitened factors
+
+@dataclass(frozen=True) class BlockDiagOp            # diag(A, B, …) of the operands
+@dataclass(frozen=True)
+class BlockRepeatOp:             # n block-diagonal copies of A = kron(eye(n), A)
+    n: int
+@dataclass(frozen=True) class DynBlockRepeatOp       # __call__(A, n): runtime-n block-repeat
+
+# Batch-2 relocated generic array builtins (both lanes render; several 0-d int → DimAtom source).
+@dataclass(frozen=True)
+class DynEyeOp:                  # eye(ref.shape[axis]) — runtime identity sized by a ref axis
+    axis: int = 1
+@dataclass(frozen=True)
+class DynZerosOp:                # zeros((refs[i].shape[axes[i]], …)) — a symbolic ℝⁿ zero
+    axes: tuple[int, ...]
+@dataclass(frozen=True)
+class DynEyeTensorOp:            # eye(∏dᵢ).reshape(∏dᵢ, d₀, …) — multi-axis DimVar seed identity
+    axes: tuple[int, ...]
+@dataclass(frozen=True)
+class ProdShapeOp:               # static · ∏ refs[i].shape[axes[i]] as a 0-d int
+    axes: tuple[int, ...]; static: int = 1
+@dataclass(frozen=True)
+class SumShapeOp:                # static + Σ refs[i].shape[axes[i]] as a 0-d int
+    axes: tuple[int, ...]; static: int = 0
+@dataclass(frozen=True)
+class SumDimOp:                  # Σ operands' axis lengths as a 0-d int
+    axis: int = 0
+@dataclass(frozen=True)
+class ProdDimOp:                 # ∏ operands' axis lengths as a 0-d int
+    axis: int = 0
+@dataclass(frozen=True)
+class ScaleAxisDimOp:            # n · mat.shape[axis] as a 0-d int (static n)
+    n: int; axis: int = 0
+@dataclass(frozen=True)
+class MulAxisDimOp:              # __call__(n, mat): int(n) · mat.shape[axis] as a 0-d int
+    axis: int = 0
+@dataclass(frozen=True)
+class CompRankOp:                # __call__(rank): ambient − int(rank) as a 0-d int
+    ambient: int
+@dataclass(frozen=True) class HStackOp               # [A | B | …] concat matrices on axis 1
+@dataclass(frozen=True) class ColStackOp             # stack flattened vectors as columns (axis 1)
+@dataclass(frozen=True)
+class ScaleOp:                   # factor · x (static scalar)
+    factor: float
+@dataclass(frozen=True) class ScaleByOp              # __call__(x, s): s · x (runtime scalar)
+@dataclass(frozen=True)
+class AddOp:                     # left-fold x0 + x1 + … over n operands
+    n: int
+@dataclass(frozen=True) class ConcatOp               # flatten each operand, concatenate on axis 0
+@dataclass(frozen=True)
+class AxisLenOp:                 # x.shape[axis] as a 0-d int
+    axis: int = 0
+@dataclass(frozen=True)
+class ReshapeOp:                 # A.reshape(shape) (static shape)
+    shape: tuple[int, ...]
+@dataclass(frozen=True)
+class ConstOp:                   # frozen numeric constant from raw bytes (no args)
+    key: str; data_bytes: bytes; shape: tuple[int, ...]; dtype: str
+@dataclass(frozen=True)
+class EyeOp:                     # static n×n identity np.eye(n) (no args)
+    n: int
+@dataclass(frozen=True) class FirstColsOp            # __call__(A, rank): A[:, :int(rank)]
+@dataclass(frozen=True) class LastColsOp             # __call__(A, rank): A[:, int(rank):]
+
+# Batch-3 relocated generic array / linalg builtins (both lanes render; linalg via _ns_call).
+@dataclass(frozen=True) class ProjectOp              # __call__(P, v): Pᵀ @ v.reshape(-1) (ambient→sub)
+@dataclass(frozen=True)
+class EmbedOp:                   # __call__(P, vsub): (P @ vsub).reshape(shape) (sub→ambient)
+    shape: tuple[int, ...] = ()
+@dataclass(frozen=True)
+class KronOp:                    # chained Kronecker product kron(mats[0], mats[1], …)
+    n: int
+@dataclass(frozen=True)
+class KronFreeOp:                # __call__(F, G): block-Kron on space axes, outer on trailing free axes
+    nf_free: int; ng_free: int
+@dataclass(frozen=True) class InvTransposeOp         # __call__(A): inv(A).T (dual-basis cob)
+@dataclass(frozen=True) class ComposeViaStdOp        # __call__(R_to, R_from): solve(R_to, R_from)
+@dataclass(frozen=True) class SqrtSpdOp              # __call__(G): SPD operator sqrt via eigh (SPD-guarded)
+@dataclass(frozen=True)
+class RankOp:                    # __call__(A): numeric column rank as a 0-d int
+    tol: float = 1e-9
+@dataclass(frozen=True) class MetricOrthonormalOp    # __call__(A, G): A·L⁻ᵀ, LLᵀ=AᵀGA (Cholesky)
+
 @dataclass(frozen=True)
 class IntAtom:                   # integer-valued selector (SwitchOp scrutinee)
     name: str

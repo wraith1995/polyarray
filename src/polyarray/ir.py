@@ -1324,6 +1324,461 @@ class QrOp:
         return Q, R
 
 
+@dataclass(frozen=True)
+class TransposeOp:
+    """Full-reverse transpose of a bound array (``A.T``).
+
+    Value-preserving on the cells (no float coercion), so it threads symbolic
+    ``RationalFunction`` cells as well as numeric ones.
+    """
+
+    def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        return np.asarray(A).T
+
+
+@dataclass(frozen=True)
+class SinvFullOp:
+    """The ``nrows×ncols`` rectangular-diagonal pseudo-inverse ``S⁻¹``.
+
+    ``out[i, i] = 1/Sᵢ`` for ``i < rank`` (the numerical rank), else ``0`` — the
+    metric pseudo-inverse assembled from a :class:`GSvdOp`'s singular values
+    (grassmann `50 §A5`).  ``rank`` is a runtime 0-d int; the diagonal beyond it
+    is masked to zero (so trailing near-zero singular values never divide).
+    """
+
+    nrows: int
+    ncols: int
+
+    def __call__(self, S: np.ndarray, rank: np.ndarray) -> np.ndarray:  # noqa: N803
+        r = int(rank)
+        out = np.zeros((self.nrows, self.ncols))
+        s = np.asarray(S, dtype=float)
+        for i in range(r):
+            out[i, i] = 1.0 / s[i]
+        return out
+
+
+@dataclass(frozen=True)
+class GSvdFullOp:
+    """Run :class:`GSvdOp` and return the full-width metric-orthonormal factors.
+
+    Multi-output ``(Ufull, Vfull, S, rank)`` with *static* widths: ``Ufull =
+    [U|UI]`` (``cod×cod``) and ``Vfull = [V|VI]`` (``dom×dom``) are the full
+    de-whitened factors (image/coimg = leading ``rank`` cols, coker/ker = the
+    trailing complement).  The runtime-δ block slice happens in a downstream
+    Stmt referencing this op's ``rank`` output (grassmann `50 §A1`).
+    """
+
+    rcond: float | None = None
+
+    def __call__(
+        self, A: np.ndarray, M_V: np.ndarray, M_W: np.ndarray
+    ) -> tuple[np.ndarray, ...]:  # noqa: N803
+        U, UI, V, VI, S, rank = GSvdOp(rcond=self.rcond)(A, M_V, M_W)
+        Ufull = np.concatenate([np.asarray(U), np.asarray(UI)], axis=1)
+        Vfull = np.concatenate([np.asarray(V), np.asarray(VI)], axis=1)
+        return Ufull, Vfull, np.asarray(S), np.asarray(rank)
+
+
+@dataclass(frozen=True)
+class BlockDiagOp:
+    """Block-diagonal assembly ``diag(A, B, …)`` of the bound operands."""
+
+    def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        arrs = [np.asarray(m, dtype=float) for m in mats]
+        rows = sum(a.shape[0] for a in arrs)
+        cols = sum(a.shape[1] for a in arrs)
+        out = np.zeros((rows, cols))
+        r = c = 0
+        for a in arrs:
+            out[r:r + a.shape[0], c:c + a.shape[1]] = a
+            r += a.shape[0]
+            c += a.shape[1]
+        return out
+
+
+@dataclass(frozen=True)
+class BlockRepeatOp:
+    """``n`` block-diagonal copies of ``A`` — ``kron(eye(n), A)`` (static ``n``)."""
+
+    n: int
+
+    def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        a = np.asarray(A, dtype=float)
+        out = np.zeros((self.n * a.shape[0], self.n * a.shape[1]))
+        for i in range(self.n):
+            out[i * a.shape[0]:(i + 1) * a.shape[0], i * a.shape[1]:(i + 1) * a.shape[1]] = a
+        return out
+
+
+@dataclass(frozen=True)
+class DynBlockRepeatOp:
+    """``n`` block-diagonal copies of ``A`` with a **runtime** count ``n`` —
+    ``kron(eye(int(n)), A)``."""
+
+    def __call__(self, A: np.ndarray, n: np.ndarray) -> np.ndarray:  # noqa: N803
+        a = np.asarray(A, dtype=float)
+        count = int(np.asarray(n))
+        out = np.zeros((count * a.shape[0], count * a.shape[1]))
+        for i in range(count):
+            out[i * a.shape[0]:(i + 1) * a.shape[0], i * a.shape[1]:(i + 1) * a.shape[1]] = a
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Generic array builtins relocated from grassmann's lowering layer (Batch 2).
+# Each is a frozen, hashable Stmt.fn with a numpy host ``__call__``; both render
+# lanes live in ``pyab._ARRAY_OP_LOWERINGS`` and ``numpy_source._builtin_renderers``.
+# Several produce a 0-d int sizing a downstream dynamic axis (DimAtom source).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DynEyeOp:
+    """A runtime identity sized by a reference array's axis (default the rank column at axis 1;
+    ``axis=k`` sizes ``np.eye`` off ``ref.shape[k]``)."""
+
+    axis: int = 1
+
+    def __call__(self, ref: np.ndarray) -> np.ndarray:
+        return np.eye(int(np.asarray(ref).shape[self.axis]))
+
+
+@dataclass(frozen=True)
+class DynZerosOp:
+    """``np.zeros(d₀, d₁, …)`` sized off ``refs[i].shape[axes[i]]`` — a symbolic ℝⁿ zero."""
+
+    axes: tuple[int, ...]
+
+    def __call__(self, *refs: np.ndarray) -> np.ndarray:
+        return np.zeros(tuple(int(np.asarray(refs[i]).shape[a]) for i, a in enumerate(self.axes)))
+
+
+@dataclass(frozen=True)
+class DynEyeTensorOp:
+    """``np.eye(∏dᵢ).reshape(∏dᵢ, d₀, d₁, …)`` — the vmap identity of a MULTI-axis DimVar binder
+    (a matrix/tensor seed ``ℝⁿ⊸ℝⁿ``); each ``dᵢ`` read from ``refs[i].shape[axes[i]]``."""
+
+    axes: tuple[int, ...]
+
+    def __call__(self, *refs: np.ndarray) -> np.ndarray:
+        dims = [int(np.asarray(refs[i]).shape[a]) for i, a in enumerate(self.axes)]
+        prod = int(np.prod(dims)) if dims else 1
+        return np.eye(prod).reshape(prod, *dims)
+
+
+@dataclass(frozen=True)
+class ProdShapeOp:
+    """``static · ∏ refs[i].shape[axes[i]]`` as a 0-d int — a flattened tensor-product dimension."""
+
+    axes: tuple[int, ...]
+    static: int = 1
+
+    def __call__(self, *refs: np.ndarray) -> np.ndarray:
+        return np.asarray(int(self.static * int(np.prod(
+            [int(np.asarray(refs[i]).shape[a]) for i, a in enumerate(self.axes)] or [1]))))
+
+
+@dataclass(frozen=True)
+class SumShapeOp:
+    """``static + Σ refs[i].shape[axes[i]]`` as a 0-d int — a flattened direct-sum dimension."""
+
+    axes: tuple[int, ...]
+    static: int = 0
+
+    def __call__(self, *refs: np.ndarray) -> np.ndarray:
+        return np.asarray(int(self.static + int(sum(
+            int(np.asarray(refs[i]).shape[a]) for i, a in enumerate(self.axes)))))
+
+
+@dataclass(frozen=True)
+class SumDimOp:
+    """Σ of the operands' ``axis`` lengths as a 0-d int — sizes a dynamic block-diag axis."""
+
+    axis: int = 0
+
+    def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        return np.asarray(sum(int(np.asarray(m).shape[self.axis]) for m in mats))
+
+
+@dataclass(frozen=True)
+class ProdDimOp:
+    """∏ of the operands' ``axis`` lengths as a 0-d int — sizes a dynamic Kron axis."""
+
+    axis: int = 0
+
+    def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        out = 1
+        for m in mats:
+            out *= int(np.asarray(m).shape[self.axis])
+        return np.asarray(out)
+
+
+@dataclass(frozen=True)
+class ScaleAxisDimOp:
+    """``n · (mat's ``axis`` length)`` as a 0-d int — static count, runtime per-copy axis."""
+
+    n: int
+    axis: int = 0
+
+    def __call__(self, mat: np.ndarray) -> np.ndarray:
+        return np.asarray(self.n * int(np.asarray(mat).shape[self.axis]))
+
+
+@dataclass(frozen=True)
+class MulAxisDimOp:
+    """``count · (mat's ``axis`` length)`` as a 0-d int — runtime count, runtime axis."""
+
+    axis: int = 0
+
+    def __call__(self, n: np.ndarray, mat: np.ndarray) -> np.ndarray:
+        return np.asarray(int(np.asarray(n)) * int(np.asarray(mat).shape[self.axis]))
+
+
+@dataclass(frozen=True)
+class CompRankOp:
+    """The complement rank ``ambient − δ`` as a 0-d int — sizes the FFS complement (Ker/CoKer) axis."""
+
+    ambient: int
+
+    def __call__(self, rank: np.ndarray) -> np.ndarray:
+        return np.asarray(self.ambient - int(rank))
+
+
+@dataclass(frozen=True)
+class HStackOp:
+    """Horizontally stack matrices (columns side by side) — ``[A | B | …]``."""
+
+    def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        return np.hstack([np.asarray(m, dtype=float) for m in mats])
+
+
+@dataclass(frozen=True)
+class ColStackOp:
+    """Stack 1-D coordinate vectors as the columns of a matrix (the ``ListBasis`` matrix)."""
+
+    def __call__(self, *cols: np.ndarray) -> np.ndarray:
+        return np.stack([np.asarray(c, dtype=float).reshape(-1) for c in cols], axis=1)
+
+
+@dataclass(frozen=True)
+class ScaleOp:
+    """``factor · x`` — static scalar multiply."""
+
+    factor: float
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        return self.factor * np.asarray(x, dtype=float)
+
+
+@dataclass(frozen=True)
+class ScaleByOp:
+    """``s · x`` — runtime-scalar multiply (the ``ScaleOp`` sibling)."""
+
+    def __call__(self, x: np.ndarray, s: np.ndarray) -> np.ndarray:
+        return np.asarray(s, dtype=float) * np.asarray(x, dtype=float)
+
+
+@dataclass(frozen=True)
+class AddOp:
+    """Left-fold sum ``x0 + x1 + …`` over ``n`` operands."""
+
+    n: int
+
+    def __call__(self, *xs: np.ndarray) -> np.ndarray:
+        out = np.asarray(xs[0], dtype=float).copy()
+        for x in xs[1:]:
+            out = out + np.asarray(x, dtype=float)
+        return out
+
+
+@dataclass(frozen=True)
+class ConcatOp:
+    """Flatten each operand then concatenate on axis 0."""
+
+    def __call__(self, *xs: np.ndarray) -> np.ndarray:
+        return np.concatenate([np.asarray(x, dtype=float).reshape(-1) for x in xs])
+
+
+@dataclass(frozen=True)
+class AxisLenOp:
+    """The (runtime) length of ``x``'s axis ``axis`` as a 0-d int."""
+
+    axis: int = 0
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        return np.asarray(int(np.asarray(x).shape[self.axis]))
+
+
+@dataclass(frozen=True)
+class ReshapeOp:
+    """``A.reshape(shape)`` (static shape)."""
+
+    shape: tuple[int, ...]
+
+    def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        return np.asarray(A, dtype=float).reshape(self.shape)
+
+
+@dataclass(frozen=True)
+class ConstOp:
+    """A frozen numeric constant rematerialized from raw bytes (no args)."""
+
+    key: str
+    data_bytes: bytes
+    shape: tuple[int, ...]
+    dtype: str
+
+    def __call__(self) -> np.ndarray:
+        return np.frombuffer(self.data_bytes, dtype=self.dtype).reshape(self.shape).copy()
+
+
+@dataclass(frozen=True)
+class EyeOp:
+    """The static ``n×n`` identity ``np.eye(n)`` (no args)."""
+
+    n: int
+
+    def __call__(self) -> np.ndarray:
+        return np.eye(self.n)
+
+
+@dataclass(frozen=True)
+class FirstColsOp:
+    """``A[:, :int(rank)]`` — the leading (runtime-``rank``) columns."""
+
+    def __call__(self, A: np.ndarray, rank: np.ndarray) -> np.ndarray:  # noqa: N803
+        return np.asarray(A)[:, : int(rank)]
+
+
+@dataclass(frozen=True)
+class LastColsOp:
+    """``A[:, int(rank):]`` — the complementary (trailing) columns."""
+
+    def __call__(self, A: np.ndarray, rank: np.ndarray) -> np.ndarray:  # noqa: N803
+        return np.asarray(A)[:, int(rank):]
+
+
+# --- Batch-3 relocated generic array / linalg builtins ----------------------
+# Subspace project/embed, Kronecker assembly, inverse-transpose / basis-compose,
+# the SPD operator square root, numeric rank, and metric orthonormalization —
+# bodies moved verbatim from grassmann's ``lower/represent.py`` (pure numpy, no
+# grassmann types).  Both lanes render (pyab ``_ARRAY_OP_LOWERINGS`` + numpy
+# ``_builtin_renderers``).
+
+
+@dataclass(frozen=True)
+class ProjectOp:
+    """``Pᵀ @ v`` — project ambient coords onto the orthonormal sub-basis (drop comp).
+
+    ``v`` may be a multi-axis ambient tensor (e.g. ``V⊗ᵏ`` stored ``(n,…,n)``); it is
+    raveled to the ambient (column) coordinate before the projection.
+    """
+
+    def __call__(self, P: np.ndarray, v: np.ndarray) -> np.ndarray:  # noqa: N803
+        return np.asarray(P, dtype=float).T @ np.asarray(v, dtype=float).reshape(-1)
+
+
+@dataclass(frozen=True)
+class EmbedOp:
+    """``P @ vsub`` — pad sub-coords into the ambient (zeros in the complement).
+
+    The ambient result is reshaped to the ambient space's multi-axis layout
+    (``shape``), e.g. ``V⊗ᵏ`` ⇒ ``(n,…,n)``.
+    """
+
+    shape: tuple[int, ...] = ()
+
+    def __call__(self, P: np.ndarray, vsub: np.ndarray) -> np.ndarray:  # noqa: N803
+        out = np.asarray(P, dtype=float) @ np.asarray(vsub, dtype=float)
+        return out.reshape(self.shape) if self.shape else out
+
+
+@dataclass(frozen=True)
+class KronOp:
+    """Chained Kronecker product ``kron(mats[0], mats[1], …)`` of ``n`` matrices."""
+
+    n: int
+
+    def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        out = np.asarray(mats[0], dtype=float)
+        for m in mats[1:]:
+            out = np.kron(out, np.asarray(m, dtype=float))
+        return out
+
+
+@dataclass(frozen=True)
+class KronFreeOp:
+    """``Kron`` of two maps that may carry trailing free (basis-index / seed) axes.
+
+    Each operand is ``(dom, cod, *free)``; the result is ``(dom_f·dom_g, cod_f·cod_g,
+    *f_free, *g_free)`` — the Kronecker block structure on the two space axes, an outer
+    product on the (disjoint) free axes. With no free axes this is exactly ``np.kron``.
+    """
+
+    nf_free: int
+    ng_free: int
+
+    def __call__(self, F: np.ndarray, G: np.ndarray) -> np.ndarray:  # noqa: N803
+        F = np.asarray(F, dtype=float)
+        G = np.asarray(G, dtype=float)
+        df, cf, ff = F.shape[0], F.shape[1], F.shape[2:]
+        dg, cg, gg = G.shape[0], G.shape[1], G.shape[2:]
+        fr = F.reshape(df, 1, cf, 1, *ff, *([1] * self.ng_free))
+        gr = G.reshape(1, dg, 1, cg, *([1] * self.nf_free), *gg)
+        return (fr * gr).reshape(df * dg, cf * cg, *ff, *gg)
+
+
+@dataclass(frozen=True)
+class InvTransposeOp:
+    """``inv(A).T`` — the inverse-transpose (dual-basis change of coordinates)."""
+
+    def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        return np.linalg.inv(np.asarray(A, dtype=float)).T
+
+
+@dataclass(frozen=True)
+class ComposeViaStdOp:
+    """``solve(R_to, R_from)`` — compose two changes-of-basis through the std rep."""
+
+    def __call__(self, R_to: np.ndarray, R_from: np.ndarray) -> np.ndarray:  # noqa: N803
+        return np.linalg.solve(np.asarray(R_to, dtype=float), np.asarray(R_from, dtype=float))
+
+
+@dataclass(frozen=True)
+class SqrtSpdOp:
+    """The symmetric-positive-definite operator square root ``S`` with ``S·S = G`` — via
+    eigendecomposition of the symmetrized matrix.  **Fails loudly** if ``G`` is not SPD."""
+
+    def __call__(self, G: np.ndarray) -> np.ndarray:  # noqa: N803
+        A = 0.5 * (np.asarray(G, dtype=float) + np.asarray(G, dtype=float).T)
+        w, V = np.linalg.eigh(A)
+        if w.min() <= 0:
+            raise ValueError(f"Sqrt: operator is not SPD (min eigenvalue {w.min():.3e})")
+        return (V * np.sqrt(w)) @ V.T
+
+
+@dataclass(frozen=True)
+class RankOp:
+    """The numeric rank of a column matrix as a 0-d int — sizes a RREF-selected basis."""
+
+    tol: float = 1e-9
+
+    def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        return np.asarray(int(np.linalg.matrix_rank(np.asarray(A, dtype=float), tol=self.tol)))
+
+
+@dataclass(frozen=True)
+class MetricOrthonormalOp:
+    """Orthonormalize columns w.r.t. a metric ``G``: ``A·L⁻ᵀ`` with ``LLᵀ = AᵀGA`` (Cholesky)."""
+
+    def __call__(self, A: np.ndarray, G: np.ndarray) -> np.ndarray:  # noqa: N803
+        a = np.asarray(A, dtype=float)
+        gram = a.T @ np.asarray(G, dtype=float) @ a
+        L = np.linalg.cholesky(gram)
+        return a @ np.linalg.inv(L).T
+
+
 def _check(ok: bool, msg: str, detail: str = "") -> None:
     """Raise ``AssertionError(msg + detail)`` unless ``ok``."""
     if not ok:
@@ -3264,35 +3719,72 @@ def _to_rf_or_num(v: Cell) -> RationalFunction:
 
 __all__ = [
     "AbsOp",
+    "AddOp",
+    "AxisLenOp",
+    "BlockDiagOp",
+    "BlockRepeatOp",
     "BulkOut",
     "CallOp",
     "Cell",
+    "ColStackOp",
+    "CompRankOp",
+    "ComposeViaStdOp",
+    "ConcatOp",
     "Const",
+    "ConstOp",
     "DetOp",
+    "DynBlockRepeatOp",
+    "DynEyeOp",
+    "DynEyeTensorOp",
+    "DynZerosOp",
+    "EmbedOp",
+    "EyeOp",
+    "FirstColsOp",
+    "GSvdFullOp",
     "GSvdOp",
+    "HStackOp",
     "InputRef",
     "IntAtom",
     "IntAtomRef",
     "InvOp",
+    "InvTransposeOp",
+    "KronFreeOp",
+    "KronOp",
+    "LastColsOp",
+    "MetricOrthonormalOp",
     "MoveaxisOp",
+    "MulAxisDimOp",
     "OutSpec",
     "OutputRef",
     "PinvOp",
+    "ProdDimOp",
+    "ProdShapeOp",
     "Program",
+    "ProjectOp",
     "Provenance",
     "ProvenanceKind",
+    "RankOp",
     "RationalRef",
     "Ref",
+    "ReshapeOp",
+    "ScaleAxisDimOp",
+    "ScaleByOp",
+    "ScaleOp",
     "SignOp",
+    "SinvFullOp",
     "SolveOp",
     "SqrtOp",
+    "SqrtSpdOp",
     "Stmt",
+    "SumDimOp",
+    "SumShapeOp",
     "SwitchOp",
     "SymArray",
     "SymArrayRef",
     "SymInput",
     "SymbolEnv",
     "TensordotOp",
+    "TransposeOp",
     "WhileOp",
     "allocate_input",
     "call_subprogram_inline",

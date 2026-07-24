@@ -56,31 +56,68 @@ import numpy as np
 
 from .ir import (
     AbsOp,
+    AddOp,
     AssertOp,
+    AxisLenOp,
+    BlockDiagOp,
+    BlockRepeatOp,
     CallOp,
+    ColStackOp,
+    CompRankOp,
+    ComposeViaStdOp,
+    ConcatOp,
     Const,
+    ConstOp,
     DetOp,
+    DynBlockRepeatOp,
+    DynEyeOp,
+    DynEyeTensorOp,
+    DynZerosOp,
     EinsumOp,
     EinsumStmtOp,
+    EmbedOp,
+    EyeOp,
+    FirstColsOp,
+    GSvdFullOp,
+    HStackOp,
     IdentityOp,
     InputRef,
     IntAtomRef,
     InvOp,
+    InvTransposeOp,
+    KronFreeOp,
+    KronOp,
+    LastColsOp,
+    MetricOrthonormalOp,
     MoveaxisOp,
+    MulAxisDimOp,
     OutputRef,
     PinvOp,
+    ProdDimOp,
+    ProdShapeOp,
     Program,
+    ProjectOp,
     QrOp,
+    RankOp,
     RationalRef,
+    ReshapeOp,
+    ScaleAxisDimOp,
+    ScaleByOp,
+    ScaleOp,
     SignOp,
+    SinvFullOp,
     SolveOp,
     SqrtOp,
+    SqrtSpdOp,
     Stmt,
+    SumDimOp,
+    SumShapeOp,
     SvdOp,
     SwitchOp,
     SymArray,
     SymArrayRef,
     TensordotOp,
+    TransposeOp,
     is_dynamic,
 )
 from .rational import RationalFunction, _poly_to_pyexpr, _ring_names
@@ -632,6 +669,165 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
         branches = ", ".join(a[1:])
         return f"np.asarray([{branches}][int({a[0]})])"
 
+    def transpose(op, a):
+        return f"np.asarray({a[0]}).T"
+
+    def sinv_full(op, a):
+        # out[i,j] = 1/S[i] on the diagonal for i < rank, else 0 (nrows×ncols).
+        n, m = int(op.nrows), int(op.ncols)
+        return (
+            f"(lambda _S, _rk, _sp: np.where("
+            f"(np.arange({n})[:, None] == np.arange({m})[None, :]), "
+            f"np.where(np.arange({n}) < _rk, 1.0 / np.where(np.arange({n}) < _rk, _sp, 1.0), 0.0)"
+            f"[:, None], 0.0))({a[0]}, int({a[1]}), "
+            f"np.concatenate([np.asarray({a[0]}, dtype=float).reshape(-1), np.ones({n})])[:{n}])"
+        )
+
+    def gsvd_full(op, a):
+        # GSvdOp then re-concatenate [U|UI] / [V|VI] == the full de-whitened factors
+        # (mirrors GSvdOp.__call__ exactly). Self-contained: GSvdOp has no numpy builtin.
+        rc = "None" if op.rcond is None else repr(float(op.rcond))
+        return (
+            "(lambda _A, _MV, _MW: (lambda _Lw, _Rw: (lambda _Aw: (lambda _Ut, _S, _Vt: "
+            "(lambda _rank: (np.linalg.solve(_Lw.T, _Ut), np.linalg.solve(_Rw.T, _Vt.T), "
+            "_S, np.asarray(_rank)))"
+            f"(0 if _S.size == 0 else int((_S > (({rc} * _S.max()) if {rc} is not None "
+            "else (_S.max() * max(_Aw.shape) * np.finfo(float).eps))).sum())))"
+            "(*np.linalg.svd(_Aw, full_matrices=True)))"
+            "(_Lw.T @ _A @ np.linalg.inv(_Rw.T)))"
+            "(np.linalg.cholesky(np.asarray(_MW, dtype=float)), "
+            "np.linalg.cholesky(np.asarray(_MV, dtype=float))))"
+            f"(np.asarray({a[0]}, dtype=float), np.asarray({a[1]}, dtype=float), "
+            f"np.asarray({a[2]}, dtype=float))"
+        )
+
+    def block_diag(op, a):
+        ms = "[" + ", ".join(f"np.asarray({e}, dtype=float)" for e in a) + "]"
+        return (
+            "(lambda _ms: (lambda _w: np.concatenate([np.concatenate("
+            "[np.zeros((_m.shape[0], sum(_w[:_i]))), _m, np.zeros((_m.shape[0], sum(_w[_i+1:])))], "
+            "axis=1) for _i, _m in enumerate(_ms)], axis=0))([_m.shape[1] for _m in _ms]))"
+            f"({ms})"
+        )
+
+    def block_repeat(op, a):
+        return f"np.kron(np.eye({int(op.n)}), np.asarray({a[0]}, dtype=float))"
+
+    def dyn_block_repeat(op, a):
+        return f"np.kron(np.eye(int({a[1]})), np.asarray({a[0]}, dtype=float))"
+
+    # --- Batch-2 relocated generic array ops (bodies moved from grassmann) ---
+    def dyn_eye(op, a):
+        return f"np.eye(int(np.asarray({a[0]}).shape[{op.axis}]))"
+
+    def dyn_zeros(op, a):
+        dims = ", ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
+        return f"np.zeros(({dims},))"
+
+    def dyn_eye_tensor(op, a):
+        dims = ", ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
+        return f"(lambda _d: np.eye(int(np.prod(_d))).reshape(int(np.prod(_d)), *_d))([{dims}])"
+
+    def prod_shape(op, a):
+        inner = ", ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
+        return f"np.asarray(int({op.static} * int(np.prod([{inner}] or [1]))))"
+
+    def sum_shape(op, a):
+        inner = " + ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
+        return f"np.asarray(int({op.static} + ({inner or '0'})))"
+
+    def sum_dim(op, a):
+        return f"np.asarray(int(sum(np.asarray(_m).shape[{op.axis}] for _m in [{', '.join(a)}])))"
+
+    def prod_dim(op, a):
+        return (f"np.asarray(int(np.prod([np.asarray(_m).shape[{op.axis}] "
+                f"for _m in [{', '.join(a)}]])))")
+
+    def scale_axis_dim(op, a):
+        return f"np.asarray(int({op.n} * np.asarray({a[0]}).shape[{op.axis}]))"
+
+    def mul_axis_dim(op, a):
+        return f"np.asarray(int(int({a[0]}) * np.asarray({a[1]}).shape[{op.axis}]))"
+
+    def comp_rank(op, a):
+        return f"np.asarray(int({op.ambient} - int({a[0]})))"
+
+    def hstack(op, a):
+        return f"np.hstack([np.asarray(_m, dtype=float) for _m in [{', '.join(a)}]])"
+
+    def col_stack(op, a):
+        return (f"np.stack([np.asarray(_c, dtype=float).reshape(-1) for _c in "
+                f"[{', '.join(a)}]], axis=1)")
+
+    def scale(op, a):
+        return f"({op.factor!r} * np.asarray({a[0]}, dtype=float))"
+
+    def scale_by(op, a):
+        return f"(np.asarray({a[1]}, dtype=float) * np.asarray({a[0]}, dtype=float))"
+
+    def add(op, a):
+        return "(" + " + ".join(f"np.asarray({e}, dtype=float)" for e in a) + ")"
+
+    def concat(op, a):
+        return ("np.concatenate(["
+                + ", ".join(f"np.asarray({e}, dtype=float).reshape(-1)" for e in a) + "])")
+
+    def axis_len(op, a):
+        return f"np.asarray(int(np.asarray({a[0]}).shape[{op.axis}]))"
+
+    def reshape(op, a):
+        return f"np.asarray({a[0]}, dtype=float).reshape({tuple(op.shape)})"
+
+    def const(op, a):
+        val = np.frombuffer(op.data_bytes, dtype=op.dtype).reshape(op.shape)
+        return f"np.array({val.tolist()!r}, dtype=np.{op.dtype})"
+
+    def eye(op, a):
+        return f"np.eye({op.n})"
+
+    def first_cols(op, a):
+        return f"np.asarray({a[0]}, dtype=float)[:, :int({a[1]})]"
+
+    def last_cols(op, a):
+        return f"np.asarray({a[0]}, dtype=float)[:, int({a[1]}):]"
+
+    # --- Batch-3 relocated generic array / linalg ops (bodies from grassmann) ---
+    def project(op, a):  # Pᵀ @ v  (ambient coords -> sub-basis coords)
+        return f"(np.asarray({a[0]}, dtype=float).T @ np.asarray({a[1]}, dtype=float).reshape(-1))"
+
+    def embed(op, a):  # P @ vsub  (sub-coords -> ambient), reshaped to op.shape
+        base = f"(np.asarray({a[0]}, dtype=float) @ np.asarray({a[1]}, dtype=float))"
+        return base + (f".reshape({tuple(op.shape)})" if op.shape else "")
+
+    def kron(op, a):  # chained Kronecker product
+        ms = ", ".join(f"np.asarray({e}, dtype=float)" for e in a)
+        return f"__import__('functools').reduce(np.kron, [{ms}])"
+
+    def kron_free(op, a):  # Kron of two maps with trailing free (basis/seed) axes (block ⊗)
+        nf, ng = op.nf_free, op.ng_free
+        return (
+            f"(lambda _F, _G: (_F.reshape(_F.shape[0], 1, _F.shape[1], 1, *_F.shape[2:], *([1]*{ng})) "
+            f"* _G.reshape(1, _G.shape[0], 1, _G.shape[1], *([1]*{nf}), *_G.shape[2:])).reshape("
+            f"_F.shape[0]*_G.shape[0], _F.shape[1]*_G.shape[1], *_F.shape[2:], *_G.shape[2:]))"
+            f"(np.asarray({a[0]}, dtype=float), np.asarray({a[1]}, dtype=float))")
+
+    def inv_transpose(op, a):  # inv(A).T
+        return f"np.linalg.inv(np.asarray({a[0]}, dtype=float)).T"
+
+    def compose_via_std(op, a):  # solve(R_to, R_from)
+        return f"np.linalg.solve(np.asarray({a[0]}, dtype=float), np.asarray({a[1]}, dtype=float))"
+
+    def sqrt_spd(op, a):  # the SPD square root via eigh of the symmetrized G
+        return (f"(lambda _w, _V: (_V * np.sqrt(_w)) @ _V.T)(*np.linalg.eigh("
+                f"0.5 * (np.asarray({a[0]}, dtype=float) + np.asarray({a[0]}, dtype=float).T)))")
+
+    def rank(op, a):  # numerical rank of A as a 0-d int
+        return f"np.asarray(int(np.linalg.matrix_rank(np.asarray({a[0]}, dtype=float), tol={op.tol!r})))"
+
+    def metric_orthonormal(op, a):  # A @ inv(chol(Aᵀ G A))ᵀ
+        return (f"(lambda _a, _g: _a @ np.linalg.inv(np.linalg.cholesky(_a.T @ _g @ _a)).T)"
+                f"(np.asarray({a[0]}, dtype=float), np.asarray({a[1]}, dtype=float))")
+
     return {
         DetOp: det,
         InvOp: inv,
@@ -649,6 +845,43 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
         QrOp: qr,
         SvdOp: svd,
         SwitchOp: switch,
+        TransposeOp: transpose,
+        SinvFullOp: sinv_full,
+        GSvdFullOp: gsvd_full,
+        BlockDiagOp: block_diag,
+        BlockRepeatOp: block_repeat,
+        DynBlockRepeatOp: dyn_block_repeat,
+        DynEyeOp: dyn_eye,
+        DynZerosOp: dyn_zeros,
+        DynEyeTensorOp: dyn_eye_tensor,
+        ProdShapeOp: prod_shape,
+        SumShapeOp: sum_shape,
+        SumDimOp: sum_dim,
+        ProdDimOp: prod_dim,
+        ScaleAxisDimOp: scale_axis_dim,
+        MulAxisDimOp: mul_axis_dim,
+        CompRankOp: comp_rank,
+        HStackOp: hstack,
+        ColStackOp: col_stack,
+        ScaleOp: scale,
+        ScaleByOp: scale_by,
+        AddOp: add,
+        ConcatOp: concat,
+        AxisLenOp: axis_len,
+        ReshapeOp: reshape,
+        ConstOp: const,
+        EyeOp: eye,
+        FirstColsOp: first_cols,
+        LastColsOp: last_cols,
+        ProjectOp: project,
+        EmbedOp: embed,
+        KronOp: kron,
+        KronFreeOp: kron_free,
+        InvTransposeOp: inv_transpose,
+        ComposeViaStdOp: compose_via_std,
+        SqrtSpdOp: sqrt_spd,
+        RankOp: rank,
+        MetricOrthonormalOp: metric_orthonormal,
     }
 
 
