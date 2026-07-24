@@ -47,6 +47,7 @@ when you actually *compile* the emitted IR through the torch backend.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -1694,32 +1695,63 @@ def lower_program_into(
 # Soft ceilings for the eager-materialization backstop. A HEALTHY (mostly-bulk) program reports ~0
 # symbolic output mass (``analyze`` skips bulk cells — ``forward._row``), so these fire ONLY on genuine
 # blow-ups (per-cell RF scatter / a live data-independent solve expanded per cell), before the expensive
-# render/codegen that would otherwise OOM. Tunable; kept generous so it is signal, not noise.
+# render/codegen that would otherwise OOM. Tunable; kept generous so it is signal, not noise. Override
+# per run with ``PYAB_IR_MASS_CEILING`` / ``PYAB_IR_CELLS_CEILING``.
 _IR_MASS_CEILING = 100_000        # Σ monomials over symbolic output cells (all programs + nested bodies)
 _IR_CELLS_CEILING = 8192          # number of symbolic output cells (eager per-cell scatter)
 
 
-def _warn_if_ir_oversized(program: Program, name: str) -> None:
-    """Emit ONE warning when ``program``'s IR is pathologically large — the fingerprint of an eager
-    materialization that should have stayed a deferred ``bulk`` node (or a data-independent solve that
-    should have been constant-folded). Rides :func:`polyarray.forward.analyze` (cheap on bulk programs,
-    which it skips; the asymmetry is the signal). Never raises — a cost report must not break a compile."""
-    try:
+class PyabIROversizedError(RuntimeError):
+    """Raised by the oversized-IR backstop in ``raise`` mode (``PYAB_IR_CEILING=raise``): the program's
+    symbolic IR blew past the cost ceiling — an eager materialization / un-folded data-independent solve —
+    so compilation is aborted HERE (fast + loud, with a top-offenders breakdown) instead of proceeding to
+    the render/codegen that would OOM or hang. Catchable so a caller can fall back / re-plan (`§E2`)."""
+
+
+def _ir_ceiling_mode() -> str:
+    """How the oversized-IR backstop reacts, from ``PYAB_IR_CEILING`` ∈ {``warn`` (default), ``raise``,
+    ``off``}. ``raise`` is for CI/dev: turn a blow-up into an instant, attributed failure at compile
+    time rather than a slow OOM/hang downstream (§E1/E2 blow-up blocker-avoidance)."""
+    return os.environ.get("PYAB_IR_CEILING", "warn").strip().lower()
+
+
+def _check_ir_oversized(program: Program, name: str) -> None:
+    """Backstop the eager-materialization blow-up class: when ``program``'s symbolic IR is pathologically
+    large (the fingerprint of a per-cell scatter that should be a deferred ``bulk`` node, or a
+    data-independent solve/SVD that should be constant-folded), react per :func:`_ir_ceiling_mode` —
+    ``warn`` (one warning, the compile proceeds — DEFAULT, behaviour-preserving), ``raise``
+    (:class:`PyabIROversizedError`, abort now with a top-offenders breakdown), or ``off``. Rides
+    :func:`polyarray.forward.analyze` (cheap on bulk programs, which it skips — the asymmetry is the
+    signal). The ANALYSIS never breaks a compile; only ``raise`` mode raises, and only deliberately."""
+    mode = _ir_ceiling_mode()
+    if mode == "off":
+        return
+    try:                                                # the analysis itself must NEVER break a compile
         from . import forward
-        import warnings
         rep = forward.analyze(program)
         n_cells = sum(r.n_output_cells for r in rep.rows)
-        if rep.total_mass > _IR_MASS_CEILING or n_cells > _IR_CELLS_CEILING:
-            warnings.warn(
-                f"pyab.as_function_def({name!r}): oversized IR "
-                f"(mass={rep.total_mass}, output_cells={n_cells}) — likely an EAGER materialization that "
-                f"should be a deferred `bulk` node (route contractions through `runtime_einsum_multi`, emit "
-                f"large-shape outputs `bulk=True`, keep `.shape`/`.ndim` off `.cells`), or a data-independent "
-                f"solve/SVD that should be constant-folded. Report:\n{rep}",
-                stacklevel=2,
-            )
-    except Exception:                                   # a cost report must NEVER break a compile
-        pass
+        mass_ceiling = int(os.environ.get("PYAB_IR_MASS_CEILING", _IR_MASS_CEILING))
+        cells_ceiling = int(os.environ.get("PYAB_IR_CELLS_CEILING", _IR_CELLS_CEILING))
+        oversized = rep.total_mass > mass_ceiling or n_cells > cells_ceiling
+    except Exception:
+        return
+    if not oversized:
+        return
+    top = sorted(rep.rows, key=lambda r: r.total_mass, reverse=True)[:5]
+    breakdown = "\n".join(
+        f"    {r.name:16} mass={r.total_mass:>8d} sym_cells={r.symbolic_cells}/{r.n_output_cells} "
+        f"max_cell={r.max_cell} prov={r.prov_kinds}" for r in top)
+    msg = (
+        f"pyab.as_function_def({name!r}): oversized IR (mass={rep.total_mass}, output_cells={n_cells}; "
+        f"ceilings mass={mass_ceiling}, cells={cells_ceiling}) — the fingerprint of an EAGER "
+        f"materialization that should be a deferred `bulk` node (route contractions through "
+        f"`runtime_einsum_multi`, emit large-shape outputs `bulk=True`, keep `.shape`/`.ndim` off "
+        f"`.cells`), or a data-independent solve/SVD that should be constant-folded.\n"
+        f"  Top sub-programs by symbolic mass:\n{breakdown}")
+    if mode == "raise":
+        raise PyabIROversizedError(msg)
+    import warnings
+    warnings.warn(msg, stacklevel=2)                    # default `warn`: surface it, compile proceeds
 
 
 def as_function_def(
@@ -1737,7 +1769,7 @@ def as_function_def(
     """
     opts = opts or LowerOpts()
     program, _ = prepare(program, opts=opts)
-    _warn_if_ir_oversized(program, name)                # backstop: catch eager-materialization blow-ups
+    _check_ir_oversized(program, name)                  # backstop: catch eager-materialization blow-ups (§E2)
     core = _core()
     params = tuple(core.Param(name=_safe(inp.name)) for inp in program.inputs)
     params += tuple(core.Param(name=_safe(a)) for a in program.int_atoms)
