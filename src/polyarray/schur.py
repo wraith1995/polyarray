@@ -32,7 +32,8 @@ from typing import cast
 
 import numpy as np
 
-from .ir import EinsumStmtOp, InvOp, OutSpec, Program, SymArray, current_budget_override, is_dynamic
+from .ir import (EinsumStmtOp, InvOp, OutSpec, Program, SymArray, current_budget_override,
+                 is_dynamic, probe_direct_eval)
 from .rational import RationalFunction, cofactor_inverse, simple_zero
 
 
@@ -164,13 +165,19 @@ def _structural_mask(matrix: SymArray) -> np.ndarray | None:
     if any(is_dynamic(inp.shape) for inp in inputs):
         return None
     mask: np.ndarray | None = None
-    for k in range(_N_PROBES):
-        try:
-            vals = np.abs(np.asarray(matrix.evaluate(_probe_binding(inputs, k)), dtype=float))
-        except (KeyError, ValueError, ZeroDivisionError, np.linalg.LinAlgError):
-            return None
-        m = np.isfinite(vals) & (vals > _MASK_TOL)
-        mask = m if mask is None else (mask | m)
+    # A 3-point probe runs the C program only 3× — no-``compile`` RF evaluation (direct term
+    # sum, both in the program runner via ``probe_direct_eval`` and in the output-cell loop
+    # via ``compiled=False``) is ~31 s cheaper than codegen on a degree-5 C (the Argyris/Bell
+    # floor), and byte-identical, so the probed mask is unchanged.
+    with probe_direct_eval():
+        for k in range(_N_PROBES):
+            try:
+                vals = np.abs(np.asarray(
+                    matrix.evaluate(_probe_binding(inputs, k), compiled=False), dtype=float))
+            except (KeyError, ValueError, ZeroDivisionError, np.linalg.LinAlgError):
+                return None
+            m = np.isfinite(vals) & (vals > _MASK_TOL)
+            mask = m if mask is None else (mask | m)
     return mask
 
 

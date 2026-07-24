@@ -846,8 +846,15 @@ class SymArray:
     # Numeric evaluation
     # ------------------------------------------------------------------
 
-    def evaluate(self, bindings: Mapping[str, np.ndarray | float]) -> np.ndarray:
+    def evaluate(self, bindings: Mapping[str, np.ndarray | float], *,
+                 compiled: bool = True) -> np.ndarray:
         """Substitute numeric ``bindings`` into the cells; return float ndarray.
+
+        ``compiled`` selects the per-cell RF evaluator: the default codegen-and-cache path
+        (``eval_numeric_fast`` — amortizes over MANY evaluations of the same cells), or, with
+        ``compiled=False``, a direct term-sum (``eval_numeric_direct``) that skips the per-RF
+        ``compile`` — the right choice for a FEW evaluations, e.g. the 3-point structural-mask
+        probe (:func:`polyarray.schur._structural_mask`). Byte-identical values either way.
 
         ``bindings`` is keyed by symbolic-input name (e.g. ``"V_0"``) and
         each value is the numeric vector / scalar to substitute for that
@@ -878,7 +885,8 @@ class SymArray:
             cell = self._cells[idx]
             if isinstance(cell, RationalFunction):
                 try:
-                    out[idx] = cell.eval_numeric_fast(flat)
+                    out[idx] = (cell.eval_numeric_fast(flat) if compiled
+                                else cell.eval_numeric_direct(flat))
                 except KeyError as exc:
                     missing = [n for n in cell.gens if n not in flat]
                     raise KeyError(
@@ -3490,17 +3498,40 @@ def _eval_cell(cell: Cell, bindings: dict[str, float]) -> float:
     raise TypeError(f"cannot evaluate cell of type {type(cell).__name__}")
 
 
+# When set (via :func:`probe_direct_eval`), the program runner evaluates each
+# ``RationalFunction`` by DIRECT term-summation (``eval_numeric_direct``) instead of the
+# codegen-and-cache ``eval_numeric_fast``. The codegen amortizes over MANY runs of the same
+# program, but the structural-mask probe (:func:`polyarray.schur._structural_mask`) runs a
+# program only 3× — where compiling every RF (``builtins.compile`` + ``_poly_term_strings``)
+# is ~31 s of the ~36 s degree-5 Argyris P(T) build for nothing. Values are byte-identical, so
+# the probed mask is unchanged. Module-scoped: symbolic builds are single-threaded.
+_PROBE_DIRECT_EVAL = False
+
+
+@contextlib.contextmanager
+def probe_direct_eval():
+    """Scope in which the program runner uses no-``compile`` RF evaluation — for FEW-run
+    probes (the structural-mask). See :data:`_PROBE_DIRECT_EVAL`."""
+    global _PROBE_DIRECT_EVAL
+    prev = _PROBE_DIRECT_EVAL
+    _PROBE_DIRECT_EVAL = True
+    try:
+        yield
+    finally:
+        _PROBE_DIRECT_EVAL = prev
+
+
 def _eval_rf(rf: RationalFunction, bindings: dict[str, float]) -> float:
     """Numeric eval of a :class:`RationalFunction`.
 
-    Uses :meth:`RationalFunction.eval_numeric_fast`, which trusts that
-    ``bindings`` is full and float-valued — the program-runner and
-    :meth:`SymArray.evaluate` boundaries already guarantee that.  On
-    the rare missing-binding path (a programming error rather than a
-    user-visible case) we re-raise with a friendlier message.
+    Uses :meth:`RationalFunction.eval_numeric_fast` (codegen-and-cache) by default, or
+    :meth:`~RationalFunction.eval_numeric_direct` (no per-RF ``compile``) inside a
+    :func:`probe_direct_eval` scope — see :data:`_PROBE_DIRECT_EVAL`.  On the rare
+    missing-binding path (a programming error) we re-raise with a friendlier message.
     """
     try:
-        return rf.eval_numeric_fast(bindings)
+        return (rf.eval_numeric_direct(bindings) if _PROBE_DIRECT_EVAL
+                else rf.eval_numeric_fast(bindings))
     except KeyError as exc:
         # Compiled-fast path will raise KeyError for the first missing
         # name; surface the full set of missing gens for diagnostics.
