@@ -489,6 +489,62 @@ def _try_descend(
 
 
 # ---------------------------------------------------------------------------
+# P6b: constant-fold INSIDE a vmap body (keep the batching)
+# ---------------------------------------------------------------------------
+
+def _is_rebuildable_vmap(fn: Any) -> bool:
+    """A vmap closure this pass can REBUILD needs all three attrs :func:`~polyarray.ir.vmap`
+    sets — ``_vmap_body`` / ``_in_axes`` / ``_out_axes``. Some front-end wrappers expose only
+    ``_vmap_body`` (for body introspection) without the axis tuples; those are NOT rebuildable
+    here (``pa.ir.vmap`` needs the axes), so we must skip them — not crash on a missing attr."""
+    return all(hasattr(fn, a) for a in ("_vmap_body", "_in_axes", "_out_axes"))
+
+
+def _vmap_closure_of(fn: Any) -> tuple[Any, Any] | None:
+    """If ``fn`` is a REBUILDABLE :func:`~polyarray.ir.vmap` closure (or a :class:`CallOp` wrapping
+    one — carrying ``_vmap_body`` / ``_in_axes`` / ``_out_axes``), return ``(closure, rewrap)`` where
+    ``rewrap`` rebuilds an equivalent ``fn`` from a fresh closure; else ``None`` (a wrapper missing the
+    axis tuples degrades to no-fold)."""
+    if _is_rebuildable_vmap(fn):
+        return fn, (lambda c: c)
+    if isinstance(fn, CallOp) and _is_rebuildable_vmap(fn.fn):
+        return fn.fn, (lambda c: CallOp(fn=c))
+    return None
+
+
+def _fold_vmap_body(fn: Any, depth: int, seen: frozenset[int]) -> Any:
+    """Constant-fold the numeric subcomputations INSIDE a vmap body, keeping the vmap closure
+    (its in/out axes and input signature) intact.
+
+    :func:`_descent_body` deliberately refuses to descend a vmap closure, because swapping the
+    closure for the bare body would drop the per-point batching. But the body's INTERNAL Stmts
+    whose inputs are all build-time-numeric — e.g. a QR/SVD frame orthonormalization on a FIXED
+    reference basis, data-INDEPENDENT of the per-point vmap args — can still be folded to
+    constants without touching the batching. Recurse the floor-fold (``_specialize`` with an
+    EMPTY bind, which never drops an input, so the vmap ``in_axes`` stay aligned) into the body;
+    if it folded anything away, rewrap the folded body in an equivalent vmap closure. Falls back
+    to ``fn`` unchanged whenever nothing folds or anything looks off — always a sound no-op
+    degrade (identity/sharing preserved when there is nothing to gain)."""
+    info = _vmap_closure_of(fn)
+    if info is None or depth >= _MAX_DESCENT_DEPTH:
+        return fn
+    closure, rewrap = info
+    body = closure._vmap_body
+    if id(body) in seen:
+        return fn  # cycle guard
+    try:
+        folded = _specialize(body, {}, depth + 1, seen | {id(body)})
+    except Exception:
+        return fn
+    if len(folded.statements) >= len(body.statements):
+        return fn  # nothing folded away -> keep the original (preserve id / lowerer sharing)
+    if [i.name for i in folded.inputs] != [i.name for i in body.inputs]:
+        return fn  # input signature changed -> vmap axes would misalign; degrade
+    from .ir import vmap as _vmap
+    return rewrap(_vmap(folded, in_axes=closure._in_axes, out_axes=closure._out_axes))
+
+
+# ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
 
@@ -586,7 +642,10 @@ def _specialize(
         if descended is not None:
             new_fn, new_in = descended
         else:
-            new_fn = s.fn
+            # P6b: descend the floor-fold into a surviving vmap body to collapse its
+            # data-independent (constant) subcomputations — the QR/SVD frame prep on the
+            # fixed reference basis — without dropping the per-point batching.
+            new_fn = _fold_vmap_body(s.fn, depth, seen_here)
             new_in = tuple(_fold_ref(new, r, i, known, idx_map) for r in s.in_)
         new_statements.append(
             Stmt(fn=new_fn, in_=new_in, out=s.out, note=s.note,
