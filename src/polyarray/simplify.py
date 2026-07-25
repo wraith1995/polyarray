@@ -1050,6 +1050,73 @@ def dependency_cone(program: Program, target: SymArray) -> set:
     return cone
 
 
+def is_structurally_constant(program: Program, target: SymArray) -> bool:
+    """Is ``target``'s value a PROVABLE build-time constant — soundly, by DEPENDENCY
+    (not by sampling)?
+
+    Walks ``target``'s dependency cone (:func:`dependency_cone` — the set of Stmts
+    feeding ``target``) and returns ``True`` iff the cone is a *closed constant
+    subprogram*:
+
+    1. **No Stmt input is an** :class:`~polyarray.ir.InputRef` (a reference to a declared
+       program input) — nor an :class:`~polyarray.ir.IntAtomRef` (a runtime-bound integer),
+       both of which are values supplied at run time; and
+    2. **no cell generator anywhere in the cone** (nor in ``target`` itself) has a
+       provenance ``kind`` other than ``"stmt_out"`` — i.e. no ``vertex`` / ``point`` /
+       ``coeff`` / ``param_dof`` / ``per_point`` (feed) atom is read.
+
+    **Soundness.**  A cone with no live-input reference and only ``stmt_out`` generators
+    depends on nothing outside itself: its leaves are nullary constant ops (``ConstOp`` /
+    ``EyeOp`` …), every intermediate atom is produced by a prior Stmt *in the cone*, and no
+    generator traces to a program feed.  Its value is therefore identical under every
+    binding — a build-time constant that folds without any sampling.  This is EXACT, not
+    heuristic: it never mistakes a feed-varying operator for a constant.
+
+    **Conservative.**  Any ref type that cannot be positively classified as constant-safe
+    (an :class:`~polyarray.ir.OutputRef` — a prior in-cone Stmt output — or a
+    :class:`~polyarray.ir.Const` literal), or any generator whose provenance cannot be
+    looked up, forces ``False``.  We never claim constancy we cannot prove, so a value with
+    any live input dependency is reported non-constant.
+    """
+    def _gens_ok(atoms: set) -> bool:
+        for name in atoms:
+            try:
+                prov = program.env.of(name)
+            except KeyError:
+                return False                         # unknown generator ⇒ can't prove ⇒ conservative
+            if prov.kind != "stmt_out":
+                return False                         # a feed atom (vertex/point/coeff/…) ⇒ NOT constant
+        return True
+
+    # ``target`` itself must carry no feed generator (a value whose cells directly reference
+    # a vertex/point atom depends on the feed even if no Stmt produces it).
+    if not _gens_ok(_symarray_atoms(target)):
+        return False
+
+    try:
+        cone = dependency_cone(program, target)
+    except Exception:  # noqa: BLE001 — can't enumerate the cone ⇒ don't claim constancy
+        return False
+
+    for i in cone:
+        stmt = program.statements[i]
+        for ref in stmt.in_:
+            if isinstance(ref, OutputRef):
+                continue                             # a prior IN-CONE Stmt output ⇒ constant-safe
+            if isinstance(ref, Const):
+                continue                             # a frozen numeric literal ⇒ constant-safe
+            if isinstance(ref, InputRef):
+                return False                         # references a declared program INPUT ⇒ live
+            if isinstance(ref, IntAtomRef):
+                return False                         # a runtime-bound integer ⇒ live
+            if isinstance(ref, (SymArrayRef, RationalRef)):
+                if not _gens_ok(_ref_deps(ref)[0]):  # its generators must all be stmt_out
+                    return False
+                continue
+            return False                             # unknown ref type ⇒ conservative
+    return True
+
+
 def _read_symarray(program: Program, sa: SymArray, bindings: dict[str, float]) -> np.ndarray:
     bulk = getattr(sa, "_bulk", None)
     if bulk is not None:
