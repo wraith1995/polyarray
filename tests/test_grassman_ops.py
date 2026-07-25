@@ -375,3 +375,52 @@ def test_symarray_einsum_numeric_and_symbolic() -> None:
     rs = sa.einsum("mi,ip->mp", K)
     assert isinstance(rs, SymArray) and not rs.is_numeric and rs.program is prog
     assert np.allclose(np.asarray(rs.evaluate(values)), A @ K)
+
+
+def _is_atom_cell(cell: object) -> bool:
+    """A fresh deferred-Stmt output cell is a single-generator atom RationalFunction
+    ``x`` (one generator, equal to ``atom(gen)``); an expanded einsum product mixes many
+    generators (the a-atoms and k-atoms)."""
+    if not isinstance(cell, RationalFunction) or len(cell.gens) != 1:
+        return False
+    return cell == RationalFunction.atom(cell.gens[0])
+
+
+def test_dispatch_einsum_force_defer() -> None:
+    """A SMALL object-dtype einsum (bound below the default threshold 64) materialises via
+    ``np.einsum`` by default (no Stmt), but ``force_defer=True`` ALWAYS emits exactly one
+    ``EinsumStmtOp`` whose outputs are fresh single-generator atoms (a deferred node), NOT the
+    expanded symbolic product. Both lanes evaluate to the same numeric contraction."""
+    from polyarray.ir import dispatch_einsum
+
+    rng = np.random.default_rng(11)
+    A = rng.standard_normal((2, 4))                      # (M, N_dof)
+    K = rng.standard_normal((4, 3))                      # (N_dof, dim_P)
+
+    # -- default lane: small bound => eager np.einsum, no Stmt emitted, cells are the product --
+    prog = Program("fd_none")
+    sa, values = _sym_matrix(prog, A, "a")
+    kk, kvals = _sym_matrix(prog, K, "k")
+    n_before = len(prog.statements)
+    res = dispatch_einsum("mi,ip->mp", sa, kk, program=prog, name="rc")
+    assert len(prog.statements) == n_before                    # did NOT grow: materialised
+    assert isinstance(res, np.ndarray) and res.dtype == object and res.shape == (2, 3)
+    # cells are the expanded product (multi-generator RFs), NOT fresh atoms
+    assert not all(_is_atom_cell(c) for c in res.ravel())
+    res_sa = SymArray(np.asarray(res), program=prog)
+    assert np.allclose(np.asarray(res_sa.evaluate({**values, **kvals})), A @ K)
+
+    # -- force_defer lane: skip the threshold => exactly ONE EinsumStmtOp, fresh-atom outputs --
+    prog2 = Program("fd_force")
+    sa2, values2 = _sym_matrix(prog2, A, "a")
+    kk2, kvals2 = _sym_matrix(prog2, K, "k")
+    n_before2 = len(prog2.statements)
+    res2 = dispatch_einsum("mi,ip->mp", sa2, kk2, program=prog2, name="rc", force_defer=True)
+    assert len(prog2.statements) == n_before2 + 1              # grew by exactly one Stmt
+    assert isinstance(prog2.statements[-1].fn, EinsumStmtOp)
+    assert isinstance(res2, np.ndarray) and res2.dtype == object and res2.shape == (2, 3)
+    assert all(_is_atom_cell(c) for c in res2.ravel())         # fresh single-generator atoms
+    res2_sa = SymArray(np.asarray(res2), program=prog2)
+    prog2.add_output("C", res2_sa)
+    out = prog2.run({**values2, **kvals2})
+    assert np.allclose(out["C"], A @ K)                        # deferred node evaluates the same

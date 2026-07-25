@@ -2459,6 +2459,7 @@ def dispatch_einsum(
     program: Program | None,
     name: str = "einsum",
     optimize: bool = True,
+    force_defer: bool = False,
 ) -> np.ndarray | SymArray:
     """``np.einsum``-compatible signature that dispatches through the offload.
 
@@ -2482,6 +2483,7 @@ def dispatch_einsum(
         program=program,
         out_shape=out_shape,
         name=name,
+        force_defer=force_defer,
     )
 
 
@@ -2491,6 +2493,7 @@ def runtime_einsum_multi(
     program: Program | None,
     out_shape: tuple,
     name: str = "einsum_multi",
+    force_defer: bool = False,
 ) -> np.ndarray | SymArray:
     """Multi-operand symbolic einsum with size-aware materialisation.
 
@@ -2501,6 +2504,15 @@ def runtime_einsum_multi(
     symbolic structure preserved).  Otherwise emits an
     :class:`EinsumStmtOp` :class:`Stmt` whose outputs are fresh atom
     RFs of shape ``out_shape``.
+
+    ``force_defer=True`` skips the size estimate + eager short-circuit
+    for the object-dtype, program-present, NON-bulk case, so the
+    contraction ALWAYS emits a fresh-atom :class:`EinsumStmtOp`
+    regardless of the estimated size (used when a caller must keep an
+    operand symbolic and deferred — e.g. the symbolic-``K`` recombine
+    lane — rather than densifying it into ``np.einsum``).  It does NOT
+    affect the bulk branch (already force-defers) nor the all-numeric /
+    no-program fallthrough (cannot defer without a program).
 
     All-numeric operands and no-program calls fall through to bare
     ``np.einsum`` (mirrors :func:`runtime_einsum`).
@@ -2533,12 +2545,13 @@ def runtime_einsum_multi(
     if program is None or not any_object:
         return np.einsum(spec, *arrs, optimize=True)
 
-    bound = _estimate_einsum_output_terms(spec, arrs)
-    # Threshold from the budget when set; None == legacy env-aware default.
-    bt = program.budget.einsum_bag_threshold
-    threshold = _einsum_bag_threshold() if bt is None else bt
-    if bound <= threshold:
-        return np.einsum(spec, *arrs, optimize=True)
+    if not force_defer:
+        bound = _estimate_einsum_output_terms(spec, arrs)
+        # Threshold from the budget when set; None == legacy env-aware default.
+        bt = program.budget.einsum_bag_threshold
+        threshold = _einsum_bag_threshold() if bt is None else bt
+        if bound <= threshold:
+            return np.einsum(spec, *arrs, optimize=True)
 
     op = EinsumStmtOp(spec=spec)
     refs = [SymArray(a, program=program) for a in arrs]
