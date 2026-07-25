@@ -360,6 +360,16 @@ def evaluate_cone(program: Program, target: SymArray, values: Mapping) -> np.nda
     # (possibly partially-built) shared program cannot crash or affect the probe.
     # Equals target.evaluate(values) whenever the full run would succeed.
     # (Program.build_runtime_bindings gained `only=<stmt indices>` for this lane.)
+
+def is_structurally_constant(program: Program, target: SymArray) -> bool
+    # SOUND, sampling-free test that `target`'s value is a build-time constant:
+    # True iff its dependency_cone is a CLOSED CONSTANT subprogram — no Stmt input is
+    # an InputRef / IntAtomRef (a runtime feed) and no cell generator anywhere in the
+    # cone (nor in `target` itself) has provenance kind other than "stmt_out"
+    # (i.e. no vertex/point/coeff/… feed atom is read). EXACT, not heuristic; never
+    # calls a feed-varying value constant. CONSERVATIVE: any ref/generator that cannot
+    # be positively classified constant-safe — or a cone that fails to enumerate —
+    # forces False. Folds without any evaluation/codegen.
 ```
 ```
 
