@@ -677,6 +677,12 @@ class _Lowerer:
         self.bulkmap: dict[str, Any] = {}
         # (stmt_idx, out_idx) -> PyAB Var for the produced output.
         self.outvar: dict[tuple[int, int], Any] = {}
+        # CSE for non-bulk object-dtype operands: id(cells) -> the Var its nested
+        # per-cell ``stack`` was assembled into once, so a SymArray reused as an
+        # operand across many Stmts is materialised ONCE (a single Var) instead of
+        # re-scattered element-wise at every consumption site.  Keyed on the shared
+        # ``SymArrayRef._cells`` identity (stable across refs to the same SymArray).
+        self._cells_cse: dict[int, Any] = {}
         self.extra = dict(opts.op_lowerings or {})
         self.array_ns = self.core.Var(name="torch" if opts.target == "torch" else "np")
         # In-refs of the Stmt currently being rendered — set by ``_render_op`` just
@@ -780,7 +786,7 @@ class _Lowerer:
         if isinstance(ref, SymArrayRef):
             if ref._bulk is not None:
                 return self.bulkmap[ref._bulk.name]
-            return self._cells_expr(ref.cells)
+            return self._cells_expr_shared(ref._cells)
         if isinstance(ref, IntAtomRef):
             return self.core.CallExpr(
                 fn=self.core.Var(name="int"), args=(self.intatom_exprs[ref.name],)
@@ -1197,6 +1203,24 @@ class _Lowerer:
         if isinstance(value, np.ndarray):
             return c.ArrayExpr(obj=_nested_tuple(c, value.tolist()), dtype=self._dtype_f64())
         return c.FloatLit(value=float(value))
+
+    def _cells_expr_shared(self, cells: np.ndarray) -> Any:
+        """CSE wrapper for :meth:`_cells_expr` on an OPERAND ref: assemble a non-bulk
+        OBJECT-dtype cell array ONCE into a Var (keyed on ``id(cells)``) and reuse it,
+        so a SymArray consumed as an operand by many Stmts is materialised a single time
+        rather than re-scattered element-wise (nested ``stack`` of per-cell ``_poly_to_ir``
+        trees) at every consumption site — the dominant non-bulk codegen blow-up.  Float /
+        empty arrays fall through (a cheap single ``ArrayExpr``; not worth a Var)."""
+        arr = np.asarray(cells)
+        if arr.dtype != object or arr.size == 0:
+            return self._cells_expr(cells)
+        key = id(cells)
+        hit = self._cells_cse.get(key)
+        if hit is not None:
+            return hit
+        var = self.b.assign_new(self._cells_expr(cells), base="op")
+        self._cells_cse[key] = var
+        return var
 
     def _cells_expr(self, cells: np.ndarray) -> Any:
         """Assemble an ndarray of cells (floats and/or RationalFunctions)."""
