@@ -24,7 +24,16 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .ir import IdentityOp, OutSpec, Program, SymArray, _cell_size
+from .ir import (
+    Const,
+    IdentityOp,
+    OutSpec,
+    Program,
+    RationalRef,
+    SymArray,
+    SymArrayRef,
+    _cell_size,
+)
 from .rational import RationalFunction
 
 
@@ -82,6 +91,14 @@ class ProgramRow:
     total_mass: int       # Σ monomial count over symbolic output cells
     max_cell: int         # largest single output-cell monomial count
     prov_kinds: dict[str, int]  # generator-provenance histogram over output cells
+    # OPERAND mass — the real lowering cost.  Every einsum/linalg Stmt defers its
+    # OUTPUT to fresh atoms (so ``total_mass`` above reads tiny), but pyab lowers each
+    # non-bulk RationalFunction OPERAND cell (``stmt.in_``) by expanding its monomials
+    # into the codegen AST.  This is where a degree-d symbolic build actually costs —
+    # ``total_mass`` alone hides it (the argyris-P(T) 9K-output / 8.35M-operand mismatch).
+    operand_mass: int = 0     # Σ monomial count over non-bulk RF operand cells
+    max_operand: int = 0      # largest single operand-cell monomial count
+    n_operand_cells: int = 0  # number of symbolic (RF) operand cells
 
 
 @dataclass(frozen=True)
@@ -102,6 +119,13 @@ class IRReport:
     def total_mass(self) -> int:
         return sum(r.total_mass for r in self.rows)
 
+    @property
+    def total_operand_mass(self) -> int:
+        """Σ monomial count over non-bulk RF OPERAND cells across all programs — the
+        real codegen/lowering cost (``total_mass`` counts only outputs, which einsums
+        defer to atoms, so it hides the operand expansion)."""
+        return sum(r.operand_mass for r in self.rows)
+
     def prov_kinds(self) -> dict[str, int]:
         """Generator-provenance histogram aggregated over all programs."""
         out: dict[str, int] = {}
@@ -113,14 +137,17 @@ class IRReport:
     def __str__(self) -> str:
         lines = [
             f"IRReport: {self.n_programs} program(s), "
-            f"defer={self.n_defer}, mass={self.total_mass}, "
+            f"defer={self.n_defer}, out_mass={self.total_mass}, "
+            f"operand_mass={self.total_operand_mass}, "
             f"prov={self.prov_kinds()}",
         ]
         for r in self.rows:
             lines.append(
                 f"  {r.name:14} stmts={r.n_stmts:3d} defer={r.n_defer:3d} "
                 f"sym_cells={r.symbolic_cells:3d}/{r.n_output_cells:<3d} "
-                f"mass={r.total_mass:5d} max={r.max_cell:4d} prov={r.prov_kinds}"
+                f"out_mass={r.total_mass:6d} max={r.max_cell:5d}  "
+                f"operand_mass={r.operand_mass:8d} max_op={r.max_operand:7d} "
+                f"n_op={r.n_operand_cells:5d} prov={r.prov_kinds}"
             )
         return "\n".join(lines)
 
@@ -145,10 +172,39 @@ def _prov_kind(program: Program, gen: str) -> str:
     return getattr(p, "kind", "extern") if p is not None else "extern"
 
 
+def _ref_rf_cells(ref) -> list:
+    """The RationalFunction operand cells a Stmt input ref carries (non-bulk only).
+
+    ``SymArrayRef`` (its ``_cells``, unless bulk), ``Const`` (a materialised value),
+    and ``RationalRef`` (a single RF).  ``InputRef``/``OutputRef``/``IntAtomRef`` carry
+    no monomials (a name / a prior-Stmt handle) and contribute nothing.
+    """
+    if isinstance(ref, SymArrayRef):
+        if ref._bulk is not None:
+            return []
+        arr = np.asarray(ref._cells)
+        return [c for c in arr.reshape(-1) if isinstance(c, RationalFunction)]
+    if isinstance(ref, RationalRef):
+        rf = ref.rf
+        return [rf] if isinstance(rf, RationalFunction) else []
+    if isinstance(ref, Const):
+        arr = np.asarray(ref.value, dtype=object)
+        return [c for c in arr.reshape(-1) if isinstance(c, RationalFunction)]
+    return []
+
+
 def _row(program: Program) -> ProgramRow:
     n_defer = sum(_is_op(st.fn) for st in program.statements)
     n_cells = sym_cells = total_mass = max_cell = 0
+    op_mass = max_op = n_op = 0
     prov: dict[str, int] = {}
+    for st in program.statements:
+        for ref in st.in_:
+            for cell in _ref_rf_cells(ref):
+                n_op += 1
+                sz = _cell_size(cell)
+                op_mass += sz
+                max_op = max(max_op, sz)
     for sa in program.outputs.values():
         # Read placeholder cells for a bulk output (no per-cell symbols);
         # never force a materialisation here.
@@ -174,6 +230,9 @@ def _row(program: Program) -> ProgramRow:
         total_mass=total_mass,
         max_cell=max_cell,
         prov_kinds=prov,
+        operand_mass=op_mass,
+        max_operand=max_op,
+        n_operand_cells=n_op,
     )
 
 
