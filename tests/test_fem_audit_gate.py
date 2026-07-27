@@ -34,15 +34,37 @@ def _harness() -> Path | None:
             cand = anc.joinpath(*rel)
             if cand.is_file():
                 return cand
-        cand = anc / "audit" / "run_audits.py"
-        if cand.is_file():
-            return cand
     return None
+
+
+def _in_a_workspace() -> bool:
+    """Whether this checkout sits in a multi-repo workspace (so the harness SHOULD be there).
+
+    The distinction the gate turns on. A repo cloned on its own genuinely has no workspace
+    audit and must skip; a repo sitting next to its siblings and finding no harness means the
+    harness moved or broke, and that must FAIL. Detected by the siblings the audit needs
+    anyway.
+    """
+    for anc in Path(__file__).resolve().parents:
+        if (anc / "grassmann" / "src").is_dir() and (anc / "polyarray" / "src").is_dir():
+            return True
+    return False
 
 
 def test_fem_audit_gate() -> None:
     runner = _harness()
     if runner is None:
+        # A gate that degrades to SILENCE is indistinguishable from a gate that
+        # passes. Moving the workspace audit once left this skipping in all six
+        # repos while every suite stayed green and nothing was audited. Skip ONLY
+        # for a genuinely standalone checkout; in a workspace, a missing harness
+        # is a broken gate and must fail.
+        if _in_a_workspace():
+            pytest.fail(
+                "workspace audit harness NOT FOUND while sitting in a workspace — "
+                "expected savo/audit/workspace/run_audits.py. The gate would "
+                "otherwise skip silently and this suite would look green with "
+                "nothing audited.")
         pytest.skip("fem audit harness not present (standalone checkout)")
     workspace = Path(__file__).resolve().parents[1].parent      # the dir holding this repo
     out = subprocess.run(
