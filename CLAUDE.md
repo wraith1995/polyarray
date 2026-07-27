@@ -50,5 +50,5 @@ contract — additions need it updated).
 `simplify.py`, `forward.py`, `sparsity.py`, `budget.py`, `numpy_source.py`,
 `poly_backend.py` + native backends. Design docs: `plans/00-simplify-design.md`
 (Numeric ⊏ Symbolic ⊏ Opaque lattice), `plans/01-budget-moderated-simplification.md`.
-Tests: `pytest -n auto` in this repo's `.venv`. mypy: configured in pyproject (chartLib-model flags); baseline 52 errors (2026-07-03) — shrink, don't grow. Audit: `python3 ../../audit/run_audits.py
+Tests: `pytest -n auto` in this repo's `.venv`. mypy: configured in pyproject (chartLib-model flags); baseline 52 errors (2026-07-03) — shrink, don't grow. Audit: `python3 savo/audit/workspace/run_audits.py
 --repos polyarray` (from `fem/`; adjust if top-level checkout).
