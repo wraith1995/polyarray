@@ -24,6 +24,16 @@ BASELINE: dict[str, int] = {}                       # ERROR-clean (task #16 clea
 
 def _harness() -> Path | None:
     for anc in Path(__file__).resolve().parents:
+        # `savo/audit/workspace/` is the home since the workspace audit moved there (it was in
+        # `fem/audit`, an untracked directory). The old path is still probed so a checkout that
+        # predates the move keeps working — and so this gate never silently SKIPS, which is what
+        # it did in all six repos when the move landed: a gate that skips is not guarding.
+        for rel in (("savo", "audit", "workspace", "run_audits.py"),
+                    ("audit", "workspace", "run_audits.py"),
+                    ("audit", "run_audits.py")):
+            cand = anc.joinpath(*rel)
+            if cand.is_file():
+                return cand
         cand = anc / "audit" / "run_audits.py"
         if cand.is_file():
             return cand
