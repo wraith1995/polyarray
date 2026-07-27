@@ -87,6 +87,8 @@ class SymArray:                  # object/float ndarray of cells, bound to a Pro
     def matvec(self, v: SymArray | np.ndarray) -> SymArray
     def einsum(self, subscripts: str, *others: SymArray | np.ndarray) -> SymArray  # np.einsum on cells, program threaded
     def transpose(self) -> SymArray
+    def reshape(self, shape: tuple[int, ...] | list[int]) -> SymArray   # BULK-PRESERVING: emits ReshapeOp, never unpacks
+    def expand_dims(self, axis: int) -> SymArray                        # the deferral-safe `arr[:, np.newaxis]`
     def det(self, budget: SymbolicBudget | None = None) -> SymArray
     def inverse(self, budget: SymbolicBudget | None = None) -> SymArray
     def pinv(self) -> SymArray
