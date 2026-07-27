@@ -901,6 +901,73 @@ class SymArray:
     # Operation methods (closed-form-or-emit)
     # ------------------------------------------------------------------
 
+    def reshape(self, shape: tuple[int, ...] | list[int]) -> SymArray:
+        """``self.reshape(shape)``, keeping a bulk array BULK.
+
+        A reshape wants no cell VALUES — only a shape. But ``.cells`` auto-unpacks a bulk array
+        (one ``unpack`` Stmt materialising every per-cell atom), so ``SymArray(sa.cells.reshape(...))``
+        forces the whole tensor to answer a question about its layout. Six sites across pointwise and
+        savo were doing exactly that, for no other reason than that this method did not exist —
+        `ReshapeOp` has been in the IR (and rendered by pyab, and degree-transparent) all along.
+
+        Bulk in, bulk out: emits one ``ReshapeOp`` Stmt so the chain stays deferred. Non-bulk goes
+        through ``_cells`` directly, which is already materialised, so nothing is forced there either.
+
+        ``-1`` is resolved here rather than left to numpy, because the emitted ``OutSpec`` needs a
+        concrete shape.
+        """
+        cur = self.shape
+        static_cur = not is_dynamic(cur)
+        shape = tuple(int(s) for s in shape)
+        if -1 in shape:
+            if not static_cur:
+                raise ValueError(
+                    "SymArray.reshape: -1 needs a static source shape; this array's shape is "
+                    f"dynamic ({cur}). Pass the resolved shape.")
+            known = 1
+            for s in shape:
+                if s != -1:
+                    known *= s
+            total = 1
+            for s in cur:
+                total *= int(s)
+            if known == 0 or total % known:
+                raise ValueError(f"SymArray.reshape: cannot resolve -1 in {shape} from {cur}")
+            shape = tuple(total // known if s == -1 else s for s in shape)
+        if static_cur:
+            total, want = 1, 1
+            for s in cur:
+                total *= int(s)
+            for s in shape:
+                want *= s
+            if total != want:
+                raise ValueError(
+                    f"SymArray.reshape: cannot reshape size {total} {tuple(cur)} into {shape}")
+        if self._bulk is not None and self.program is not None:
+            [out] = self.program.emit_stmt(
+                ReshapeOp(shape), [self], [OutSpec("reshape", shape)],
+                note="SymArray.reshape", bulk=True,
+            )
+            return out                                   # still bulk — nothing materialised
+        return SymArray(self._cells.reshape(shape), program=self.program)
+
+    def expand_dims(self, axis: int) -> SymArray:
+        """Insert a length-1 axis at ``axis`` — the deferral-safe ``arr[:, np.newaxis]``.
+
+        Spelled on top of :meth:`reshape`, so it keeps a bulk array bulk for the same reason.
+        """
+        cur = self.shape
+        if is_dynamic(cur):
+            raise ValueError(
+                "SymArray.expand_dims: needs a static shape to place the new axis; this array's "
+                f"shape is dynamic ({cur}). Use `reshape` with the resolved shape.")
+        n = len(cur)
+        if not -n - 1 <= axis <= n:
+            raise ValueError(f"SymArray.expand_dims: axis {axis} out of range for ndim {n}")
+        at = axis if axis >= 0 else axis + n + 1
+        return self.reshape((*tuple(int(s) for s in cur[:at]), 1,
+                             *tuple(int(s) for s in cur[at:])))
+
     def transpose(self) -> SymArray:
         """Return ``self.T`` as a new SymArray bound to the same program."""
         return SymArray(self.cells.T, program=self.program)
