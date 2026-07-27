@@ -394,6 +394,57 @@ def program_degree(program: Program, seed: Mapping[str, float], *,
     # caller (pointwise `estimate_degree`).
 ```
 
+## Compile observability (`observe.py`)
+
+The staged compile trace the consumers (pointwise / savo / oracle) instrument against.
+It lives here because this repo owns the measurement primitives (`forward.analyze`,
+`degree.program_degree`, `ir._cell_size`) *and* the pyab→torch dump hand-off, and is a
+dependency of every layer that wants observing. grassmann and chartLib are deliberately
+NOT instrumented and do not import this.
+
+```python
+class Level(IntEnum): OFF, WARN, INFO, DEBUG, DUMP     # from FEM_OBSERVE, default WARN
+
+def measure(obj, *, degree_seed=None) -> Measurement
+    # Size / degree / provenance of a Program, SymArray, ndarray, sequence, or wrapper
+    # exposing `.program`/`.prog`. FAILURE-TOLERANT: a probe that raises yields a
+    # Measurement carrying `.error`, never propagates. Never forces a bulk node.
+
+@contextmanager
+def observe_compile(name, *, level=None, dump_root=None, report=True) -> CompileTrace
+def scope(name, **kw) -> CompileTrace    # reuse an enclosing trace, else open one
+def trace() -> CompileTrace              # the ambient trace; NEVER None (null when off)
+def active() -> bool                     # guard EXPENSIVE ctx gathering only
+def stage(name, obj=None, *, detail=None, **ctx)   # record on the ambient trace
+def phase(name, *, detail=None, **ctx)             # time a block; result -> box[0]
+    # `detail` is a zero-arg callable returning extra text for the stage's DUMP —
+    # what the stage produced in the caller's own vocabulary (which basis, which
+    # bindings). Called only at `dump`, only once per stage; being a thunk it may
+    # close over locals bound inside the phase.
+def dump_dir_for(name) -> Path | None    # pass straight to pyab.compile_torch(dump_dir=)
+
+class CompileTrace:
+    .stage / .phase / .dump_dir_for / .report() / .write_report()
+    .peak_stage()      # largest mass — where the IR is biggest
+    .jump_stage()      # largest mass multiplier over its parent — where it GOT big
+    .rational_stage()  # where degree first went inf (stopped being polynomial)
+```
+
+Stages repeated in a loop are **rolled up** by `(depth, name)`: `Snapshot.m` is the
+largest MEASURED occurrence, `.count` the number of runs, `.n_measured` how many were
+measured — one row and one dump directory per stage however many times it ran. Below
+`debug` the occurrences are sampled geometrically (1, 2, 4, 8, …); `debug`/`dump`
+measure all of them.
+
+At `dump` each stage directory gets `stage.txt` (numbers + `IRReport`), `program.py`
+(the stage's polyarray IR rendered via `numpy_source.to_numpy_source`), and `detail.txt`
+if the call site supplied one.
+
+Full guide: **`OBSERVABILITY.md`**.
+
+Env: `FEM_OBSERVE` (level), `FEM_OBSERVE_DIR` (dump root), `FEM_OBSERVE_MASS_CEILING` /
+`_OPERAND_CEILING` / `_CELLS_CEILING` / `_DEGREE_CEILING` (warning thresholds).
+
 ## Backends
 
 Selected at import time of `polyarray.poly_backend` from the
