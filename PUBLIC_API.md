@@ -343,15 +343,33 @@ def bind_inputs(program, bind) -> Program   # = specialize(bind=...)
     # folded — it survives unchanged (conservative; static path byte-identical).
 
 def partial_eval_numeric(program: Program, *, probes: int = 3, seed: int = 0,
-                         rtol: float = 1e-9, atol: float = 1e-12) -> Program
+                         rtol: float = 1e-9, atol: float = 1e-12,
+                         mode: str | None = None, time_budget: float = 10.0) -> Program
 def partial_eval_numeric_symarray(sa: SymArray, **kw) -> SymArray
-    # Probe-and-freeze (simplify.py): fold every Stmt whose outputs are numerically
-    # INVARIANT under the symbolic inputs — discovered by running the program at
-    # `probes` random bindings (polynomial identity testing; probabilistic, NOT
-    # exact-by-construction; measure-zero false freezes for rational cells).
-    # Strictly stronger than the dataflow fold_numeric: collapses e.g. A·inv(A) ≡ I
+class NonExactFoldWarning(UserWarning)
+    # Fold every Stmt whose outputs are INVARIANT under the symbolic inputs —
+    # strictly stronger than the dataflow fold_numeric: collapses e.g. A·inv(A) ≡ I
     # and a metric-free grass_dof whose symbolic Jacobian input provably cancels.
     # The _symarray form also folds the cells (invariant atom -> numeric cell).
+    # `mode` selects HOW invariance is certified (default: env
+    # POLYARRAY_PARTIAL_EVAL_MODE, else "hybrid"; the parameter always wins):
+    #   "exact"  — exact_fold.py: each output entry brought to rational normal form
+    #              over the feed atoms (flint fmpq — exact-by-construction; the
+    #              rational op set + exact Gauss inv/det/solve + sub-Program descent;
+    #              numeric-closed subgraphs run their real ops deterministically).
+    #              Non-normalizable (opaque-op) statements are left symbolic; provably
+    #              non-constant ones are REFUTED. Time-boxed by `time_budget` seconds.
+    #   "hybrid" — exact first; ONLY unresolved statements fall back to the probe
+    #              pass, and every probe freeze raises ONE aggregated
+    #              NonExactFoldWarning naming the sites. Exactly-refuted statements
+    #              are never probed (closes the colluding-probe false freeze).
+    #   "probe"  — the legacy probe-and-freeze, unchanged and silent: `probes`
+    #              random bindings (polynomial identity testing; probabilistic, NOT
+    #              exact-by-construction; measure-zero false freezes) — for
+    #              diagnostic/performance sites that don't need exactness.
+    # The _symarray form additionally applies the ENTRY-LEVEL exact fold in
+    # exact/hybrid modes: a cell whose rational normal form is degree-0 folds to its
+    # exact constant even when no single statement is invariant.
 
 def dependency_cone(program: Program, target: SymArray) -> set[int]
     # The statement indices `target` transitively depends on (via input Refs +
