@@ -28,6 +28,8 @@ shrinking the Stmt to the still-symbolic operands.
 """
 from __future__ import annotations
 
+import os
+import warnings
 from typing import Any, Mapping
 
 import numpy as np
@@ -706,30 +708,108 @@ def _read_stmt_outs(stmt: Stmt, bindings: Mapping[str, Any]) -> list[np.ndarray]
     return outs
 
 
+class NonExactFoldWarning(UserWarning):
+    """A build-time constant was certified NON-exactly (by random-probe polynomial
+    identity testing) on a default/hybrid ``partial_eval_numeric`` path.
+
+    Raised (as a warning) whenever ``mode="hybrid"`` freezes a statement the exact
+    lane could not normalize — the certificate for those statements is probabilistic
+    (measure-zero failure), not exact-by-construction.  Silence with
+    ``mode="probe"`` (accept probing), or forbid with ``mode="exact"``."""
+
+
+_PARTIAL_EVAL_MODES = ("exact", "hybrid", "probe")
+
+
+def _resolve_partial_eval_mode(mode: str | None) -> str:
+    """``mode`` (or the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default) validated.
+
+    The explicit parameter is the API; the env var only moves the DEFAULT
+    (``None``) — an explicit argument always wins."""
+    if mode is None:
+        mode = os.environ.get("POLYARRAY_PARTIAL_EVAL_MODE", "hybrid")
+    if mode not in _PARTIAL_EVAL_MODES:
+        raise ValueError(
+            f"partial_eval_numeric: mode must be one of {_PARTIAL_EVAL_MODES}, got {mode!r}")
+    return mode
+
+
+def _warn_probe_freezes(
+    program: Program, probe_frozen: set[int], reasons: Mapping[int, str],
+    *, probes: int, rtol: float,
+) -> None:
+    """One aggregated :class:`NonExactFoldWarning` naming the probe-frozen sites."""
+    if not probe_frozen:
+        return
+    def _site(i: int) -> str:
+        stmt = program.statements[i]
+        names = [o._bulk.name if o._bulk is not None else
+                 next((c.gens[0] for c in np.asarray(o.cells).reshape(-1)
+                       if isinstance(c, RationalFunction) and c.gens), "?")
+                 for o in stmt.out]
+        note = f" note={stmt.note!r}" if stmt.note else ""
+        why = reasons.get(i, "?")
+        return f"stmt {i}{note} -> {', '.join(names)} (exact lane: {why})"
+    shown = [_site(i) for i in sorted(probe_frozen)[:5]]
+    more = len(probe_frozen) - len(shown)
+    # Surface the DEEPEST distinct blockers across the whole unresolved set — a frozen
+    # statement's own reason is often just the downstream cascade ("operand depends on
+    # an unresolved statement"), while the root cause (the QR / front-end sign-fix /
+    # vmap closure inside a sub-program) sits on an earlier unresolved statement.
+    roots = sorted({r for r in reasons.values()
+                    if not r.startswith("operand depends")})
+    root_note = (" Exact-lane root blockers: " + "; ".join(roots[:4])
+                 + (f"; … {len(roots) - 4} more" if len(roots) > 4 else "") + "."
+                 if roots else "")
+    warnings.warn(NonExactFoldWarning(
+        f"partial_eval_numeric(mode='hybrid') froze {len(probe_frozen)} statement(s) of "
+        f"program {program.name!r} by PROBE (non-exact) polynomial identity testing "
+        f"(probes={probes}, rtol={rtol}): "
+        + "; ".join(shown) + (f"; … {more} more" if more > 0 else "")
+        + ". These certificates are probabilistic, not exact-by-construction: the "
+          "entries could not be brought to rational normal form." + root_note
+        + " Pass mode='probe' to accept probing silently, or mode='exact' to refuse "
+          "non-exact folds."),
+        stacklevel=3)
+
+
 def _partial_eval_numeric(
     program: Program, *, probes: int, seed: int, rtol: float, atol: float,
-) -> tuple[Program, dict]:
-    """Probe-and-freeze partial evaluation: fold every Stmt whose outputs are
-    NUMERICALLY INVARIANT under the program's symbolic inputs.
+    mode: str = "probe", time_budget: float = 10.0,
+) -> tuple[Program, dict, Any]:
+    """Partial evaluation folding every Stmt whose outputs are INVARIANT under the
+    program's symbolic inputs — by exact normalization, probing, or both (``mode``).
 
     ``fold_numeric`` folds only numeric-CLOSED subcomputations (dataflow: no symbolic
     ancestor). This pass folds the strictly larger class of subcomputations whose
-    outputs merely do not DEPEND on the symbolic inputs — discovered by running the
-    program under ``probes`` random input bindings and freezing every Stmt output that
-    is bit-finite and equal (``rtol``/``atol``) across all runs. The canonical case: a
+    outputs merely do not DEPEND on the symbolic inputs. The canonical case: a
     chain ``inv(A) → A·inv(A)`` is identically ``I`` for every ``A`` — dataflow says
-    symbolic, probing says constant. (The FEEC motivation: a metric-free DOF's nested
-    grass program is fed one vertex-symbolic Jacobian buffer whose contribution
-    provably cancels; this pass collapses the whole ``grass_dof`` Stmt to its
-    reference value, making the symbolic Vandermonde STRUCTURALLY constant.)
+    symbolic, identity testing says constant. (The FEEC motivation: a metric-free
+    DOF's nested grass program is fed one vertex-symbolic Jacobian buffer whose
+    contribution provably cancels; this pass collapses the whole ``grass_dof`` Stmt
+    to its reference value, making the symbolic Vandermonde STRUCTURALLY constant.)
 
-    SOUNDNESS: probabilistic (polynomial identity testing), NOT exact-by-construction
-    like ``specialize`` — a cell equal at every probe by coincidence would be frozen
-    wrongly. Probes are i.i.d. over a continuous box, so for the rational-function
-    cells this IR produces, false freezes have measure zero; raise ``probes`` for
-    belt-and-braces. Statement granularity: an intermediate that genuinely varies
-    (a per-probe ``Q`` factor, say) stays symbolic even when a DOWNSTREAM output is
-    invariant — the downstream Stmt still folds on its own.
+    ``mode`` (see :func:`partial_eval_numeric` for the public contract):
+
+    * ``"exact"``  — :mod:`polyarray.exact_fold` only: constancy certified by the
+      exact rational normal form of each output entry (flint ``fmpq`` arithmetic;
+      exact-by-construction). Entries that cannot be normalized (opaque ops on the
+      symbolic path) are simply NOT folded.
+    * ``"hybrid"`` — exact first; statements the exact lane left *unresolved* fall
+      back to the legacy probe pass, and every such non-exact freeze raises one
+      aggregated :class:`NonExactFoldWarning`. Statements the exact lane REFUTED
+      (provably non-constant) are never probed — this is what closes the
+      colluding-probe false-freeze hole.
+    * ``"probe"``  — the legacy behavior, unchanged and silent: ``probes`` random
+      input bindings over ``[0.6, 1.6]``, freeze every Stmt output bit-finite and
+      equal (``rtol``/``atol``) across runs. Probabilistic (measure-zero false
+      freezes), NOT exact-by-construction — kept for diagnostic / performance
+      call sites that don't need exactness.
+
+    Statement granularity: an intermediate that genuinely varies (a per-probe ``Q``
+    factor, say) stays symbolic even when a DOWNSTREAM output is invariant — the
+    downstream Stmt still folds on its own (and the exact lane's ENTRY-level fold in
+    :func:`partial_eval_numeric_symarray` also certifies cell-level cancellations).
 
     Static inputs only (a ``DimAtom``-shaped input raises ``NotImplementedError``).
     Inputs are never dropped — unused ones simply go unread at ``run`` time.
@@ -742,40 +822,63 @@ def _partial_eval_numeric(
                 raise NotImplementedError(
                     f"partial_eval_numeric: dynamic input {inp.name!r} (DimAtom axis) unsupported")
 
-    rng = np.random.default_rng(seed)
-    runs: list[Mapping[str, Any]] = []
-    for _ in range(probes):
-        vals = {inp.name: rng.uniform(0.6, 1.6, size=tuple(inp.shape))
-                for inp in program.inputs}
-        runs.append(program.build_runtime_bindings(vals))
-
-    per_probe_outs: list[list[list[np.ndarray] | None]] = [
-        [_read_stmt_outs(stmt, b) for stmt in program.statements] for b in runs
-    ]
-
-    new = program.copy()
     known: dict[str, Any] = {}
     foldable: set[int] = set()
-    for i, stmt in enumerate(new.statements):
-        outs0 = per_probe_outs[0][i]
-        if outs0 is None or any(not np.all(np.isfinite(o)) for o in outs0):
-            continue
-        invariant = all(
-            per_probe_outs[p][i] is not None
-            and all(np.allclose(a, b, rtol=rtol, atol=atol)
-                    for a, b in zip(outs0, per_probe_outs[p][i], strict=True))
-            for p in range(1, probes)
-        )
-        if not invariant:
-            continue
-        try:
-            staged = dict(known)
-            _record_known(stmt, outs0, staged)
-        except ValueError:
-            continue
-        known = staged
-        foldable.add(i)
+    exact_state = None
+    if mode in ("exact", "hybrid"):
+        from .exact_fold import exact_partial_eval
+        exact_state = exact_partial_eval(program, time_budget=time_budget)
+        known.update(exact_state.known)
+        foldable |= exact_state.folded
 
+    probe_frozen: set[int] = set()
+    if mode in ("probe", "hybrid"):
+        rng = np.random.default_rng(seed)
+        runs: list[Mapping[str, Any]] = []
+        for _ in range(probes):
+            vals = {inp.name: rng.uniform(0.6, 1.6, size=tuple(inp.shape))
+                    for inp in program.inputs}
+            runs.append(program.build_runtime_bindings(vals))
+
+        per_probe_outs: list[list[list[np.ndarray] | None]] = [
+            [_read_stmt_outs(stmt, b) for stmt in program.statements] for b in runs
+        ]
+
+        # Exactly-refuted statements are PROVABLY non-constant: never probe-freeze
+        # them (a colluding probe set is exactly the unsound case this closes).
+        skip: set[int] = set(foldable)
+        if exact_state is not None:
+            skip |= exact_state.refuted
+        for i, stmt in enumerate(program.statements):
+            if i in skip:
+                continue
+            outs0 = per_probe_outs[0][i]
+            if outs0 is None or any(not np.all(np.isfinite(o)) for o in outs0):
+                continue
+            invariant = all(
+                per_probe_outs[p][i] is not None
+                and all(np.allclose(a, b, rtol=rtol, atol=atol)
+                        for a, b in zip(outs0, per_probe_outs[p][i], strict=True))
+                for p in range(1, probes)
+            )
+            if not invariant:
+                continue
+            try:
+                staged = dict(known)
+                _record_known(stmt, outs0, staged)
+            except ValueError:
+                continue
+            known = staged
+            probe_frozen.add(i)
+        foldable |= probe_frozen
+
+    if mode == "hybrid":
+        _warn_probe_freezes(
+            program, probe_frozen,
+            exact_state.unresolved if exact_state is not None else {},
+            probes=probes, rtol=rtol)
+
+    new = program.copy()
     survivors = [i for i in range(len(new.statements)) if i not in foldable]
     idx_map = {old: new_i for new_i, old in enumerate(survivors)}
     new_statements: list[Stmt] = []
@@ -786,30 +889,67 @@ def _partial_eval_numeric(
                                    provenance=st.provenance, inline=st.inline))
     new.statements = new_statements
     new.outputs = {k: _fold_symarray(sa, known, new, k) for k, sa in new.outputs.items()}
-    return new, known
+    return new, known, exact_state
 
 
 def partial_eval_numeric(
     program: Program, *, probes: int = 3, seed: int = 0,
     rtol: float = 1e-9, atol: float = 1e-12,
+    mode: str | None = None, time_budget: float = 10.0,
 ) -> Program:
-    new, _known = _partial_eval_numeric(program, probes=probes, seed=seed, rtol=rtol, atol=atol)
+    """Fold every Stmt whose outputs are invariant under the program's symbolic
+    inputs — see :func:`_partial_eval_numeric` for the mechanics.
+
+    ``mode`` selects HOW invariance is certified:
+
+    * ``"exact"``  — exact rational normal form only (:mod:`polyarray.exact_fold`;
+      exact-by-construction). Non-normalizable statements are left symbolic.
+    * ``"hybrid"`` (the default) — exact where possible; the legacy probe pass is
+      the fallback for opaque/unresolved statements ONLY, and every probe-based
+      freeze raises an aggregated :class:`NonExactFoldWarning` naming the sites.
+      Statements the exact lane proved NON-constant are never probe-frozen.
+    * ``"probe"``  — the legacy probe-and-freeze, unchanged and silent
+      (probabilistic; for diagnostic/performance sites that don't need exactness).
+
+    ``mode=None`` reads the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default (else
+    ``"hybrid"``); the explicit parameter always wins.  ``probes`` configures the
+    probe count of the probe/hybrid-fallback lanes.  ``time_budget`` (seconds)
+    bounds the exact lane — on expiry the remaining statements degrade to the
+    (warned) probe fallback rather than hang."""
+    new, _known, _state = _partial_eval_numeric(
+        program, probes=probes, seed=seed, rtol=rtol, atol=atol,
+        mode=_resolve_partial_eval_mode(mode), time_budget=time_budget)
     return new
 
 
 def partial_eval_numeric_symarray(
     sa: SymArray, *, probes: int = 3, seed: int = 0,
     rtol: float = 1e-9, atol: float = 1e-12,
+    mode: str | None = None, time_budget: float = 10.0,
 ) -> SymArray:
     """:func:`partial_eval_numeric` for a ``SymArray`` whose CELLS reference the
     program's atoms (e.g. a symbolic Vandermonde whose cells are ``grass_dof.result``
     refs): folds the threaded program AND the cells together, so an invariant atom
-    becomes a numeric cell — the STRUCTURAL form of the array."""
+    becomes a numeric cell — the STRUCTURAL form of the array.
+
+    In the exact/hybrid modes the cells additionally get the ENTRY-LEVEL exact fold
+    (:func:`polyarray.exact_fold.exact_fold_cells`): a cell is certified constant iff
+    its rational normal form over the feed atoms has total degree zero — so a
+    cancellation that completes only at the entry (no single statement invariant)
+    still folds, exact-by-construction.  ``mode``/``probes``/``time_budget`` as in
+    :func:`partial_eval_numeric`."""
     from .ir import SymArray
     if sa.program is None:
         return sa
-    new, known = _partial_eval_numeric(sa.program, probes=probes, seed=seed, rtol=rtol, atol=atol)
-    folded = _numify_constant_cells(_fold_cells(np.asarray(sa.cells), known))
+    mode_r = _resolve_partial_eval_mode(mode)
+    new, known, state = _partial_eval_numeric(
+        sa.program, probes=probes, seed=seed, rtol=rtol, atol=atol,
+        mode=mode_r, time_budget=time_budget)
+    cells = _fold_cells(np.asarray(sa.cells), known)
+    if state is not None:
+        from .exact_fold import exact_fold_cells
+        cells = exact_fold_cells(cells, state, sa.program, time_budget=time_budget)
+    folded = _numify_constant_cells(cells)
     return SymArray(folded, program=new)
 
 

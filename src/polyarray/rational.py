@@ -1032,6 +1032,14 @@ def _compose_poly(
     target ring, the bound generator's ``name**exp`` is the RF power
     ``repl_t**exp``, and the term RFs are summed.  ``repl_t`` is assumed already
     lifted into ``target``.
+
+    COEFFICIENT EXACTNESS: the source coefficient is passed to the target ring
+    NATIVELY (``ground_new`` / ``from_dict`` accept each backend's own ground
+    type — fmpq / RR — unchanged), never round-tripped through ``float``.  The
+    old float round-trip silently rounded any non-double-representable
+    coefficient (e.g. the ``c·0.5625`` produced by a previous compose in a
+    ``compose_multi`` chain), which broke the exact-fold soundness contract:
+    a chained substitution must be exact on exact backends.
     """
     target_names = target.names
     n_tgt = len(target_names)
@@ -1049,19 +1057,18 @@ def _compose_poly(
         return p
 
     for monom, coeff in poly.terms():
-        c = _coeff_to_float(coeff)
-        if c == 0.0:
+        if coeff == 0:                       # exact zero test on the NATIVE coefficient
             continue
         exp_name = int(monom[name_pos])
         if n_tgt == 0:
-            mono = RationalFunction.constant(c, target)
+            mono = RationalFunction.from_poly(target.ground_new(coeff))
         else:
             tgt_exp = [0] * n_tgt
             for src_pos, exp in enumerate(monom):
                 if exp == 0 or src_pos == name_pos:
                     continue
                 tgt_exp[tgt_index[src_names[src_pos]]] += int(exp)
-            mono = RationalFunction.from_poly(target.from_dict({tuple(tgt_exp): c}))
+            mono = RationalFunction.from_poly(target.from_dict({tuple(tgt_exp): coeff}))
         term = mono if not exp_name else mono * repl_pow(exp_name)
         result = result + term
     return result

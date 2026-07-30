@@ -1,0 +1,309 @@
+"""The EXACT lane of `partial_eval_numeric` (modes exact | hybrid | probe).
+
+The probe-and-freeze fold is probabilistic; since the ``P(T)=I`` affine-invariance
+certificate rides on it, the exact lane certifies constancy by the rational normal
+form of each entry (flint exact-rational arithmetic) and the default (hybrid) path
+WARNS wherever a certificate is issued non-exactly.  These tests pin:
+
+* an exactly-constant rational entry certifies with NO warning;
+* a vertex-dependent entry that a COLLUDING probe set would freeze is REFUTED
+  by the exact check (the unsoundness this lane closes);
+* a non-normalizable (opaque-op) entry falls back to probes WITH the warning;
+* probe-count configurability is honored;
+* the entry-level fold certifies a cancellation no single statement exhibits.
+"""
+from __future__ import annotations
+
+import warnings
+
+import numpy as np
+import pytest
+
+from polyarray import (
+    InvOp,
+    NonExactFoldWarning,
+    OutSpec,
+    Program,
+    Provenance,
+    SymInput,
+    TensordotOp,
+    partial_eval_numeric,
+    partial_eval_numeric_symarray,
+)
+from polyarray.ir import IdentityOp, OutputRef, SymArray
+
+
+def _prov(name: str) -> Provenance:
+    return Provenance("vertex", name, (), name)
+
+
+def _inv_chain_program() -> Program:
+    """The canonical invariant chain: C = A · inv(A) ≡ I (A symbolic everywhere)."""
+    prog = Program("painv", inputs=[SymInput("A", (2, 2), _prov("A"))])
+    prog.emit_stmt(InvOp(), [prog.input("A")], [OutSpec("B", (2, 2))], bulk=False)
+    [C] = prog.emit_stmt(
+        TensordotOp.from_axes(([1], [0])),
+        [prog.input("A"), OutputRef(0, 0)],
+        [OutSpec("C", (2, 2))],
+        bulk=False,
+    )
+    prog.add_output("C", C.cells)
+    return prog
+
+
+def test_exact_constant_certifies_without_warning() -> None:
+    """A·inv(A): every entry's rational normal form is degree-0 (1 or 0) — the exact
+    lane folds it with NO probe and NO warning, in both exact and hybrid modes."""
+    for mode in ("exact", "hybrid"):
+        prog = _inv_chain_program()
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            folded = partial_eval_numeric(prog, mode=mode)
+        assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)], mode
+        rng = np.random.default_rng(7)
+        A = rng.uniform(0.5, 1.5, (2, 2)) + np.eye(2)
+        np.testing.assert_allclose(folded.run({"A": A})["C"], np.eye(2), atol=0.0)
+
+
+def _colluding_program() -> tuple[Program, float]:
+    """A stmt whose output is VERTEX-DEPENDENT yet agrees at every default probe.
+
+    The probe lane (probes=3, seed=0) binds the single ``(1,)`` input to three
+    deterministic draws a, b, c of ``default_rng(0).uniform(0.6, 1.6, (1,))``.
+    The cell q(x) = (x−a)(x−b)(x−c) + 7 evaluates to EXACTLY 7.0 at all three
+    probes (x−a is exact float zero at x==a), so probe-and-freeze folds it — a
+    genuine false freeze.  Returns (program, q(1.0)) with q(1.0) ≠ 7."""
+    prog = Program("collude", inputs=[SymInput("x", (1,), _prov("x"))])
+    x_rf = np.asarray(prog.input_arrays["x"].cells)[0]
+    rng = np.random.default_rng(0)
+    a = float(rng.uniform(0.6, 1.6, (1,))[0])
+    b = float(rng.uniform(0.6, 1.6, (1,))[0])
+    c = float(rng.uniform(0.6, 1.6, (1,))[0])
+    q = (x_rf - a) * (x_rf - b) * (x_rf - c) + 7.0
+    sa = SymArray(np.array([q], dtype=object), program=prog)
+    [Y] = prog.emit_stmt(IdentityOp(), [sa], [OutSpec("Y", (1,))], bulk=False)
+    prog.add_output("Y", Y.cells)
+    true_at_1 = (1.0 - a) * (1.0 - b) * (1.0 - c) + 7.0
+    assert abs(true_at_1 - 7.0) > 1e-3
+    return prog, true_at_1
+
+
+def test_colluding_probes_would_freeze_wrongly_probe_mode() -> None:
+    """mode='probe' (the legacy behavior) IS fooled by the colluding probe set —
+    documenting the unsoundness the exact lane closes."""
+    prog, true_at_1 = _colluding_program()
+    folded = partial_eval_numeric(prog, mode="probe")
+    assert len(folded.statements) == 0                      # wrongly frozen
+    got = np.asarray(folded.run({"x": np.array([1.0])})["Y"], float)
+    np.testing.assert_allclose(got, [7.0])                  # the frozen (WRONG) constant
+    assert abs(got[0] - true_at_1) > 1e-3
+
+
+def test_exact_check_refutes_colluding_probes() -> None:
+    """exact/hybrid: the entry's rational normal form is NON-constant — refuted
+    exactly, the statement survives, and hybrid does NOT hand it to the probe
+    fallback (no warning: a refutation is exact, not a probe certificate)."""
+    for mode in ("exact", "hybrid"):
+        prog, true_at_1 = _colluding_program()
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            folded = partial_eval_numeric(prog, mode=mode)
+        assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)], mode
+        assert len(folded.statements) == 1, mode            # NOT frozen
+        got = np.asarray(folded.run({"x": np.array([1.0])})["Y"], float)
+        np.testing.assert_allclose(got, [true_at_1])        # still the true value
+
+
+class _OpaqueInvariant:
+    """An op the exact lane cannot normalize whose value IS invariant on the probe
+    box: sign(x) + 2 ≡ 3 on x ∈ [0.6, 1.6] (but not globally — sign is opaque)."""
+
+    calls: int = 0
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        type(self).calls += 1
+        return np.sign(np.asarray(x, dtype=float)) + 2.0
+
+
+def _opaque_program() -> Program:
+    prog = Program("opq", inputs=[SymInput("x", (1,), _prov("x"))])
+    [Y] = prog.emit_stmt(_OpaqueInvariant(), [prog.input("x")],
+                         [OutSpec("Y", (1,))], bulk=False)
+    prog.add_output("Y", Y.cells)
+    return prog
+
+
+def test_non_normalizable_entry_falls_back_with_warning() -> None:
+    """hybrid: an opaque op the exact lane cannot execute is probe-frozen — and the
+    fallback is LOUD (NonExactFoldWarning naming the site)."""
+    prog = _opaque_program()
+    with pytest.warns(NonExactFoldWarning, match="PROBE"):
+        folded = partial_eval_numeric(prog, mode="hybrid")
+    assert len(folded.statements) == 0                      # frozen (by probes)
+    got = np.asarray(folded.run({"x": np.array([1.0])})["Y"], float)
+    np.testing.assert_allclose(got, [3.0])
+
+
+def test_exact_mode_refuses_non_normalizable_fold() -> None:
+    """exact: the opaque statement is left symbolic — no probe, no warning."""
+    prog = _opaque_program()
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        folded = partial_eval_numeric(prog, mode="exact")
+    assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
+    assert len(folded.statements) == 1                      # untouched
+
+
+def test_probe_count_configurable() -> None:
+    """``probes`` reaches the probe lane: the opaque op runs once per probe."""
+    for mode in ("probe", "hybrid"):
+        for probes in (2, 5):
+            _OpaqueInvariant.calls = 0
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                partial_eval_numeric(_opaque_program(), mode=mode, probes=probes)
+            assert _OpaqueInvariant.calls == probes, (mode, probes)
+    with pytest.raises(ValueError):
+        partial_eval_numeric(_opaque_program(), probes=1)
+
+
+def test_entry_level_cancellation_certifies_exactly() -> None:
+    """A cancellation that completes only at the ENTRY (no statement invariant):
+    y = x (an identity stmt whose output VARIES), entry = y/x ≡ 1.  The entry-level
+    exact fold certifies the constant; the statement itself survives."""
+    prog = Program("entry", inputs=[SymInput("x", (1,), _prov("x"))])
+    [Y] = prog.emit_stmt(IdentityOp(), [prog.input("x")],
+                         [OutSpec("Y", (1,))], bulk=False)
+    prog.add_output("Y", Y.cells)
+    x_rf = np.asarray(prog.input_arrays["x"].cells)[0]
+    y_rf = np.asarray(Y.cells)[0]
+    sa = SymArray(np.array([y_rf / x_rf], dtype=object), program=prog)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        folded = partial_eval_numeric_symarray(sa, mode="exact")
+    assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
+    vals = np.asarray(folded.evaluate({}), float)           # collapses: entry is constant
+    np.testing.assert_allclose(vals, [1.0])
+
+
+def test_non_dyadic_constant_through_cancellation_is_folded_not_refuted() -> None:
+    """REGRESSION (adversarial audit, 2026-07-30): the old two-point short-circuit
+    evaluated cells by FLOAT term-summation, so a constant-through-cancellation cell
+    with a non-dyadic constant — ``c·p/p`` with ``c = 1/3`` — produced two different
+    floats and was declared "provably non-constant" WITHOUT the exact gcd running.
+    A falsely-refuted statement is excluded from BOTH lanes in hybrid mode, silently
+    gating a genuinely affine-invariant entry False.  The filter now evaluates in
+    EXACT fmpq arithmetic: these cells must classify FOLDED."""
+    from polyarray.exact_fold import _constant_value
+    from polyarray.rational import RationalFunction as RF
+
+    x, y = RF.atom("x"), RF.atom("y")
+    p = x * x + y + x * y
+    for c in (1.0 / 3.0, 7.0 / 3.0):
+        cell = (RF.constant(c) * p) / p
+        assert _constant_value(cell) == c, f"c={c}: constant-through-cancellation refuted"
+    # and genuinely varying cells are still (exactly) refuted by the filter
+    assert _constant_value(p) is None
+    assert _constant_value(p / x) is None
+
+    # statement-level: an IdentityOp over the (1/3)·p/p cell must FOLD in exact mode
+    # (no probe, no warning), with the exact constant as the frozen value.
+    c = 1.0 / 3.0
+    prog = Program("nondyadic", inputs=[SymInput("x", (1,), _prov("x"))])
+    x_rf = np.asarray(prog.input_arrays["x"].cells)[0]
+    q = x_rf * x_rf + x_rf + 1.0                     # strictly positive ⇒ never singular
+    sa = SymArray(np.array([(RF.constant(c) * q) / q], dtype=object), program=prog)
+    [Y] = prog.emit_stmt(IdentityOp(), [sa], [OutSpec("Y", (1,))], bulk=False)
+    prog.add_output("Y", Y.cells)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        folded = partial_eval_numeric(prog, mode="exact")
+    assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
+    assert len(folded.statements) == 0, "constant-through-cancellation stmt must fold"
+    got = np.asarray(folded.run({"x": np.array([2.0])})["Y"], float)
+    np.testing.assert_allclose(got, [c], atol=0.0)
+
+
+def test_time_budget_degrades_to_unresolved_not_hang() -> None:
+    """REGRESSION (re-audit, 2026-07-30): the exact filter/classification must honor
+    ``time_budget`` — a pathological cell degrades to *unresolved* (⇒ the warned
+    probe fallback in hybrid), never a gate hang.  Pinned at three levels."""
+    import time as _time
+
+    from polyarray.exact_fold import _Timeout, _constant_value
+    from polyarray.rational import RationalFunction as RF
+
+    # (1) unit: an expired deadline raises _Timeout before any expensive step.
+    x = RF.atom("x")
+    rf = (RF.constant(1.0 / 3.0) * (x * x + 1.0)) / (x * x + 1.0)
+    with pytest.raises(_Timeout):
+        _constant_value(rf, deadline=_time.monotonic() - 1.0)
+    # no deadline / generous deadline: same exact answer as before.
+    assert _constant_value(rf) == 1.0 / 3.0
+    assert _constant_value(rf, deadline=_time.monotonic() + 60.0) == 1.0 / 3.0
+
+    # (2) end-to-end: time_budget=0 ⇒ the (foldable!) constant-through-cancellation
+    # statement is NOT exact-folded; exact mode leaves it symbolic, silently.
+    def _prog() -> Program:
+        prog = Program("budget", inputs=[SymInput("x", (1,), _prov("x"))])
+        x_rf = np.asarray(prog.input_arrays["x"].cells)[0]
+        q = x_rf * x_rf + x_rf + 1.0
+        sa = SymArray(np.array([(RF.constant(1.0 / 3.0) * q) / q], dtype=object),
+                      program=prog)
+        [Y] = prog.emit_stmt(IdentityOp(), [sa], [OutSpec("Y", (1,))], bulk=False)
+        prog.add_output("Y", Y.cells)
+        return prog
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        folded = partial_eval_numeric(_prog(), mode="exact", time_budget=0.0)
+    assert len(folded.statements) == 1, "expired budget must leave the stmt unresolved"
+    assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
+
+    # (3) hybrid: the unresolved statement goes to the LOUD probe fallback, and the
+    # warning carries the time-budget reason.
+    with pytest.warns(NonExactFoldWarning, match="time budget"):
+        folded = partial_eval_numeric(_prog(), mode="hybrid", time_budget=0.0)
+    assert len(folded.statements) == 0                  # probe-frozen (invariant)
+
+
+def test_chained_compose_is_coefficient_exact() -> None:
+    """REGRESSION for the root cause: ``_compose_poly`` used to round every source
+    coefficient through ``float``, so the SECOND compose of a ``compose_multi`` chain
+    rounded the non-double-representable coefficients the first compose produced
+    (e.g. ``(1/3)·0.5625``).  Substitution must be exact on the exact backend."""
+    from polyarray.rational import RationalFunction as RF
+
+    c = 1.0 / 3.0
+    x, y = RF.atom("x"), RF.atom("y")
+    p = RF.constant(c) * (x * x + y + x * y)
+    e = p.compose_multi({"x": RF.constant(0.75), "y": RF.constant(2.5)})
+    # exact expectation: c·(0.75² + 2.5 + 0.75·2.5) = c·4.9375, cross-multiplied exactly
+    assert e == RF.constant(c) * RF.constant(4.9375)
+
+
+def test_probe_mode_is_silent_and_env_default_is_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mode='probe' keeps the legacy silent behavior; the env var only moves the
+    DEFAULT — an explicit ``mode`` argument always wins."""
+    prog = _opaque_program()
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        partial_eval_numeric(prog, mode="probe")
+    assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
+
+    monkeypatch.setenv("POLYARRAY_PARTIAL_EVAL_MODE", "probe")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        partial_eval_numeric(_opaque_program())             # default from env: probe, silent
+    assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
+    with pytest.warns(NonExactFoldWarning):
+        partial_eval_numeric(_opaque_program(), mode="hybrid")   # explicit wins over env
+
+    with pytest.raises(ValueError):
+        partial_eval_numeric(_opaque_program(), mode="bogus")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
