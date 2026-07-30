@@ -358,7 +358,11 @@ class NonExactFoldWarning(UserWarning)
     #              rational op set + exact Gauss inv/det/solve + sub-Program descent;
     #              numeric-closed subgraphs run their real ops deterministically).
     #              Non-normalizable (opaque-op) statements are left symbolic; provably
-    #              non-constant ones are REFUTED. Time-boxed by `time_budget` seconds.
+    #              non-constant ones are REFUTED. Cost is bounded by BOTH `time_budget`
+    #              (seconds, checked between ops) and an operand-size cap checked BEFORE
+    #              each symbolic op (`exact_fold._MAX_SYM_MASS` monomials — one einsum /
+    #              Gauss pass over RF cells cannot be interrupted mid-flight). Oversized
+    #              or timed-out statements degrade to unresolved ⇒ probe fallback.
     #   "hybrid" — exact first; ONLY unresolved statements fall back to the probe
     #              pass, and every probe freeze raises ONE aggregated
     #              NonExactFoldWarning naming the sites. Exactly-refuted statements
