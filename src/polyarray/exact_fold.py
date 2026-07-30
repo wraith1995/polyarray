@@ -35,9 +35,13 @@ CELL as a rational function of the feed atoms — so an entry whose statement-le
 pieces vary but whose composition cancels (the FEEC motivation) still certifies,
 without any statement being frozen.
 
-The pass is TIME-BOXED (``time_budget`` seconds): rational normal forms can be
-expensive, and a pathological entry must degrade to the (loud) probe fallback rather
-than hang the gate.
+**Bounded cost — TWO knobs, both required.** ``time_budget`` (seconds) is checked
+BETWEEN operations, and ``max_sym_mass`` (:data:`_MAX_SYM_MASS`) caps the monomial mass
+of ONE symbolic op's operands BEFORE it runs.  The time box alone is not enough: a
+single ``np.einsum`` / Gauss pass over object-dtype cells runs to completion inside one
+deadline interval, so a degree-5 element (Bell) could spend an hour in one uninterrupted
+op while nominally under a 10 s budget.  Rejected-by-size and timed-out statements both
+degrade to *unresolved* ⇒ the (loud) probe fallback — never a hang, never a guess.
 """
 from __future__ import annotations
 
@@ -85,6 +89,20 @@ _OPAQUE = object()
 
 # Recursion ceiling for sub-Program descent (mirrors simplify._MAX_DESCENT_DEPTH).
 _MAX_DEPTH = 32
+
+# WORK CAP for ONE exact symbolic op: the total monomial mass (numerator + denominator
+# terms, summed over every symbolic cell) its operands may carry.  The time budget alone
+# cannot bound the exact lane, because a single ``np.einsum`` / Gauss elimination over
+# object-dtype ``RationalFunction`` cells runs to completion INSIDE one deadline
+# interval — the Bell (degree-5, 18-DOF) symbolic Vandermonde stalled the oracle
+# lowering gate for >55 min in one such einsum.  An op whose operands exceed the cap is
+# declared *unresolved* up front (⇒ the warned probe fallback), so the exact lane's cost
+# per statement is bounded BEFORE the expensive work starts, not merely interrupted
+# after it.  Rationale for the size: the entries this lane certifies are small by
+# nature (a vertex-rational Vandermonde entry — Lagrange/FEEC cells measure in the
+# tens of monomials); a five-figure operand mass means the exact route has already lost
+# to the probe route, whatever the wall clock says.
+_MAX_SYM_MASS = 4096
 
 
 class _Timeout(Exception):
@@ -167,6 +185,35 @@ def _exact_eval_at(rf: RationalFunction, k: int) -> RationalFunction:
     return rf.compose_multi(sub)
 
 
+def _rf_mass(rf: RationalFunction) -> int:
+    """Monomial mass of one cell: numerator + denominator term counts."""
+    return int(rf.num.n_terms()) + int(rf.den.n_terms())
+
+
+def _sym_mass(values: Any, cap: int) -> int:
+    """Total monomial mass of ``values`` (an operand / list of operands), counted
+    EARLY-EXIT: accumulation stops as soon as ``cap`` is exceeded, so an enormous
+    operand costs O(cap) to reject rather than O(size) to measure."""
+    total = 0
+    stack = list(values) if isinstance(values, list) else [values]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, RationalFunction):
+            total += _rf_mass(v)
+        else:
+            arr = np.asarray(v)
+            if arr.dtype != object:
+                continue                      # numeric operand — no symbolic mass
+            for c in (arr.reshape(-1) if arr.shape else [arr[()]]):
+                if isinstance(c, RationalFunction):
+                    total += _rf_mass(c)
+                    if total > cap:
+                        return total
+        if total > cap:
+            return total
+    return total
+
+
 def _check_deadline(deadline: float | None) -> None:
     """Raise :class:`_Timeout` when ``deadline`` (monotonic seconds) has passed.
 
@@ -242,17 +289,30 @@ class _Env:
     outs: dict[tuple[int, int], Any] = field(default_factory=dict)
 
 
-def _resolve_rf(rf: RationalFunction, env: _Env, program: Program) -> Any:
+def _resolve_rf(
+    rf: RationalFunction, env: _Env, program: Program, max_sym_mass: int | None = None,
+) -> Any:
     """``rf`` with every resolvable stmt-out atom substituted by its exact value.
 
     Feed atoms (vertex / point / coeff provenance) stay symbolic generators; a
-    stmt-out atom without an exact value makes the whole cell unresolvable."""
+    stmt-out atom without an exact value makes the whole cell unresolvable.
+
+    ``max_sym_mass`` (when given) caps the SUBSTITUTION's monomial mass: one
+    ``compose_multi`` runs uninterrupted, so an oversized replacement set is declared
+    unresolvable up front rather than blowing the time budget from inside."""
     sub: dict[str, RationalFunction] = {}
+    mass = _rf_mass(rf)
     for g in rf.gens:
         if g in env.atom:
             v = env.atom[g]
-            sub[g] = v if isinstance(v, RationalFunction) \
-                else RationalFunction.constant(float(v))
+            if isinstance(v, RationalFunction):
+                if max_sym_mass is not None:
+                    mass += _rf_mass(v)
+                    if mass > max_sym_mass:
+                        return _OPAQUE        # substitution too large for exact work
+                sub[g] = v
+            else:
+                sub[g] = RationalFunction.constant(float(v))
             continue
         try:
             kind = program.env.of(g).kind
@@ -320,7 +380,7 @@ def _fe_is_zero(x: Any) -> bool:
     return x.is_zero() if isinstance(x, RationalFunction) else float(x) == 0.0
 
 
-def _exact_inv(a: np.ndarray) -> np.ndarray:
+def _exact_inv(a: np.ndarray, deadline: float | None = None) -> np.ndarray:
     """Exact Gauss–Jordan inverse over the rational-function field.
 
     Pivots are chosen exactly (structurally non-zero — a non-zero rational function
@@ -338,6 +398,7 @@ def _exact_inv(a: np.ndarray) -> np.ndarray:
     for i in range(n):
         m[i, n + i] = 1.0
     for col in range(n):
+        _check_deadline(deadline)   # per-column: Gauss over RF cells can be slow
         piv = None
         for row in range(col, n):
             if not _fe_is_zero(m[row, col]):
@@ -363,7 +424,7 @@ def _exact_inv(a: np.ndarray) -> np.ndarray:
     return m[:, n:]
 
 
-def _exact_det(a: np.ndarray) -> Any:
+def _exact_det(a: np.ndarray, deadline: float | None = None) -> Any:
     """Exact determinant by fraction-free-ish Gauss elimination over the field."""
     a = np.asarray(a, dtype=object).copy()
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
@@ -371,6 +432,7 @@ def _exact_det(a: np.ndarray) -> Any:
     n = a.shape[0]
     det: Any = 1.0
     for col in range(n):
+        _check_deadline(deadline)
         piv = next((r for r in range(col, n) if not _fe_is_zero(a[r, col])), None)
         if piv is None:
             return 0.0
@@ -388,9 +450,9 @@ def _exact_det(a: np.ndarray) -> Any:
     return det
 
 
-def _exact_solve(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def _exact_solve(a: np.ndarray, b: np.ndarray, deadline: float | None = None) -> np.ndarray:
     b = np.asarray(b, dtype=object)
-    inv = _exact_inv(a)
+    inv = _exact_inv(a, deadline)
     if b.ndim == 1:
         return np.einsum("ij,j->i", inv, b, optimize=False)
     return np.einsum("ij,j...->i...", inv, b, optimize=False)
@@ -406,6 +468,7 @@ def _obj(a: Any) -> np.ndarray:
 
 def _sym_apply(
     fn: Any, args: list[Any], deadline: float, depth: int, reason: _Reason,
+    max_sym_mass: int,
 ) -> list[Any] | None:
     """Execute one op over exact symbolic operands; ``None`` = opaque (no guess)."""
     if isinstance(fn, EinsumStmtOp):
@@ -439,17 +502,17 @@ def _sym_apply(
     if isinstance(fn, ColStackOp):
         return [np.stack([_obj(c).reshape(-1) for c in args], axis=1)]
     if isinstance(fn, InvOp):
-        return [_exact_inv(args[0])]
+        return [_exact_inv(args[0], deadline)]
     if isinstance(fn, InvTransposeOp):
-        return [_exact_inv(args[0]).T]
+        return [_exact_inv(args[0], deadline).T]
     if isinstance(fn, SolveOp):
-        return [_exact_solve(args[0], args[1])]
+        return [_exact_solve(args[0], args[1], deadline)]
     if isinstance(fn, DetOp):
-        return [np.asarray(_exact_det(args[0]), dtype=object)]
+        return [np.asarray(_exact_det(args[0], deadline), dtype=object)]
     if isinstance(fn, Program):
-        return _run_program(fn, args, deadline, depth + 1, reason)
+        return _run_program(fn, args, deadline, depth + 1, reason, max_sym_mass)
     if isinstance(fn, CallOp) and isinstance(fn.fn, Program):
-        return _run_program(fn.fn, args, deadline, depth + 1, reason)
+        return _run_program(fn.fn, args, deadline, depth + 1, reason, max_sym_mass)
     name = type(fn).__name__
     if isinstance(fn, CallOp):
         inner = fn.fn
@@ -482,6 +545,7 @@ def _bind_body_inputs(body: Program, args: list[Any], env: _Env) -> bool:
 
 def _run_program(
     body: Program, args: list[Any], deadline: float, depth: int, reason: _Reason,
+    max_sym_mass: int,
 ) -> list[Any] | None:
     """Recursively execute a sub-program over exact values; ``None`` = opaque."""
     if depth > _MAX_DEPTH:
@@ -492,7 +556,7 @@ def _run_program(
         reason.note("sub-program input binding mismatch (bulk/dynamic input or shape)")
         return None
     for i, stmt in enumerate(body.statements):
-        if not _exec_stmt(body, i, stmt, env, deadline, depth, reason):
+        if not _exec_stmt(body, i, stmt, env, deadline, depth, reason, max_sym_mass):
             return None                       # one opaque stmt poisons the body — no guess
     outs: list[Any] = []
     for sa in body.outputs.values():
@@ -509,7 +573,7 @@ def _run_program(
 
 def _exec_stmt(
     program: Program, i: int, stmt: Stmt, env: _Env, deadline: float, depth: int,
-    reason: _Reason,
+    reason: _Reason, max_sym_mass: int,
 ) -> bool:
     """Execute one statement into ``env``; False when opaque/unresolvable."""
     if time.monotonic() > deadline:
@@ -538,8 +602,20 @@ def _exec_stmt(
             reason.note(f"{type(stmt.fn).__name__} raised on numeric operands")
             return False
     else:
+        # WORK CAP before the expensive symbolic execution: one einsum / Gauss pass over
+        # object-dtype RF cells cannot be interrupted mid-flight, so oversized operands
+        # are rejected UP FRONT (⇒ unresolved ⇒ the warned probe fallback).  Sub-program
+        # bodies are exempt here — their own statements are capped individually as they
+        # execute, which is the finer (and cheaper) granularity.
+        if not isinstance(stmt.fn, (Program, CallOp)):
+            mass = _sym_mass(args, max_sym_mass)
+            if mass > max_sym_mass:
+                reason.note(
+                    f"operands too large for exact execution ({type(stmt.fn).__name__}: "
+                    f"monomial mass > {max_sym_mass})")
+                return False
         try:
-            outs = _sym_apply(stmt.fn, args, deadline, depth, reason)
+            outs = _sym_apply(stmt.fn, args, deadline, depth, reason, max_sym_mass)
         except _Timeout:
             raise
         except Exception as exc:  # noqa: BLE001 — symbolic twin failed ⇒ opaque, never a guess
@@ -574,8 +650,15 @@ def _exec_stmt(
 # Entry points (consumed by simplify)
 # ---------------------------------------------------------------------------
 
-def exact_partial_eval(program: Program, *, time_budget: float) -> ExactState:
+def exact_partial_eval(
+    program: Program, *, time_budget: float, max_sym_mass: int = _MAX_SYM_MASS,
+) -> ExactState:
     """One exact pass over ``program``: fold / refute / leave-unresolved each Stmt.
+
+    Cost is bounded by BOTH knobs: ``time_budget`` (seconds, checked between
+    operations) and ``max_sym_mass`` (:data:`_MAX_SYM_MASS` — the monomial mass one
+    symbolic op's operands may carry, checked BEFORE the op runs, because a single
+    object-dtype einsum / Gauss pass cannot be interrupted mid-flight).
 
     Never raises on op content — every failure mode degrades to ``unresolved``
     (which ``mode="hybrid"`` hands to the loud probe fallback)."""
@@ -588,7 +671,7 @@ def exact_partial_eval(program: Program, *, time_budget: float) -> ExactState:
     for i, stmt in enumerate(program.statements):
         reason.value = None                    # fresh slate per top-level statement
         try:
-            ok = _exec_stmt(program, i, stmt, env, deadline, 0, reason)
+            ok = _exec_stmt(program, i, stmt, env, deadline, 0, reason, max_sym_mass)
         except _Timeout:
             for j in range(i, len(program.statements)):
                 state.unresolved[j] = "time budget exhausted"
@@ -668,7 +751,7 @@ def exact_partial_eval(program: Program, *, time_budget: float) -> ExactState:
 
 def exact_fold_cells(
     cells: np.ndarray, state: ExactState, program: Program, *,
-    time_budget: float,
+    time_budget: float, max_sym_mass: int = _MAX_SYM_MASS,
 ) -> np.ndarray:
     """ENTRY-LEVEL exact fold of an output cell array.
 
@@ -695,7 +778,11 @@ def exact_fold_cells(
             continue
         if time.monotonic() > deadline:
             break
-        v = _resolve_rf(c, env, program)
+        # WORK CAP on the substitution too: `_resolve_rf` composes the (possibly huge)
+        # statement values into this cell, and one `compose_multi` runs uninterrupted.
+        if _rf_mass(c) > max_sym_mass:
+            continue
+        v = _resolve_rf(c, env, program, max_sym_mass)
         if v is _OPAQUE or not isinstance(v, RationalFunction):
             continue
         try:

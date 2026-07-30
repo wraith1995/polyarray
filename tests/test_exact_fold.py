@@ -267,6 +267,53 @@ def test_time_budget_degrades_to_unresolved_not_hang() -> None:
     assert len(folded.statements) == 0                  # probe-frozen (invariant)
 
 
+def test_oversized_symbolic_op_is_rejected_before_it_runs() -> None:
+    """REGRESSION (oracle lowering stall, 2026-07-30): the time budget alone cannot
+    bound the exact lane — ONE ``np.einsum`` over object-dtype RF cells runs to
+    completion inside a single deadline interval (Bell's degree-5 symbolic W stalled
+    the oracle pyab-lowering gate >55 min under a nominal 10 s budget).  Operands
+    above ``max_sym_mass`` must be rejected BEFORE the op runs ⇒ unresolved ⇒ the
+    warned probe fallback."""
+    from polyarray.exact_fold import _MAX_SYM_MASS, _sym_mass, exact_partial_eval
+    from polyarray.rational import RationalFunction as RF
+
+    # A cell with many monomials: (x + y + 1)^8 has 45 terms; mass counting early-exits.
+    x, y = RF.atom("x"), RF.atom("y")
+    big = (x + y + 1.0) ** 8
+    assert _sym_mass([np.array([big], dtype=object)], 10) > 10        # early-exit works
+    assert _sym_mass([np.array([big], dtype=object)], 10**6) == big.num.n_terms() + 1
+
+    prog = Program("big", inputs=[SymInput("x", (1,), _prov("x"))])
+    x_rf = np.asarray(prog.input_arrays["x"].cells)[0]
+    cell = (x_rf + 1.0) ** 6
+    sa = SymArray(np.array([cell], dtype=object), program=prog)
+    [Y] = prog.emit_stmt(IdentityOp(), [sa], [OutSpec("Y", (1,))], bulk=False)
+    prog.add_output("Y", Y.cells)
+
+    # A cap BELOW this operand's mass ⇒ unresolved with the size reason (not executed).
+    state = exact_partial_eval(prog, time_budget=60.0, max_sym_mass=2)
+    assert 0 in state.unresolved
+    assert "too large" in state.unresolved[0]
+    assert not state.folded and not state.refuted
+    # The production cap admits it (an ordinary small cell), and it is exactly refuted.
+    state = exact_partial_eval(prog, time_budget=60.0, max_sym_mass=_MAX_SYM_MASS)
+    assert state.refuted == {0} and not state.unresolved
+
+    # hybrid: a size-rejected but genuinely INVARIANT statement (``(x+1)⁶/(x+1)⁶ ≡ 1``,
+    # left uncancelled) reaches the LOUD probe fallback and is frozen there.
+    prog2 = Program("bigconst", inputs=[SymInput("x", (1,), _prov("x"))])
+    x2 = np.asarray(prog2.input_arrays["x"].cells)[0]
+    ratio = ((x2 + 1.0) ** 6) / ((x2 + 1.0) ** 6)
+    sa2 = SymArray(np.array([ratio], dtype=object), program=prog2)
+    [Y2] = prog2.emit_stmt(IdentityOp(), [sa2], [OutSpec("Y", (1,))], bulk=False)
+    prog2.add_output("Y", Y2.cells)
+    with pytest.warns(NonExactFoldWarning, match="too large"):
+        folded = partial_eval_numeric(prog2, mode="hybrid", max_sym_mass=2)
+    assert len(folded.statements) == 0                      # probe-frozen
+    np.testing.assert_allclose(
+        np.asarray(folded.run({"x": np.array([3.0])})["Y"], float), [1.0])
+
+
 def test_chained_compose_is_coefficient_exact() -> None:
     """REGRESSION for the root cause: ``_compose_poly`` used to round every source
     coefficient through ``float``, so the SECOND compose of a ``compose_multi`` chain

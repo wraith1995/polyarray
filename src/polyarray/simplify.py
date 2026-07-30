@@ -775,7 +775,7 @@ def _warn_probe_freezes(
 
 def _partial_eval_numeric(
     program: Program, *, probes: int, seed: int, rtol: float, atol: float,
-    mode: str = "probe", time_budget: float = 10.0,
+    mode: str = "probe", time_budget: float = 10.0, max_sym_mass: int | None = None,
 ) -> tuple[Program, dict, Any]:
     """Partial evaluation folding every Stmt whose outputs are INVARIANT under the
     program's symbolic inputs — by exact normalization, probing, or both (``mode``).
@@ -826,8 +826,10 @@ def _partial_eval_numeric(
     foldable: set[int] = set()
     exact_state = None
     if mode in ("exact", "hybrid"):
-        from .exact_fold import exact_partial_eval
-        exact_state = exact_partial_eval(program, time_budget=time_budget)
+        from .exact_fold import _MAX_SYM_MASS, exact_partial_eval
+        exact_state = exact_partial_eval(
+            program, time_budget=time_budget,
+            max_sym_mass=_MAX_SYM_MASS if max_sym_mass is None else max_sym_mass)
         known.update(exact_state.known)
         foldable |= exact_state.folded
 
@@ -896,6 +898,7 @@ def partial_eval_numeric(
     program: Program, *, probes: int = 3, seed: int = 0,
     rtol: float = 1e-9, atol: float = 1e-12,
     mode: str | None = None, time_budget: float = 10.0,
+    max_sym_mass: int | None = None,
 ) -> Program:
     """Fold every Stmt whose outputs are invariant under the program's symbolic
     inputs — see :func:`_partial_eval_numeric` for the mechanics.
@@ -913,12 +916,16 @@ def partial_eval_numeric(
 
     ``mode=None`` reads the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default (else
     ``"hybrid"``); the explicit parameter always wins.  ``probes`` configures the
-    probe count of the probe/hybrid-fallback lanes.  ``time_budget`` (seconds)
-    bounds the exact lane — on expiry the remaining statements degrade to the
-    (warned) probe fallback rather than hang."""
+    probe count of the probe/hybrid-fallback lanes.  ``time_budget`` (seconds,
+    checked BETWEEN operations) and ``max_sym_mass`` (the monomial mass one symbolic
+    op's operands may carry, checked BEFORE it runs — an object-dtype einsum / Gauss
+    pass is uninterruptible once started) JOINTLY bound the exact lane: oversized or
+    timed-out statements degrade to the (warned) probe fallback rather than hang.
+    ``max_sym_mass=None`` uses ``exact_fold._MAX_SYM_MASS``."""
     new, _known, _state = _partial_eval_numeric(
         program, probes=probes, seed=seed, rtol=rtol, atol=atol,
-        mode=_resolve_partial_eval_mode(mode), time_budget=time_budget)
+        mode=_resolve_partial_eval_mode(mode), time_budget=time_budget,
+        max_sym_mass=max_sym_mass)
     return new
 
 
@@ -926,6 +933,7 @@ def partial_eval_numeric_symarray(
     sa: SymArray, *, probes: int = 3, seed: int = 0,
     rtol: float = 1e-9, atol: float = 1e-12,
     mode: str | None = None, time_budget: float = 10.0,
+    max_sym_mass: int | None = None,
 ) -> SymArray:
     """:func:`partial_eval_numeric` for a ``SymArray`` whose CELLS reference the
     program's atoms (e.g. a symbolic Vandermonde whose cells are ``grass_dof.result``
@@ -936,7 +944,8 @@ def partial_eval_numeric_symarray(
     (:func:`polyarray.exact_fold.exact_fold_cells`): a cell is certified constant iff
     its rational normal form over the feed atoms has total degree zero — so a
     cancellation that completes only at the entry (no single statement invariant)
-    still folds, exact-by-construction.  ``mode``/``probes``/``time_budget`` as in
+    still folds, exact-by-construction.  ``mode``/``probes``/``time_budget``/
+    ``max_sym_mass`` as in
     :func:`partial_eval_numeric`."""
     from .ir import SymArray
     if sa.program is None:
@@ -944,11 +953,13 @@ def partial_eval_numeric_symarray(
     mode_r = _resolve_partial_eval_mode(mode)
     new, known, state = _partial_eval_numeric(
         sa.program, probes=probes, seed=seed, rtol=rtol, atol=atol,
-        mode=mode_r, time_budget=time_budget)
+        mode=mode_r, time_budget=time_budget, max_sym_mass=max_sym_mass)
     cells = _fold_cells(np.asarray(sa.cells), known)
     if state is not None:
-        from .exact_fold import exact_fold_cells
-        cells = exact_fold_cells(cells, state, sa.program, time_budget=time_budget)
+        from .exact_fold import _MAX_SYM_MASS, exact_fold_cells
+        cells = exact_fold_cells(
+            cells, state, sa.program, time_budget=time_budget,
+            max_sym_mass=_MAX_SYM_MASS if max_sym_mass is None else max_sym_mass)
     folded = _numify_constant_cells(cells)
     return SymArray(folded, program=new)
 
