@@ -1894,6 +1894,7 @@ class AssertOp:
     * ``"rank_eq"``        — ``int(rest[0]) == int(rest[1])`` (δ vs asserted)
     * ``"spd"``            — ``x`` is symmetric positive-definite
     * ``"square_full_rank"`` — ``x`` is square and full rank
+    * ``"in_span"``        — ``x`` lies in the column span of ``rest[0]`` (exact projection)
 
     On failure raises ``AssertionError(msg + detail)``; ``msg`` is the
     caller-supplied prefix.
@@ -1921,6 +1922,25 @@ class AssertOp:
                 x.ndim == 2 and x.shape[0] == x.shape[1] and _full_rank(x),
                 self.msg,
                 f"[square_full_rank] shape={x.shape}",
+            )
+        elif self.kind == "in_span":
+            # `x` (a vector) lies in the column span of `rest[0]` (a frame `P`), i.e. the
+            # projection onto that subspace is EXACT.  A consumer that realizes `P` in a
+            # non-canonical ambient basis needs this: `pinv(P)` projects along the AMBIENT
+            # orthogonal complement, so the answer is ambient-basis-dependent UNLESS the residual
+            # is zero, in which case `pinv(P)·x` is the unique exact coordinate vector and every
+            # ambient basis agrees.  Guarding at run time is what makes that substitution honest.
+            P = np.asarray(rest[0], dtype=float)
+            v = np.asarray(x, dtype=float).reshape(-1)
+            resid = v - P @ (np.linalg.pinv(P) @ v)
+            scale = max(float(np.linalg.norm(v)), 1.0)
+            _check(
+                float(np.linalg.norm(resid)) <= 1e-9 * scale,
+                self.msg,
+                f"[in_span] residual {float(np.linalg.norm(resid)):.3e} "
+                f"(relative {float(np.linalg.norm(resid)) / scale:.3e}) — the operand does NOT lie "
+                f"in the subspace, so projecting it in a non-canonical ambient basis would change "
+                f"the answer (the complement direction is ambient-basis-dependent)",
             )
         else:
             raise ValueError(f"AssertOp: unknown kind {self.kind!r}")

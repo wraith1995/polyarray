@@ -352,5 +352,143 @@ def test_probe_mode_is_silent_and_env_default_is_overridden(
         partial_eval_numeric(_opaque_program(), mode="bogus")
 
 
+# ---------------------------------------------------------------------------
+# The vmap-closure descent + the front-end-op rational twins (2026-07-31).
+#
+# Before these, a vmap closure was OPAQUE to the exact lane and everything downstream of
+# it fell back to probe-and-freeze (measured: 1120 of 1180 statements of the P⁻₂Λ¹(TET)
+# symbolic Vandermonde, all inside `grass_dof` vmap bodies).
+# ---------------------------------------------------------------------------
+
+def _vmap_inv_chain_program(batch: int = 3, n: int = 2) -> Program:
+    """``vmap(A ↦ A·inv(A))`` over a batched symbolic ``A`` — every output entry is
+    identically ``I``, but ONLY the descent into the closure can see that."""
+    from polyarray.ir import vmap
+
+    body = Program("inv_body", inputs=[SymInput("A", (n, n), _prov("A"))])
+    body.emit_stmt(InvOp(), [body.input("A")], [OutSpec("B", (n, n))], bulk=False)
+    [C] = body.emit_stmt(
+        TensordotOp.from_axes(([1], [0])),
+        [body.input("A"), OutputRef(0, 0)],
+        [OutSpec("C", (n, n))],
+        bulk=False,
+    )
+    body.add_output("C", C.cells)
+
+    prog = Program("vmap_inv", inputs=[SymInput("Ab", (batch, n, n), _prov("Ab"))])
+    [out] = prog.emit_stmt(
+        vmap(body, in_axes=(0,), out_axes=0), [prog.input("Ab")],
+        [OutSpec("R", (batch, n, n))], bulk=False,
+    )
+    prog.add_output("R", out.cells)
+    return prog
+
+
+def test_vmap_closure_descends_and_certifies_exactly() -> None:
+    """The batched ``A·inv(A) ≡ I`` folds EXACTLY through the closure — no probe, no
+    warning — and the folded program still returns ``I`` on real feeds."""
+    prog = _vmap_inv_chain_program()
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        folded = partial_eval_numeric(prog, mode="exact")
+    assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
+    rng = np.random.default_rng(3)
+    Ab = rng.uniform(0.5, 1.5, (3, 2, 2)) + np.eye(2)
+    np.testing.assert_allclose(folded.run({"Ab": Ab})["R"],
+                               np.broadcast_to(np.eye(2), (3, 2, 2)), atol=0.0)
+
+
+def test_vmap_batch_cap_bounds_the_work_before_it_starts() -> None:
+    """A batch over the cap is declared unresolved UP FRONT (⇒ the warned probe
+    fallback), never descended: the Bell-stall rule — an uninterruptible op ignores a
+    deadline, so the work is bounded before it starts, not interrupted after."""
+    import polyarray.exact_fold as EF
+
+    prog = _vmap_inv_chain_program(batch=4)
+    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    assert st.folded == {0}, st.unresolved                  # under the cap: descends
+
+    prog = _vmap_inv_chain_program(batch=4)
+    st = EF.exact_partial_eval(prog, time_budget=30.0, max_sym_mass=EF._MAX_SYM_MASS)
+    saved, EF._MAX_VMAP_BATCH = EF._MAX_VMAP_BATCH, 2
+    try:
+        st = EF.exact_partial_eval(_vmap_inv_chain_program(batch=4), time_budget=30.0)
+    finally:
+        EF._MAX_VMAP_BATCH = saved
+    assert 0 in st.unresolved and "batch 4" in st.unresolved[0], st.unresolved
+
+
+def test_pinv_twin_is_the_exact_generic_pseudo_inverse() -> None:
+    """``pinv(A)·A ≡ I`` for a symbolic TALL ``A`` — the exact twin is the
+    normal-equation form ``(AᵀA)⁻¹Aᵀ``, so the composition folds to the identity."""
+    from polyarray.ir import EinsumStmtOp, PinvOp
+
+    prog = Program("pinv_chain", inputs=[SymInput("A", (3, 2), _prov("A"))])
+    prog.emit_stmt(PinvOp(), [prog.input("A")], [OutSpec("P", (2, 3))], bulk=False)
+    [C] = prog.emit_stmt(
+        EinsumStmtOp("kn,nj->kj"), [OutputRef(0, 0), prog.input("A")],
+        [OutSpec("C", (2, 2))], bulk=False,
+    )
+    prog.add_output("C", C.cells)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        folded = partial_eval_numeric(prog, mode="exact")
+    assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
+    A = np.array([[1.0, 0.3], [0.2, 1.0], [0.4, 0.7]])
+    np.testing.assert_allclose(folded.run({"A": A})["C"], np.eye(2), atol=1e-12)
+
+
+def test_project_embed_axislen_twins_are_exact() -> None:
+    """``Project`` / ``Embed`` / ``AxisLen`` thread exact cells: with an ORTHONORMAL
+    (constant) frame ``P``, ``Pᵀ·(P·v) ≡ v`` — the round trip folds away entirely, and
+    the axis length is exact even over a fully symbolic operand."""
+    from polyarray.ir import AxisLenOp, Const, EmbedOp, ProjectOp
+
+    P = np.array([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]])
+    prog = Program("proj_embed", inputs=[SymInput("v", (2,), _prov("v"))])
+    [amb] = prog.emit_stmt(
+        EmbedOp((3,)), [Const(P), prog.input("v")], [OutSpec("amb", (3,))], bulk=False)
+    [back] = prog.emit_stmt(
+        ProjectOp(), [Const(P), OutputRef(0, 0)], [OutSpec("back", (2,))], bulk=False)
+    [n] = prog.emit_stmt(
+        AxisLenOp(0), [OutputRef(0, 0)], [OutSpec("n", ())], bulk=False)
+    prog.add_output("back", back.cells)
+    prog.add_output("n", n.cells)
+    import polyarray.exact_fold as EF
+    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    assert st.folded == {2}, (st.folded, st.unresolved)     # AxisLen is CONSTANT (=3)
+    assert st.refuted == {0, 1}, (st.refuted, st.unresolved)  # embed/project vary with v
+    v = np.array([0.3, -1.25])
+    out = prog.run({"v": v})
+    np.testing.assert_allclose(out["back"], v, atol=0.0)
+    assert float(np.asarray(out["n"])) == 3.0
+    assert amb is not None
+
+
+def test_assert_twin_passes_the_value_through_and_still_checks() -> None:
+    """The ``AssertOp`` twin is value-transparent on a symbolic operand (so the guard's
+    Stmt survives to run on real data) and still RAISES ⇒ opaque on a decidable failure."""
+    from polyarray.ir import AssertOp
+    import polyarray.exact_fold as EF
+
+    prog = Program("assert_ok", inputs=[SymInput("A", (2, 2), _prov("A"))])
+    [x] = prog.emit_stmt(
+        AssertOp("square_full_rank", "guard"), [prog.input("A")],
+        [OutSpec("X", (2, 2))], bulk=False)
+    prog.add_output("X", x.cells)
+    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    assert st.refuted == {0} and not st.unresolved          # value threaded, not opaque
+
+    bad = Program("assert_bad", inputs=[SymInput("A", (2, 2), _prov("A"))])
+    a = np.asarray(bad.input_arrays["A"].cells)
+    sing = SymArray(np.array([[a[0, 0], a[0, 0]], [a[1, 0], a[1, 0]]], dtype=object),
+                    program=bad)                            # structurally singular
+    [y] = bad.emit_stmt(
+        AssertOp("square_full_rank", "guard"), [sing], [OutSpec("Y", (2, 2))], bulk=False)
+    bad.add_output("Y", y.cells)
+    st = EF.exact_partial_eval(bad, time_budget=30.0)
+    assert 0 in st.unresolved, st                            # decidable failure ⇒ opaque
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

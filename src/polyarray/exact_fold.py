@@ -53,6 +53,8 @@ import numpy as np
 
 from .ir import (
     AddOp,
+    AssertOp,
+    AxisLenOp,
     CallOp,
     ColStackOp,
     ConcatOp,
@@ -60,15 +62,20 @@ from .ir import (
     DetOp,
     EinsumOp,
     EinsumStmtOp,
+    EmbedOp,
     HStackOp,
     IdentityOp,
     InputRef,
     IntAtomRef,
     InvOp,
     InvTransposeOp,
+    KronFreeOp,
+    KronOp,
     MoveaxisOp,
     OutputRef,
+    PinvOp,
     Program,
+    ProjectOp,
     RationalRef,
     ReshapeOp,
     ScaleByOp,
@@ -103,6 +110,15 @@ _MAX_DEPTH = 32
 # tens of monomials); a five-figure operand mass means the exact route has already lost
 # to the probe route, whatever the wall clock says.
 _MAX_SYM_MASS = 4096
+
+# WORK CAP for ONE vmap-closure descent: the number of BODY EXECUTIONS it may start.
+# Descending a vmap multiplies the exact work by the batch size — the batched operand's
+# monomial mass is still bounded by ``_MAX_SYM_MASS`` (that is the SUM over the slices, so the
+# total symbolic work stays inside the same box), but each slice also pays the body's fixed
+# per-statement overhead, and one slice's flint arithmetic cannot be interrupted.  So the batch
+# itself is bounded BEFORE the loop starts (the Bell-stall lesson: an uninterruptible op
+# ignores a deadline).  Over the cap ⇒ *unresolved* ⇒ the warned probe fallback.
+_MAX_VMAP_BATCH = 512
 
 
 class _Timeout(Exception):
@@ -458,6 +474,86 @@ def _exact_solve(a: np.ndarray, b: np.ndarray, deadline: float | None = None) ->
     return np.einsum("ij,j...->i...", inv, b, optimize=False)
 
 
+def _exact_pinv(a: np.ndarray, deadline: float | None = None) -> np.ndarray:
+    """The GENERIC (full-rank) pseudo-inverse over the rational-function field.
+
+    ``A⁺ = (AᵀA)⁻¹Aᵀ`` for a tall/square ``A``, ``Aᵀ(AAᵀ)⁻¹`` for a wide one — the
+    normal-equation form, which EQUALS the Moore–Penrose pseudo-inverse exactly where ``A``
+    has full rank.  This is the same *generic-inverse* semantics :func:`_exact_inv` /
+    :func:`_exact_solve` already carry (the identity holds identically wherever the Gram
+    determinant is non-zero); ``_exact_inv`` raises on a structurally singular Gram, so a
+    rank-deficient-by-construction ``A`` goes OPAQUE rather than being guessed.
+
+    NOT equal to ``np.linalg.pinv`` on a rank-DEFICIENT matrix: the Moore–Penrose inverse is
+    discontinuous at a rank drop and is *not* a rational function of the entries, so no exact
+    twin of it can exist.  The exact lane therefore certifies the generic branch only — and the
+    numeric lane (``PinvOp.__call__``) is unaffected.
+    """
+    a = np.asarray(a, dtype=object)
+    if a.ndim != 2:
+        raise ValueError(f"exact pinv needs a matrix, got shape {a.shape}")
+    n, k = a.shape
+    if n >= k:                                        # tall/square: (AᵀA)⁻¹Aᵀ
+        gram = np.einsum("ik,il->kl", a, a, optimize=False)
+        return _exact_solve(gram, a.T, deadline)
+    gram = np.einsum("ik,jk->ij", a, a, optimize=False)   # wide: Aᵀ(AAᵀ)⁻¹
+    return np.einsum("ik,ij->kj", a, _exact_inv(gram, deadline), optimize=False)
+
+
+def _exact_assert(fn: AssertOp, args: list[Any], deadline: float | None) -> list[Any]:
+    """The passthrough twin of :class:`~polyarray.AssertOp` over symbolic operands.
+
+    ``AssertOp`` VALUE-wise returns its first input unchanged; the predicate is a guard.  This
+    twin reproduces the value and re-checks every predicate that is DECIDABLE over the
+    rational-function field, raising (⇒ opaque, never a silent pass) when a decidable check
+    fails:
+
+    * ``shape_eq``          — structural, always decidable;
+    * ``rank_eq``           — decidable when both operands resolve to exact constants; else
+                              opaque (a rank is an integer, so a non-constant one is a bug,
+                              not a case to guess through);
+    * ``square_full_rank``  — squareness structurally, full rank as the exact ``det ≠ 0``
+                              (GENERIC rank — the ``_exact_inv`` semantics);
+    * ``spd``               — exact SYMMETRY (decidable: ``A = Aᵀ`` as rational functions) plus
+                              generic non-singularity.  **Positive-definiteness itself is a
+                              real INEQUALITY, not decidable over the rational-function field**,
+                              so the twin does not certify it.  This is the one place the exact
+                              lane is weaker than the numeric op it stands in for; it is a
+                              build-time certificate over a symbolic cell, and the runtime
+                              ``AssertOp`` still runs the true test on real data whenever the
+                              statement survives (a symbolic, non-constant operand is *refuted*,
+                              never folded away).  Flagged for review rather than hidden.
+    """
+    x = np.asarray(args[0])
+    if fn.kind == "shape_eq":
+        other = np.asarray(args[1])
+        if x.shape != other.shape:
+            raise AssertionError(f"{fn.msg} [shape_eq] {x.shape} != {other.shape}")
+    elif fn.kind == "rank_eq":
+        a, b = _cell_constant(np.asarray(args[1])[()], deadline), \
+            _cell_constant(np.asarray(args[2])[()], deadline)
+        if a is None or b is None:
+            raise ValueError("exact AssertOp(rank_eq): non-constant rank operand")
+        if int(a) != int(b):
+            raise AssertionError(f"{fn.msg} [rank_eq] {int(a)} != {int(b)}")
+    elif fn.kind in ("spd", "square_full_rank"):
+        if x.ndim != 2 or x.shape[0] != x.shape[1]:
+            raise AssertionError(f"{fn.msg} [{fn.kind}] shape={x.shape}")
+        if fn.kind == "spd":
+            xo = _obj(x)
+            for idx in np.ndindex(*x.shape):
+                # Exact equality (no tolerance) — a float cell carrying fp noise therefore
+                # raises ⇒ OPAQUE, the safe direction (less folding, never a false pass).
+                if not _fe_is_zero(xo[idx] - xo[idx[::-1]]):
+                    raise AssertionError(f"{fn.msg} [spd] matrix not symmetric at {idx}")
+        det = _exact_det(x, deadline)
+        if _fe_is_zero(det):
+            raise AssertionError(f"{fn.msg} [{fn.kind}] structurally singular")
+    else:
+        raise ValueError(f"AssertOp: unknown kind {fn.kind!r}")
+    return [x]
+
+
 def _obj(a: Any) -> np.ndarray:
     """An operand as an object ndarray (einsum over mixed float/RF cells)."""
     arr = np.asarray(a)
@@ -509,10 +605,65 @@ def _sym_apply(
         return [_exact_solve(args[0], args[1], deadline)]
     if isinstance(fn, DetOp):
         return [np.asarray(_exact_det(args[0], deadline), dtype=object)]
+    if isinstance(fn, PinvOp):
+        return [_exact_pinv(args[0], deadline)]
+    if isinstance(fn, ProjectOp):
+        # ``Pᵀ @ v.reshape(-1)`` — the grassmann-origin drop-complement matvec.  Pure field
+        # arithmetic (no float coercion, unlike ``ProjectOp.__call__``'s numeric contract), so
+        # it threads RF cells exactly.
+        return [np.einsum("nr,n->r", _obj(args[0]), _obj(args[1]).reshape(-1), optimize=False)]
+    if isinstance(fn, EmbedOp):
+        # ``(P @ vsub).reshape(op.shape)`` — the ambient reconstruction.
+        out = np.einsum("ij,j...->i...", _obj(args[0]), _obj(args[1]), optimize=False)
+        return [out.reshape(fn.shape) if fn.shape else out]
+    if isinstance(fn, KronOp):
+        # Chained Kronecker product — pure field MULTIPLICATION of entries, so it threads
+        # RationalFunction cells exactly (unlike `KronOp.__call__`, which coerces to float).
+        # STRICTLY 2-D only: the twin below is the matrix Kronecker product, and a non-matrix
+        # operand would silently produce a wrong SHAPE (which does not fail here — it fails far
+        # downstream in an unrelated einsum's arity check).  Anything else falls through to the
+        # opaque tail, i.e. exactly the pre-existing behaviour.
+        mats = [_obj(a) for a in args]
+        if any(m.ndim != 2 for m in mats):
+            reason.note(f"KronOp over non-matrix operands (ndim={[m.ndim for m in mats]})")
+            return None
+        out = mats[0]
+        for m in mats[1:]:
+            out = (out[:, None, :, None] * m[None, :, None, :]).reshape(
+                out.shape[0] * m.shape[0], out.shape[1] * m.shape[1])
+        return [out]
+    if isinstance(fn, KronFreeOp):
+        # The Kron block with trailing free axes — the same elementwise product as
+        # `KronFreeOp.__call__`, done in object dtype so exact cells survive.  Leaving this
+        # un-normalizable made the exact lane refuse every FEEC `Λᵏ` certificate: the wedge's
+        # two traced slots meet in exactly this op, so `KronFreeOp` sat directly on the result
+        # path with NOTHING irrational about it (a Kronecker product is field arithmetic).
+        F, G = _obj(args[0]), _obj(args[1])
+        # Mirror `KronFreeOp.__call__`'s shape contract exactly: each operand is
+        # ``(dom, cod, *free)`` with the declared free-axis counts.  A mismatch would build a
+        # wrong-shaped result that only fails much later, so verify before committing.
+        if (F.ndim != 2 + fn.nf_free) or (G.ndim != 2 + fn.ng_free):
+            reason.note(f"KronFreeOp operand rank mismatch (F.ndim={F.ndim}, G.ndim={G.ndim}, "
+                        f"nf_free={fn.nf_free}, ng_free={fn.ng_free})")
+            return None
+        df, cf, ff = F.shape[0], F.shape[1], F.shape[2:]
+        dg, cg, gg = G.shape[0], G.shape[1], G.shape[2:]
+        fr = F.reshape(df, 1, cf, 1, *ff, *([1] * fn.ng_free))
+        gr = G.reshape(1, dg, 1, cg, *([1] * fn.nf_free), *gg)
+        return [(fr * gr).reshape(df * dg, cf * cg, *ff, *gg)]
+    if isinstance(fn, AxisLenOp):
+        # A STRUCTURAL read: the operand's static axis length, independent of its cells — so it
+        # is exact (and constant) even when the operand is fully symbolic.
+        return [np.asarray(float(np.asarray(args[0]).shape[fn.axis]))]
+    if isinstance(fn, AssertOp):
+        return _exact_assert(fn, args, deadline)
     if isinstance(fn, Program):
         return _run_program(fn, args, deadline, depth + 1, reason, max_sym_mass)
     if isinstance(fn, CallOp) and isinstance(fn.fn, Program):
         return _run_program(fn.fn, args, deadline, depth + 1, reason, max_sym_mass)
+    closure = _vmap_closure(fn)
+    if closure is not None:
+        return _run_vmap(closure, args, deadline, depth, reason, max_sym_mass)
     name = type(fn).__name__
     if isinstance(fn, CallOp):
         inner = fn.fn
@@ -521,6 +672,97 @@ def _sym_apply(
         name = f"vmap closure ({name})"
     reason.note(f"opaque op {name} on the symbolic path")
     return None                               # opaque: QR / SVD / sqrt / vmap / front-end op
+
+
+def _vmap_closure(fn: Any) -> tuple[Program, tuple, tuple] | None:
+    """``(body, in_axes, out_axes)`` when ``fn`` is a REBUILDABLE vmap closure, else ``None``.
+
+    Mirrors ``simplify._is_rebuildable_vmap``: all three attributes must be present (a
+    front-end wrapper exposing only ``_vmap_body``, without the axis tuples, is NOT
+    descendable — the slicing would be a guess).  ``CallOp``-wrapped closures are unwrapped.
+    """
+    inner = fn.fn if isinstance(fn, CallOp) else fn
+    body = getattr(inner, "_vmap_body", None)
+    in_axes = getattr(inner, "_in_axes", None)
+    out_axes = getattr(inner, "_out_axes", None)
+    if not isinstance(body, Program) or in_axes is None or out_axes is None:
+        return None
+    return body, tuple(in_axes), tuple(out_axes)
+
+
+def _run_vmap(
+    closure: tuple[Program, tuple, tuple], args: list[Any], deadline: float, depth: int,
+    reason: _Reason, max_sym_mass: int,
+) -> list[Any] | None:
+    """Exact descent INTO a vmap closure — the batched twin of :func:`_run_program`.
+
+    Reproduces ``ir.vmap``'s own semantics exactly (slice each batched operand along its
+    ``in_axes`` entry, run the body per slice, ``np.stack`` on ``out_axes``), but over exact
+    values, so the certificate no longer stops at the closure boundary.
+
+    COST IS BOUNDED BEFORE THE LOOP STARTS (the Bell-stall rule — an uninterruptible flint op
+    ignores a deadline): the batched operands' total monomial mass must fit ``max_sym_mass``
+    (it is the SUM over the slices, so the whole descent stays inside the one box the caller
+    budgeted for this statement), AND the batch size must fit :data:`_MAX_VMAP_BATCH` (each
+    slice pays the body's fixed per-statement overhead).  The deadline is additionally checked
+    INSIDE the loop, once per slice.  Every rejection degrades to *unresolved* ⇒ the warned
+    probe fallback — never a hang, never a guess.
+    """
+    body, in_axes, out_axes = closure
+    if len(args) != len(in_axes) or len(in_axes) != len(body.inputs):
+        reason.note(f"vmap closure ({body.name}): operand/in_axes/body-input arity mismatch")
+        return None
+    arrs = [np.asarray(a) for a in args]
+    norm: list[int | None] = []
+    sizes: list[int] = []
+    for arr, ax in zip(arrs, in_axes):
+        if ax is None:
+            norm.append(None)
+            continue
+        a = int(ax) if int(ax) >= 0 else arr.ndim + int(ax)
+        if not (0 <= a < arr.ndim):
+            reason.note(f"vmap closure ({body.name}): in_axis {ax} out of range for {arr.shape}")
+            return None
+        norm.append(a)
+        sizes.append(int(arr.shape[a]))
+    if len(set(sizes)) != 1:
+        reason.note(f"vmap closure ({body.name}): inconsistent batch sizes {sizes}")
+        return None
+    batch = sizes[0]
+    if batch > _MAX_VMAP_BATCH:
+        reason.note(f"vmap closure ({body.name}): batch {batch} > {_MAX_VMAP_BATCH}")
+        return None
+    mass = _sym_mass(args, max_sym_mass)
+    if mass > max_sym_mass:
+        reason.note(f"vmap closure ({body.name}): batched operands too large for exact "
+                    f"execution (monomial mass > {max_sym_mass})")
+        return None
+    per_slice: list[list[Any]] = []
+    for i in range(batch):
+        _check_deadline(deadline)
+        sliced: list[Any] = []
+        for arr, ax in zip(arrs, norm):
+            if ax is None:
+                sliced.append(arr)
+                continue
+            idx: list[Any] = [slice(None)] * arr.ndim
+            idx[ax] = i
+            sliced.append(arr[tuple(idx)])
+        outs = _run_program(body, sliced, deadline, depth + 1, reason, max_sym_mass)
+        if outs is None:
+            return None                       # one opaque slice poisons the batch — no guess
+        per_slice.append(outs)
+    n_out = len(per_slice[0])
+    if len(out_axes) != n_out or any(len(o) != n_out for o in per_slice):
+        reason.note(f"vmap closure ({body.name}): out_axes/body-output arity mismatch")
+        return None
+    stacked: list[Any] = []
+    for k in range(n_out):
+        col = [np.asarray(s[k]) for s in per_slice]
+        if any(c.dtype == object for c in col):
+            col = [_obj(c) for c in col]
+        stacked.append(np.stack(col, axis=int(out_axes[k])))
+    return stacked
 
 
 def _bind_body_inputs(body: Program, args: list[Any], env: _Env) -> bool:
@@ -557,7 +799,20 @@ def _run_program(
         return None
     for i, stmt in enumerate(body.statements):
         if not _exec_stmt(body, i, stmt, env, deadline, depth, reason, max_sym_mass):
-            return None                       # one opaque stmt poisons the body — no guess
+            # KEEP GOING.  This used to `return None` ("one opaque stmt poisons the body"), which
+            # made the lane refuse on the PRESENCE of an un-normalizable op rather than on the
+            # RESULT depending on it.  A statement we cannot execute simply leaves its outputs
+            # unbound, and `_resolve_ref` already yields `_OPAQUE` for those — so opacity cascades
+            # to exactly the consumers that genuinely need it, and the declared-output check below
+            # still returns `None` if the result is among them.  If the body's outputs resolve
+            # anyway, the opaque statement was DEAD and refusing was pure loss.
+            #
+            # This is what unblocks a certificate whose `grass_dof` body still CONTAINS a `QrOp`
+            # that nothing downstream reads: liveness becomes implicit — "the result is a number"
+            # is itself the proof that the op did not matter, and the statements can be discarded
+            # afterwards.  (Measured: the FEEC `Λᵏ` face DOFs reach 0 LIVE frame ops but keep a dead
+            # `QrOp` in the body; presence-based refusal alone kept them on the probe lane.)
+            continue
     outs: list[Any] = []
     for sa in body.outputs.values():
         bulk = getattr(sa, "_bulk", None)
