@@ -605,3 +605,162 @@ def test_ir_ceiling_healthy_program_no_false_trip(monkeypatch):
     the backstop is signal (real blow-ups), not noise."""
     monkeypatch.setenv("PYAB_IR_CEILING", "raise")                 # default ceilings (100k / 8192)
     pyab.as_function_def(_small_symbolic_program(), name="f")      # det3 mass ≪ 100k ⇒ no raise
+
+
+# ---------------------------------------------------------------------------
+# Helper-def interning (_helper_fingerprint): content-identical sub-Programs
+# rebuilt as DISTINCT objects emit ONE ``_sub_N`` def; distinct bodies never merge.
+# ---------------------------------------------------------------------------
+
+
+def _det_dot_body(xname: str, yname: str) -> Program:
+    """body(x, y) = det(x @ y) — rebuilt fresh per call, with caller-chosen (uid-style)
+    input spellings, mimicking the per-branch ``grass_dof`` closure rebuilds."""
+    body = Program("body", inputs=[SymInput(xname, (2, 2), _prov(xname)),
+                                   SymInput(yname, (2, 2), _prov(yname))])
+    [xy] = body.emit_stmt(TensordotOp.from_axes(([1], [0])),
+                          [body.input(xname), body.input(yname)],
+                          [OutSpec("xy", (2, 2))], bulk=False)
+    from polyarray.ir import DetOp
+    [d] = body.emit_stmt(DetOp(), [xy], [OutSpec("d", ())], bulk=False)
+    body.add_output("d", d.cells)
+    return body
+
+
+def test_helper_interning_dedups_identical_subprograms():
+    from polyarray.ir import CallOp
+    from pyarraybackend.ir import core
+
+    top = Program("top", inputs=[SymInput("P", (2, 2), _prov("P")),
+                                 SymInput("Q", (2, 2), _prov("Q"))])
+    # three content-identical bodies: distinct objects AND uid-differing input names
+    # (``helpers``' id-memo cannot see them; the fingerprint must).
+    [r1] = top.emit_stmt(CallOp(fn=_det_dot_body("x_0", "y_1")),
+                         [top.input("P"), top.input("Q")], [OutSpec("r1", ())], bulk=False)
+    [r2] = top.emit_stmt(CallOp(fn=_det_dot_body("x_7", "y_9")),
+                         [top.input("Q"), top.input("P")], [OutSpec("r2", ())], bulk=False)
+    [r3] = top.emit_stmt(CallOp(fn=_det_dot_body("x_2", "y_3")),
+                         [top.input("P"), top.input("P")], [OutSpec("r3", ())], bulk=False)
+    top.add_output("out", (r1 + r2 + r3).cells)
+
+    stmts = pyab.as_function_def(top, name="f", opts=pyab.LowerOpts(target="numpy"))
+    subs = [s.name for s in stmts if isinstance(s, core.FunctionDefStmt)
+            and s.name.startswith("_sub_")]
+    assert len(subs) == 1, f"identical sub-programs must intern to one def, got {subs}"
+
+    cm = pyab.compile_numpy(top, name="f")
+    rng = np.random.default_rng(0)
+    P, Q = rng.standard_normal((2, 2)), rng.standard_normal((2, 2))
+    np.testing.assert_allclose(cm.module.f(P, Q), top.run({"P": P, "Q": Q})["out"],
+                               rtol=1e-12)
+
+
+def test_helper_interning_keeps_distinct_subprograms():
+    from polyarray.ir import CallOp, DetOp
+    from pyarraybackend.ir import core
+
+    same = _det_dot_body("x_0", "y_1")
+    other = Program("other", inputs=[SymInput("a_0", (2, 2), _prov("a_0")),
+                                     SymInput("b_1", (2, 2), _prov("b_1"))])
+    # Hadamard a*b: SAME arity/shapes, different op — must NOT merge with the sum body.
+    [s] = other.emit_stmt(EinsumStmtOp("ij,ij->ij"), [other.input("a_0"), other.input("b_1")],
+                          [OutSpec("s", (2, 2))], bulk=False)
+    [d] = other.emit_stmt(DetOp(), [s], [OutSpec("d", ())], bulk=False)
+    other.add_output("d", d.cells)
+
+    top = Program("top", inputs=[SymInput("P", (2, 2), _prov("P")),
+                                 SymInput("Q", (2, 2), _prov("Q"))])
+    [r1] = top.emit_stmt(CallOp(fn=same), [top.input("P"), top.input("Q")],
+                         [OutSpec("r1", ())], bulk=False)
+    [r2] = top.emit_stmt(CallOp(fn=other), [top.input("P"), top.input("Q")],
+                         [OutSpec("r2", ())], bulk=False)
+    top.add_output("out", (r1 + r2).cells)
+
+    stmts = pyab.as_function_def(top, name="f", opts=pyab.LowerOpts(target="numpy"))
+    subs = [s.name for s in stmts if isinstance(s, core.FunctionDefStmt)
+            and s.name.startswith("_sub_")]
+    assert len(subs) == 2, f"distinct bodies must keep distinct defs, got {subs}"
+
+    cm = pyab.compile_numpy(top, name="f")
+    rng = np.random.default_rng(1)
+    P, Q = rng.standard_normal((2, 2)), rng.standard_normal((2, 2))
+    np.testing.assert_allclose(cm.module.f(P, Q), top.run({"P": P, "Q": Q})["out"],
+                               rtol=1e-12)
+
+
+def test_helper_fingerprint_name_normalization():
+    """The interning key itself: invariant under the SPELLING of bound names (params +
+    locals — upstream mints uid suffixes that differ across content-identical rebuilds),
+    sensitive to FREE names (module globals the body calls) and to any constant."""
+    from pyarraybackend.ir import core
+
+    def body_for(x: str, t: str, free: str = "functional", scale: float = 2.0):
+        return (
+            (core.Param(name=x),),
+            (core.AssignStmt(target=core.Var(name=t),
+                             value=core.BinaryExpr(op=core.BinaryOp.MUL,
+                                                   lhs=core.Var(name=x),
+                                                   rhs=core.FloatLit(value=scale))),
+             core.AssignStmt(target=core.Var(name=t + "b"),
+                             value=core.CallExpr(fn=core.MemberExpr(base=core.Var(name=free),
+                                                                    name="relu"),
+                                                 args=(core.Var(name=t),))),
+             core.ReturnStmt(value=core.Var(name=t + "b"))),
+        )
+
+    fp = pyab._helper_fingerprint
+    base = fp(core, *body_for("V_0_0", "t_0"))
+    assert base is not None
+    # bound names differ only in their uid spelling ⇒ SAME key (this is what `helpers`'
+    # id-memo misses and what makes the rebuilt sub-Programs internable).
+    assert fp(core, *body_for("V_9_3", "t_77")) == base
+    # a different module global (free name) ⇒ different function ⇒ DIFFERENT key.
+    assert fp(core, *body_for("V_0_0", "t_0", free="torch")) != base
+    # a different baked constant ⇒ DIFFERENT key (constants are the whole point: the σ
+    # branch bodies differ only in their baked points/weights).
+    assert fp(core, *body_for("V_0_0", "t_0", scale=2.5)) != base
+
+
+def test_helper_fingerprint_discriminates_the_audit_attack_set():
+    """Regression pins for the properties an adversarial audit verified by construction but
+    which the tests above left unguarded: attribute/kwarg names that COLLIDE with a bound
+    spelling must not be alpha-renamed, a param permutation must not be erased, and a nested
+    scope must REFUSE (``_fp_bound_names`` is unscoped, so a nested binder could otherwise
+    alpha-normalize an outer free global of the same spelling)."""
+    from pyarraybackend.ir import core
+
+    fp = pyab._helper_fingerprint
+
+    def attr_body(attr: str, pname: str = "sin"):
+        return ((core.Param(name=pname),),
+                (core.ReturnStmt(value=core.CallExpr(
+                    fn=core.MemberExpr(base=core.Var(name="torch"), name=attr),
+                    args=(core.Var(name=pname),))),))
+
+    # `sin` is BOUND (a param) and also the attribute spelling: the attribute must keep its
+    # own identity, so torch.sin and torch.cos can never intern together.
+    assert fp(core, *attr_body("sin")) != fp(core, *attr_body("cos"))
+    # ... and the attribute is not affected by what the param happens to be called.
+    assert fp(core, *attr_body("sin")) == fp(core, *attr_body("sin", pname="q_1"))
+
+    def two_param_body(first: str, second: str):
+        return ((core.Param(name=first), core.Param(name=second)),
+                (core.ReturnStmt(value=core.BinaryExpr(op=core.BinaryOp.SUB,
+                                                       lhs=core.Var(name=first),
+                                                       rhs=core.Var(name=second))),))
+
+    # a - b is not b - a: first-occurrence indexing must not erase the permutation.
+    assert fp(core, *two_param_body("a", "b")) is not None
+    assert fp(core, *two_param_body("a", "b")) == fp(core, *two_param_body("x", "y"))
+    ab = two_param_body("a", "b")
+    ba = ((ab[0][1], ab[0][0]), ab[1])                    # same body, params swapped
+    assert fp(core, *ba) != fp(core, *ab)
+
+    # a nested def REFUSES rather than trusting the unscoped bound-name set.
+    nested = ((core.Param(name="x"),),
+              (core.FunctionDefStmt(name="_inner", params=(core.Param(name="torch"),),
+                                    body=(core.ReturnStmt(value=core.Var(name="torch")),)),
+               core.ReturnStmt(value=core.CallExpr(
+                   fn=core.MemberExpr(base=core.Var(name="torch"), name="sqrt"),
+                   args=(core.Var(name="x"),)))))
+    assert fp(core, *nested) is None
