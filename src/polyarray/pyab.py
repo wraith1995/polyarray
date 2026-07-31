@@ -47,6 +47,8 @@ when you actually *compile* the emitted IR through the torch backend.
 """
 from __future__ import annotations
 
+import dataclasses
+import enum
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -643,6 +645,151 @@ _ARRAY_OP_LOWERINGS: dict[type, Any] = {
 
 
 # ---------------------------------------------------------------------------
+# Helper-def interning: structural fingerprint of a would-be ``_sub_N`` def.
+# ---------------------------------------------------------------------------
+
+
+def _fp_bound_names(core: Any, params: tuple, body: tuple) -> set[str]:
+    """Every name BOUND inside the def: its params, plain assignment targets,
+    let/for binders, nested def names. Everything else is FREE (module globals —
+    ``torch``/``functional``/``np`` and already-emitted helper callees) and must keep
+    its spelling in the fingerprint.
+
+    ⚠ This set is UNSCOPED — a binder anywhere in the body marks its spelling bound for the
+    WHOLE body, so an outer FREE global sharing a nested binder's spelling would be
+    alpha-normalized and two different globals could fingerprint alike. Today's emitters
+    build no nested defs/lambdas (the only ``FunctionDefStmt``s are the module-level helper
+    and entry), so the situation is unreachable; :func:`_helper_fingerprint` REFUSES on a
+    nested def or lambda rather than rely on that, which makes the claim unconditional."""
+    bound = {p.name for p in params}
+
+    def collect_target(t: Any) -> None:
+        if isinstance(t, core.Var):
+            bound.add(t.name)
+        elif isinstance(t, core.TupleExpr):
+            for el in t.elts:
+                collect_target(el)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, core.AssignStmt):
+            collect_target(node.target)
+        elif isinstance(node, core.FunctionDefStmt):
+            bound.add(node.name)
+            for p in node.params:
+                bound.add(p.name)
+        elif hasattr(core, "LetStmt") and isinstance(node, core.LetStmt):
+            bound.add(node.name)
+        elif isinstance(node, core.ForStmt):
+            collect_target(node.target)
+        if isinstance(node, (tuple, list)):
+            for c in node:
+                walk(c)
+        elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+            for f in dataclasses.fields(node):
+                walk(getattr(node, f.name))
+
+    walk(body)
+    return bound
+
+
+def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
+    """A content-complete structural fingerprint of a helper def's ``(params, body)``,
+    invariant under the SPELLING of its bound names (params carry upstream-minted uid
+    suffixes that differ across content-identical rebuilds; locals are deterministic but
+    ride along in the same normalization). Bound names are replaced by their
+    first-occurrence index in a deterministic traversal; free names keep their spelling,
+    so equal fingerprints ⇒ alpha-equivalent pure functions over the same module
+    globals ⇒ one def can serve every call site. Returns ``None`` (⇒ no interning) on
+    any leaf outside the known vocabulary — an unknown object could hide identity that
+    the stream would erase. Also refuses on a NESTED def/lambda, whose binders would make
+    :func:`_fp_bound_names`' unscoped set alpha-normalize an outer free global of the same
+    spelling (unreachable with today's emitters; refusing keeps the invariant
+    unconditional rather than contingent on them)."""
+    import hashlib
+
+    def has_nested_scope(node: Any) -> bool:
+        if isinstance(node, core.FunctionDefStmt) or (
+                hasattr(core, "LambdaExpr") and isinstance(node, core.LambdaExpr)):
+            return True
+        if isinstance(node, (tuple, list)):
+            return any(has_nested_scope(c) for c in node)
+        if dataclasses.is_dataclass(node) and not isinstance(node, type):
+            return any(has_nested_scope(getattr(node, f.name)) for f in dataclasses.fields(node))
+        return False
+
+    if has_nested_scope(body):
+        return None
+
+    bound = _fp_bound_names(core, params, body)
+    index: dict[str, int] = {}
+    out: list[str] = []
+
+    def name_tok(n: str) -> str:
+        if n not in bound:
+            return f"free:{n}"
+        if n not in index:
+            index[n] = len(index)
+        return f"@{index[n]}"
+
+    def ser(node: Any) -> None:
+        if node is None or isinstance(node, (bool, int, float, str, bytes)):
+            out.append(repr(node))
+            return
+        if isinstance(node, enum.Enum):
+            out.append(f"{type(node).__module__}.{type(node).__qualname__}.{node.name}")
+            return
+        if isinstance(node, (tuple, list)):
+            out.append("(" if isinstance(node, tuple) else "[")
+            for c in node:
+                ser(c)
+                out.append(",")
+            out.append(")")
+            return
+        if isinstance(node, np.ndarray):
+            a = np.ascontiguousarray(node)
+            out.append(f"nd{a.shape}:{a.dtype}:{hashlib.sha256(a.tobytes()).hexdigest()}")
+            return
+        if isinstance(node, (np.integer, np.floating, np.bool_)):
+            out.append(repr(node))
+            return
+        if isinstance(node, core.Var):
+            out.append(f"Var({name_tok(node.name)},{node.locality!r})")
+            return
+        if dataclasses.is_dataclass(node) and not isinstance(node, type):
+            t = type(node)
+            out.append(f"{t.__module__}.{t.__qualname__}(")
+            for f in dataclasses.fields(node):
+                v = getattr(node, f.name)
+                out.append(f"{f.name}=")
+                if f.name == "name" and isinstance(v, str) and isinstance(
+                        node, (core.Param, core.FunctionDefStmt)):
+                    out.append(name_tok(v))
+                elif hasattr(core, "LetStmt") and isinstance(node, core.LetStmt) \
+                        and f.name == "name" and isinstance(v, str):
+                    out.append(name_tok(v))
+                else:
+                    ser(v)
+                out.append(",")
+            out.append(")")
+            return
+        raise _FpRefuse(f"unserializable leaf {type(node).__qualname__}")
+
+    try:
+        ser(params)
+        ser(body)
+    except (_FpRefuse, RecursionError):
+        # RecursionError: `ser` walks the same tree codegen already recurses on (measured max
+        # depth 16 vs a 1000 limit), but a fingerprint must never be the thing that kills a
+        # compile that would otherwise succeed — refuse and emit the def uninterned.
+        return None
+    return hashlib.sha256("|".join(out).encode()).hexdigest()
+
+
+class _FpRefuse(Exception):
+    """A helper body with no stable structural serialization — skip interning."""
+
+
+# ---------------------------------------------------------------------------
 # The lowerer — a structural mirror of numpy_source._Emitter that produces PyAB
 # IR nodes (via a StmtBuilder) instead of Python source strings.
 # ---------------------------------------------------------------------------
@@ -658,6 +805,7 @@ class _Lowerer:
         var_gen: Any = None,
         defs: list[Any] | None = None,
         helpers: dict[int, str] | None = None,
+        fp_helpers: dict[str, str] | None = None,
     ) -> None:
         self.core = _core()
         self.prog = program
@@ -671,6 +819,14 @@ class _Lowerer:
         )
         self.defs: list[Any] = defs if defs is not None else []
         self.helpers: dict[int, str] = helpers if helpers is not None else {}
+        # Structural-fingerprint intern table (shared like ``helpers``): fingerprint of an
+        # emitted helper's (params, body) -> its def name. ``helpers`` memoizes by
+        # ``id(prog)`` only, so a content-identical sub-Program REBUILT as a fresh object
+        # (the per-σ-branch / per-functional ``grass_dof`` closures) re-emitted its whole
+        # def — measured 388 emitted defs collapsing to 168 on the P⁻₂Λ¹(TET) savo
+        # kernels. This interns at emission: one def per distinct body, every call site
+        # shares it. See ``_helper_fingerprint`` for the soundness argument.
+        self.fp_helpers: dict[str, str] = fp_helpers if fp_helpers is not None else {}
         # generator-name -> scalar PyAB expr producing its value.
         self.genmap: dict[str, Any] = {}
         # bulk binding-name -> PyAB expr (whole tensor).
@@ -1129,10 +1285,29 @@ class _Lowerer:
             var_gen=c.UniqueVarGen(),
             defs=self.defs,
             helpers=self.helpers,
+            fp_helpers=self.fp_helpers,
         )
         out_exprs = sub.run()
         ret = _ret_value(c, out_exprs)
         body = sub.body_stmts() + (c.ReturnStmt(value=ret),)
+        # Emission-time interning: if a structurally identical helper was already emitted
+        # (a content-equal sub-Program under a DIFFERENT object id — ``helpers`` cannot
+        # see it), point this prog at the existing def instead of appending a duplicate.
+        # Sound bottom-up: nested helpers were interned during ``sub.run()`` above, so
+        # two identical bodies reference identical callee spellings. The reserved
+        # ``name`` is simply left unused (numbering gaps are harmless).
+        # A (mutually) RECURSIVE body — one that calls back into a def still being
+        # emitted, via the name reserved above — can never intern by accident: that
+        # call site is a FREE ``Var`` in the fingerprint, keeping its unique ``_sub_N``
+        # spelling, so it only matches a twin carrying the SAME reserved name, which no
+        # other def has. Recursive helpers therefore always get their own def.
+        fp = _helper_fingerprint(c, params, body)
+        if fp is not None:
+            twin = self.fp_helpers.get(fp)
+            if twin is not None:
+                self.helpers[key] = twin
+                return twin
+            self.fp_helpers[fp] = name
         self.defs.append(c.FunctionDefStmt(name=name, params=params, body=body))
         return name
 
