@@ -551,3 +551,44 @@ def test_kron_twin_backs_off_on_a_shape_it_cannot_honour() -> None:
     # statement lands in `unresolved` (⇒ the warned probe fallback), which is the contract.
     assert 0 in st.unresolved, (st.unresolved, st.folded)
     assert 0 not in st.folded, st.folded
+
+
+# --- SwitchOp (`select_x`) — the minimal σ-switch fold -------------------------------------------
+
+def _switch_program(equal: bool):
+    """A `select_x` over a run-time-only `IntAtom`, with branches equal or not."""
+    from polyarray.ir import IntAtomRef, OutSpec, Program, SwitchOp, SymArray
+    prog = Program(name="switchtest")
+    prog.declare_int_atom("o_0", range(2))
+    b0 = SymArray(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=object), program=prog)
+    other = [[1.0, 2.0], [3.0, 4.0]] if equal else [[9.0, 9.0], [9.0, 9.0]]
+    b1 = SymArray(np.array(other, dtype=object), program=prog)
+    prog.emit_stmt(SwitchOp(2), [IntAtomRef("o_0"), b0, b1],
+                   [OutSpec("sw", (2, 2))], note="sigma-switch")
+    return prog
+
+
+def test_switch_with_equal_branches_folds_through_a_symbolic_scrutinee():
+    """A `SwitchOp` whose branches all carry the SAME value is the identity — the run-time-only
+    scrutinee cannot change the result, so the exact lane must fold it rather than freeze.
+
+    This is the σ-no-op case, and it is what makes design item B viable: B moves the σ switch from
+    the folded OUTPUT to the geometry INPUTS, i.e. upstream of the whole body. Before this fold the
+    statement aborted on the unresolved scrutinee ("operand depends on an unresolved statement"),
+    which would have put an unfoldable node ahead of every σ-carrying expression and degraded the
+    FEEC lanes back to probe fallback — trading away the `QrOp` removal, not adding to it."""
+    from polyarray.exact_fold import exact_partial_eval
+    st = exact_partial_eval(_switch_program(equal=True), time_budget=10.0)
+    assert sorted(st.folded) == [0], f"equal branches must fold; got {st.unresolved}"
+    assert not st.unresolved
+
+
+def test_switch_with_differing_branches_is_unresolved_not_guessed():
+    """Branches that genuinely differ under a run-time scrutinee stay UNRESOLVED — the fold must not
+    pick one. The reason names the switch, so the hybrid-mode warning localizes it instead of
+    blaming the generic unresolved-operand path."""
+    from polyarray.exact_fold import exact_partial_eval
+    st = exact_partial_eval(_switch_program(equal=False), time_budget=10.0)
+    assert not st.folded
+    assert len(st.unresolved) == 1
+    assert "SwitchOp" in next(iter(st.unresolved.values()))
