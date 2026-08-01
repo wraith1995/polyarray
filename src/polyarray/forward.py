@@ -21,18 +21,24 @@ is the post-build half: **look at the generated code and reshape it by choice.**
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import assert_never
 
 import numpy as np
 
 from .ir import (
     Const,
     IdentityOp,
+    InputRef,
+    IntAtomRef,
     OutSpec,
+    OutputRef,
     Program,
     RationalRef,
+    Ref,
     SymArray,
     SymArrayRef,
     _cell_size,
+    is_builtin_op,
 )
 from .rational import RationalFunction
 
@@ -154,8 +160,15 @@ class IRReport:
 
 def _is_op(fn) -> bool:
     """A typed IR op (offload / freeze / linalg / control flow) vs a plain
-    callable / sub-Program."""
-    return type(fn).__name__.endswith("Op")
+    callable / sub-Program.
+
+    polyarray's own vocabulary answers by TYPE (:data:`~polyarray.ir.StmtFn`).  The
+    class-name suffix is kept ONLY for ops belonging to a front end above polyarray,
+    which this layer must not import and therefore cannot name — the counted quantity
+    ("how many statements defer to an op") is deliberately open-world.  Every builtin
+    ends in ``Op``, so this is the same answer the name test alone gave.
+    """
+    return is_builtin_op(fn) or type(fn).__name__.endswith("Op")
 
 
 def _prov_kind(program: Program, gen: str) -> str:
@@ -172,25 +185,32 @@ def _prov_kind(program: Program, gen: str) -> str:
     return getattr(p, "kind", "extern") if p is not None else "extern"
 
 
-def _ref_rf_cells(ref) -> list:
+def _ref_rf_cells(ref: Ref) -> list:
     """The RationalFunction operand cells a Stmt input ref carries (non-bulk only).
 
-    ``SymArrayRef`` (its ``_cells``, unless bulk), ``Const`` (a materialised value),
-    and ``RationalRef`` (a single RF).  ``InputRef``/``OutputRef``/``IntAtomRef`` carry
-    no monomials (a name / a prior-Stmt handle) and contribute nothing.
+    Exhaustive over :data:`~polyarray.ir.Ref` — polyarray's *other* closed sum type —
+    for the same reason the op union is: a ref kind that falls off the end contributes
+    nothing to ``operand_mass``, which reads as "this program is cheap" rather than as a
+    missing case.
     """
-    if isinstance(ref, SymArrayRef):
-        if ref._bulk is not None:
+    match ref:
+        case SymArrayRef():
+            if ref._bulk is not None:
+                return []
+            arr = np.asarray(ref._cells)
+            return [c for c in arr.reshape(-1) if isinstance(c, RationalFunction)]
+        case RationalRef():
+            rf = ref.rf
+            return [rf] if isinstance(rf, RationalFunction) else []
+        case Const():
+            arr = np.asarray(ref.value, dtype=object)
+            return [c for c in arr.reshape(-1) if isinstance(c, RationalFunction)]
+        case InputRef() | OutputRef() | IntAtomRef():
+            # A name, a prior-Stmt handle, a runtime integer selector: no monomials of
+            # their own — the mass lives on the array they point at, counted there.
             return []
-        arr = np.asarray(ref._cells)
-        return [c for c in arr.reshape(-1) if isinstance(c, RationalFunction)]
-    if isinstance(ref, RationalRef):
-        rf = ref.rf
-        return [rf] if isinstance(rf, RationalFunction) else []
-    if isinstance(ref, Const):
-        arr = np.asarray(ref.value, dtype=object)
-        return [c for c in arr.reshape(-1) if isinstance(c, RationalFunction)]
-    return []
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def _row(program: Program) -> ProgramRow:
