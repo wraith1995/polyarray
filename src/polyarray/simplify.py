@@ -1116,6 +1116,19 @@ def substitute(program: Program, subs: Mapping[str, Any]) -> Program:
 # ---------------------------------------------------------------------------
 
 
+def symarray_atoms(sa: SymArray) -> set:
+    """The run-time binding-key atoms a ``SymArray`` reads — the PUBLIC name for what
+    :func:`_symarray_atoms` has always computed.
+
+    Exported (2026-08-01) so a consumer can ask "does this value DEPEND on that atom?" without
+    reimplementing the traversal. First caller: savo's σ-channel invariant INV-3, which must show
+    that the geometry reaching ``AssemblyInput.sample`` carries no orientation atom. Reading the
+    cells' generators is exactly the question, and the alternative — a consumer hand-rolling it —
+    is the object-dtype/cells-unwrapping the stack rules forbid.
+    """
+    return _symarray_atoms(sa)
+
+
 def _symarray_atoms(sa: SymArray) -> set:
     """The run-time binding-key atoms a SymArray reads: its bulk name, or its
     cells' RationalFunction generators (the keys ``SymArray.evaluate`` resolves)."""
