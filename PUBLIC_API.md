@@ -122,6 +122,27 @@ def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None =
 
 All frozen / hashable dataclasses.
 
+### The union — `StmtFn` / `STMT_FN_OPS` / `is_builtin_op`
+
+```python
+StmtFn: TypeAlias = DetOp | InvOp | ... | WhileOp   # every op class listed below
+STMT_FN_OPS: tuple[type, ...]                       # = get_args(StmtFn); the isinstance tuple
+def is_builtin_op(fn: object) -> TypeGuard[StmtFn]
+```
+
+`Stmt.fn` is `Callable | Program | None` — deliberately **open**, so a front end above
+polyarray can put its own op class, a `vmap` closure or a plain callable there. `StmtFn`
+names the **closed** part: the ops polyarray itself owns. A pass over the vocabulary is
+written as `if is_builtin_op(fn): <exhaustive match closed by typing.assert_never>`, with
+the open cases handled *before* the match. Adding an op to `StmtFn` then makes every pass
+that has not decided about it a **mypy error** — the guarantee an isinstance ladder cannot
+give (an op missing from a ladder is silently opaque; `KronOp`/`KronFreeOp` and `SwitchOp`
+each cost a day that way).
+
+Adding an op means, together: this list, `StmtFn`, `polyarray/__init__`'s exports,
+`degree.DEFAULT_DEGREE_KINDS`, the `pyab` + `to_numpy_source` render lanes, and whatever
+mypy names. `tests/test_op_union.py` checks every one of those mirrors against the union.
+
 ```python
 @dataclass(frozen=True) class DetOp                  # -> np.linalg.det
 @dataclass(frozen=True) class InvOp                  # -> np.linalg.inv
