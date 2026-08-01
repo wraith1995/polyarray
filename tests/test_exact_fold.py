@@ -492,3 +492,62 @@ def test_assert_twin_passes_the_value_through_and_still_checks() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_kron_twins_are_exact_and_certify_a_constant_wedge() -> None:
+    """``KronOp`` / ``KronFreeOp`` thread exact cells, and a Kron of CONSTANT operands folds.
+
+    These were the FEEC `Λᵏ` blocker: both were simply ABSENT from ``_sym_apply``'s ladder, so they
+    fell off the end into the opaque tail — declared un-normalizable by omission rather than by a
+    decision.  A Kronecker product is field MULTIPLICATION, so it is exactly representable; leaving
+    it opaque put the whole wedge DOF (whose two traced slots meet in a ``KronFreeOp``) on the
+    probe lane."""
+    from polyarray.ir import Const, KronFreeOp, KronOp
+
+    A = np.array([[1.0, 2.0], [0.0, -1.0]])
+    B = np.array([[0.0, 1.0], [1.0, 0.0]])
+    prog = Program("kron", inputs=[SymInput("v", (2,), _prov("v"))])
+    prog.emit_stmt(KronOp(2), [Const(A), Const(B)], [OutSpec("k2", (4, 4))], bulk=False)
+    prog.emit_stmt(KronFreeOp(0, 0), [Const(A), Const(B)], [OutSpec("kf", (4, 4))], bulk=False)
+
+    import polyarray.exact_fold as EF
+    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    assert st.folded == {0, 1}, (st.folded, st.unresolved)   # constant in, constant out
+    assert not st.unresolved, st.unresolved                  # and NOT opaque
+
+
+def test_kron_twin_threads_symbolic_cells_rather_than_going_opaque() -> None:
+    """With a SYMBOLIC operand the Kron is still executed exactly — *refuted* (provably
+    non-constant), never *unresolved*.  Only unresolved statements reach the probe fallback, so
+    this is the difference between an exact certificate and a probed one."""
+    from polyarray.ir import ColStackOp, Const, KronOp, OutputRef
+
+    prog = Program("kron_sym", inputs=[SymInput("v", (2,), _prov("v"))])
+    prog.emit_stmt(ColStackOp(), [prog.input("v"), Const(np.array([1.0, 0.0]))],
+                   [OutSpec("m", (2, 2))], bulk=False)
+    prog.emit_stmt(KronOp(2), [OutputRef(0, 0), Const(np.eye(2))],
+                   [OutSpec("k", (4, 4))], bulk=False)
+
+    import polyarray.exact_fold as EF
+    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    assert 1 not in st.unresolved, st.unresolved             # executed, not opaque
+    assert 1 in st.refuted, (st.refuted, st.folded)          # and PROVABLY non-constant
+
+
+def test_kron_twin_backs_off_on_a_shape_it_cannot_honour() -> None:
+    """A non-matrix ``KronOp`` operand falls through to the opaque tail instead of building a
+    wrong-shaped result.  Silent shape corruption here does NOT fail locally — it surfaces much
+    later as an unrelated einsum's arity error, so the twin verifies before committing."""
+    from polyarray.ir import Const, KronOp
+
+    prog = Program("kron_bad", inputs=[SymInput("v", (2,), _prov("v"))])
+    prog.emit_stmt(KronOp(2), [Const(np.array([1.0, 2.0])), Const(np.eye(2))],
+                   [OutSpec("k", (4,))], bulk=False)
+
+    import polyarray.exact_fold as EF
+    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    # UNRESOLVED, never a wrong-shaped fold.  The reason text is deliberately not pinned: the
+    # declared-OutSpec check may fire before the twin's own ndim guard, and either way the
+    # statement lands in `unresolved` (⇒ the warned probe fallback), which is the contract.
+    assert 0 in st.unresolved, (st.unresolved, st.folded)
+    assert 0 not in st.folded, st.folded
