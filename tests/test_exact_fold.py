@@ -592,3 +592,46 @@ def test_switch_with_differing_branches_is_unresolved_not_guessed():
     assert not st.folded
     assert len(st.unresolved) == 1
     assert "SwitchOp" in next(iter(st.unresolved.values()))
+
+
+def test_switch_with_a_constant_scrutinee_selects_the_right_branch():
+    """A build-time-CONSTANT scrutinee selects its branch, and the selected value flows on EXACTLY.
+
+    Distinct from the all-numeric case, which the numeric path (`_exec_fn` running the real
+    `SwitchOp.__call__`) already handled: here the branches are SYMBOLIC, so resolution goes through
+    the exact twin. Pinned per-branch rather than merely "it resolved" — resolving to the WRONG
+    branch would also look like success.
+
+    The outcome is `refuted`, not `folded`: the selected branch `x+1` is genuinely vertex-dependent,
+    so the exact lane proves NON-constancy. That is the sound classification (soundly excluded from
+    any probe fallback), and it is the evidence the value was carried through exactly rather than
+    frozen."""
+    from polyarray.ir import Const, OutSpec, Program, SwitchOp, SymArray, SymInput
+    from polyarray.exact_fold import exact_partial_eval
+
+    for k, expect in ((0, "x_0 + 1"), (1, "x_0 + 5")):
+        prog = Program("switchconst", inputs=[SymInput("x", (1,), _prov("x"))])
+        x = np.asarray(prog.input_arrays["x"].cells)[0]
+        b0 = SymArray(np.array([x + 1], dtype=object), program=prog)
+        b1 = SymArray(np.array([x + 5], dtype=object), program=prog)
+        prog.emit_stmt(SwitchOp(2), [Const(np.array(k)), b0, b1],
+                       [OutSpec("sw", (1,))], note="sigma-switch")
+
+        seen: list[str] = []
+        import polyarray.exact_fold as _ef
+        orig = _ef._sym_apply
+
+        def spy(fn, args, *a, _o=orig, _s=seen, **kw):
+            r = _o(fn, args, *a, **kw)
+            if isinstance(fn, SwitchOp) and r is not None:
+                _s.extend(str(v) for v in np.asarray(r[0]).ravel())
+            return r
+
+        _ef._sym_apply = spy
+        try:
+            st = exact_partial_eval(prog, time_budget=10.0)
+        finally:
+            _ef._sym_apply = orig
+        assert seen == [expect], f"scrutinee={k}: selected {seen}, expected [{expect!r}]"
+        assert sorted(st.refuted) == [0], f"scrutinee={k}: expected a refutation, got {st.unresolved}"
+        assert not st.unresolved
