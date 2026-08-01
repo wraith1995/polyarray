@@ -71,6 +71,7 @@ from .ir import (
     InvTransposeOp,
     KronFreeOp,
     KronOp,
+    SwitchOp,
     MoveaxisOp,
     OutputRef,
     PinvOp,
@@ -616,6 +617,46 @@ def _sym_apply(
         # ``(P @ vsub).reshape(op.shape)`` — the ambient reconstruction.
         out = np.einsum("ij,j...->i...", _obj(args[0]), _obj(args[1]), optimize=False)
         return [out.reshape(fn.shape) if fn.shape else out]
+    if isinstance(fn, SwitchOp):
+        # `select_x` over an `IntAtom`: inputs are `(scrutinee, branch_0, …, branch_{n-1})`.
+        #
+        # MINIMAL fold, deliberately (Teo 2026-08-01) — two sound cases and no guessing:
+        #   (a) EQUAL BRANCHES ⇒ the scrutinee cannot matter, so the switch is that value. This is the
+        #       one that pays: it is the same question `savo _blocks_equal` asks at the folded block
+        #       ("does reorienting this entity change this value?"), asked per-operand.
+        #   (b) a scrutinee that IS a build-time constant selects its branch.
+        # Anything else is opaque, as before. DISTRIBUTION — pushing an op through a switch,
+        # `f(select_x(a,[x,y]), c)` → `select_x(a,[f(x,c), f(y,c)])` — is a program REWRITE, not
+        # something a per-op twin can do, and is deliberately left out of this pass.
+        #
+        # Why it matters: design item B moves the σ switch from the folded OUTPUT to the geometry
+        # INPUTS, i.e. UPSTREAM of the whole body. Without (a), every σ-carrying expression would meet
+        # an unfoldable node first and degrade to probes — trading the `QrOp` just removed from the
+        # FEEC dependency path for a `SwitchOp`.
+        branches = args[1:]
+        if len(branches) != fn.n_branches or not branches:
+            reason.note(
+                f"SwitchOp: expected {fn.n_branches} branches, got {len(branches)}")
+            return None
+        if any(b is _OPAQUE for b in branches):
+            reason.note("SwitchOp: a branch is unresolved")
+            return None
+        vals = [_obj(b) for b in branches]
+        first = vals[0]
+        if all(v.shape == first.shape and np.array_equal(v, first) for v in vals[1:]):
+            return [first]                     # (a) the scrutinee is irrelevant
+        scr = args[0]
+        if scr is not _OPAQUE:                 # (b) a constant scrutinee picks its branch
+            s = np.asarray(_as_numeric(scr) if _as_numeric(scr) is not None else scr)
+            if s.size == 1:
+                try:
+                    k = int(s.reshape(-1)[0])
+                except (TypeError, ValueError):
+                    k = None
+                if k is not None and 0 <= k < len(vals):
+                    return [vals[k]]
+        reason.note("SwitchOp: branches differ and the scrutinee is not a build-time constant")
+        return None
     if isinstance(fn, KronOp):
         # Chained Kronecker product — pure field MULTIPLICATION of entries, so it threads
         # RationalFunction cells exactly (unlike `KronOp.__call__`, which coerces to float).
@@ -837,13 +878,24 @@ def _exec_stmt(
         reason.note("WhileOp / fn-less statement (never executed at build time)")
         return False                          # loops are never executed at build time
     args: list[Any] = []
-    for r in stmt.in_:
+    # A `SwitchOp`'s SCRUTINEE is allowed to stay unresolved. Its inputs are
+    # `(scrutinee, branch_0, …)`, and when every branch carries the SAME value the switch is the
+    # identity no matter which is picked — so the branch that a run-time-only `IntAtom` would select
+    # is irrelevant. Aborting on the unresolved scrutinee (as every other opaque operand does, and as
+    # this did) throws that away and freezes the whole downstream expression. Any opaque BRANCH is
+    # still fatal, exactly as before. See the `SwitchOp` twin in `_sym_apply`.
+    _is_switch = isinstance(stmt.fn, SwitchOp)
+    for _j, r in enumerate(stmt.in_):
         v = _resolve_ref(r, env, program)
         if v is _OPAQUE:
+            if _is_switch and _j == 0:
+                args.append(_OPAQUE)          # decided by the twin, from the branches alone
+                continue
             reason.note("operand depends on an unresolved statement / runtime-only ref")
             return False
         args.append(v)
-    numeric = [_as_numeric(a) for a in args]
+    _has_opaque = any(a is _OPAQUE for a in args)
+    numeric = [None] * len(args) if _has_opaque else [_as_numeric(a) for a in args]
     outs: list[Any] | None
     if all(n is not None for n in numeric):
         # Numeric-closed: run the REAL op — deterministic, the fold_numeric contract.
@@ -862,7 +914,7 @@ def _exec_stmt(
         # are rejected UP FRONT (⇒ unresolved ⇒ the warned probe fallback).  Sub-program
         # bodies are exempt here — their own statements are capped individually as they
         # execute, which is the finer (and cheaper) granularity.
-        if not isinstance(stmt.fn, (Program, CallOp)):
+        if not isinstance(stmt.fn, (Program, CallOp)) and not _has_opaque:
             mass = _sym_mass(args, max_sym_mass)
             if mass > max_sym_mass:
                 reason.note(
