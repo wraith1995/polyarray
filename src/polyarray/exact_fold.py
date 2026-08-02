@@ -550,6 +550,17 @@ def _exact_assert(fn: AssertOp, args: list[Any], deadline: float | None) -> list
         det = _exact_det(x, deadline)
         if _fe_is_zero(det):
             raise AssertionError(f"{fn.msg} [{fn.kind}] structurally singular")
+    elif fn.kind == "in_span":
+        # `‖v − P·pinv(P)·v‖ ≤ tol·scale` — a NORM INEQUALITY, so like `spd`'s positive-definiteness
+        # it is NOT decidable over the rational-function field. Pass the value through WITHOUT
+        # certifying, rather than raising: the raise made this statement OPAQUE, and everything
+        # downstream of it with it — a silent capability loss, not a check.
+        #
+        # Safe by the same argument `spd` records above: this twin only ever sees SYMBOLIC operands
+        # (an all-numeric statement takes the `_exec_fn` path, which runs the REAL `AssertOp` and
+        # performs the true test), and a symbolic non-constant operand is REFUTED, never folded away —
+        # so the run-time assert survives and still checks it on real data.
+        pass
     else:
         raise ValueError(f"AssertOp: unknown kind {fn.kind!r}")
     return [x]
