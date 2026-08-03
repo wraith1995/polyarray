@@ -29,10 +29,19 @@ contract — additions need it updated).
 
 - **One program, two lanes**: never fork numeric vs symbolic code paths; lane choice is a
   budget/value property.
-- Op vocabulary is the ~20 frozen `Stmt.fn` dataclasses in `ir.py` (incl. `GSvdOp` with its
-  documented reconstruction contract, `IdentityOp` = capture/freeze). New ops are rare
-  events: update `PUBLIC_API.md`, sparsity handling (default: mask reset), and
-  `to_numpy_source` rendering together.
+- Op vocabulary is the **56** frozen `Stmt.fn` dataclasses in `ir.py` (incl. `GSvdOp` with
+  its documented reconstruction contract, `IdentityOp` = capture/freeze), named by the
+  closed union **`ir.StmtFn`**. New ops are rare events: add to `StmtFn`, then run mypy —
+  every `match` closed by `assert_never` will name itself. Also update `PUBLIC_API.md`,
+  `__init__` exports, `degree.DEFAULT_DEGREE_KINDS`, and the pyab / `to_numpy_source`
+  render lanes; `tests/test_op_union.py` checks each mirror.
+- **Never dispatch over ops with a bare isinstance ladder.** `Stmt.fn` is half-open: handle
+  the open half (sub-`Program`, vmap closure, front-end op, plain callable) first, then
+  `is_builtin_op(fn)` + exhaustive `match` + `assert_never` (`exact_fold._sym_apply_builtin`
+  and `sparsity._apply_builtin_op` are the models). An op you deliberately do not handle
+  gets its own arm stating why — "opaque by omission" is what cost a day three times
+  (`KronOp`/`KronFreeOp` → FEEC Λ² at 0%; `SwitchOp` → every `select_x` frozen).
+- `ir.Ref` is polyarray's other closed sum type (6 members) — same treatment applies.
 - Poly backends selected by env: `CHARTLIB_POLY_BACKEND` ∈ sympy|flint|native_py|native_cpp,
   `CHARTLIB_POLY_COEFF` ∈ double|mpf|quad. `native_cpp` needs `make cython`. The
   `CHARTLIB_` prefix is **historical** (vendored from chartLib's `_symbolic`) — do NOT
