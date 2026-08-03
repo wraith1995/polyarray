@@ -1376,7 +1376,7 @@ class _Lowerer:
     def _const_expr(self, value: Any) -> Any:
         c = self.core
         if isinstance(value, np.ndarray):
-            return c.ArrayExpr(obj=_nested_tuple(c, value.tolist()), dtype=self._dtype_f64())
+            return _const_array_expr(c, value)
         return c.FloatLit(value=float(value))
 
     def _cells_expr_shared(self, cells: np.ndarray) -> Any:
@@ -1409,7 +1409,7 @@ class _Lowerer:
                 dtype=self._dtype_f64(),
             )
         if cells.dtype.kind == "f":
-            return c.ArrayExpr(obj=_nested_tuple(c, cells.tolist()), dtype=self._dtype_f64())
+            return _const_array_expr(c, cells)
         # Object dtype: RationalFunction and/or python floats. Assemble scalar
         # tensor leaves with ``stack`` so the result is a real backend tensor.
         return self._stack_cells(cells)
@@ -1495,6 +1495,20 @@ def _pylit(core: Any, value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return core.TupleExpr(elts=tuple(core.IntLit(value=int(v)) for v in value))
     return core.IntLit(value=int(value))
+
+
+def _const_array_expr(core: Any, value: Any) -> Any:
+    """A dense float constant as ONE ``ConstArrayExpr``.
+
+    The element-wise spelling (``ArrayExpr`` over a nested ``TupleExpr`` of
+    ``FloatLit``) costs one IR node per entry, which the FEEC tables make the
+    dominant term in everything downstream: at 3D r=4 it was 96% of the nodes
+    handed to the pyab passes and 84% of the emitted source text. ``ConstArray``
+    carries the raw buffer instead — exact, content-addressed, one node.
+    """
+    return core.ConstArrayExpr(
+        value=core.ConstArray.from_numpy(np.asarray(value, dtype=float))
+    )
 
 
 def _nested_tuple(core: Any, obj: Any) -> Any:
