@@ -2459,9 +2459,12 @@ def _op_shape(o: Any) -> tuple[int, ...]:
 
 
 def _einsum_label_dims(
-    input_parts: Sequence[str], operands: Sequence[np.ndarray],
+    input_parts: Sequence[str], operands: Sequence[SymArray | np.ndarray],
 ) -> dict[str, int]:
-    """Map each non-ellipsis label in the spec to the operand axis size it carries."""
+    """Map each non-ellipsis label in the spec to the operand axis size it carries.
+
+    Operands may be ``SymArray`` (including BULK ones): shapes are read through
+    :func:`_op_shape`, which answers from the placeholder and never materialises cells."""
     label_dim: dict[str, int] = {}
     for part, arr in zip(input_parts, operands):
         shp = _op_shape(arr)
@@ -2518,7 +2521,7 @@ def _estimate_einsum_output_terms(
 
 
 def _einsum_output_shape(
-    spec: str, operands: Sequence[np.ndarray],
+    spec: str, operands: Sequence[SymArray | np.ndarray],
 ) -> tuple[int, ...]:
     """Compute the output shape of ``np.einsum(spec, *operands)``.
 
