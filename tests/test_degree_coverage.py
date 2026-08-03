@@ -10,20 +10,14 @@ loudly, instead of silently at a consumer's integral.
 from __future__ import annotations
 
 from polyarray import degree, ir
-from polyarray.pyab import _ARRAY_OP_LOWERINGS
-
-# The Stmt.fn op vocabulary = the relocated array/linalg ops (the type-keyed pyab table,
-# enumerated dynamically so a NEW relocated op is auto-checked) + the native pyab-ladder
-# builtins (the isinstance vocabulary of _Lowerer._render_op).
-_LADDER_BUILTINS: frozenset[type] = frozenset({
-    ir.DetOp, ir.InvOp, ir.PinvOp, ir.SolveOp, ir.SqrtOp, ir.AbsOp, ir.SignOp,
-    ir.MoveaxisOp, ir.TensordotOp, ir.EinsumStmtOp, ir.EinsumOp, ir.IdentityOp,
-    ir.AssertOp, ir.SwitchOp, ir.QrOp, ir.SvdOp, ir.GSvdOp, ir.WhileOp, ir.CallOp,
-})
 
 
 def test_every_builtin_op_has_a_degree_category() -> None:
-    ops = set(_ARRAY_OP_LOWERINGS) | set(_LADDER_BUILTINS)
+    # The vocabulary is `ir.StmtFn` — the authoritative union — not a hand-kept list
+    # reconstructed from the render tables (which was itself a mirror that could go
+    # stale). `tests/test_op_union.py` pins the union against the ops `ir` defines, so
+    # this reads coverage off the real thing.
+    ops = set(ir.STMT_FN_OPS)
     missing = sorted(t.__name__ for t in ops if t not in degree.DEFAULT_DEGREE_KINDS)
     assert not missing, (
         "polyarray builtin ops with NO degree category in "

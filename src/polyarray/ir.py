@@ -29,7 +29,7 @@ import contextvars
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Union
+from typing import Any, Callable, Literal, TypeAlias, TypeGuard, Union, get_args
 
 import numpy as np
 
@@ -2381,6 +2381,63 @@ class SwitchOp:
                 f"[0, {self.n_branches})"
             )
         return np.asarray(args[1 + scrutinee])
+
+
+# ---------------------------------------------------------------------------
+# The op union — polyarray's CLOSED ``Stmt.fn`` vocabulary
+# ---------------------------------------------------------------------------
+#
+# ``Stmt.fn`` itself is deliberately OPEN (``Callable | Program | None``): a front end
+# above polyarray may put its own op class, a ``vmap`` closure, or a plain callable
+# there, and a sub-:class:`Program` is not an op at all.  What IS closed is the set of
+# ops **polyarray owns** — the ~56 frozen dataclasses defined above.  :data:`StmtFn`
+# names that set so a pass over it can be written as an exhaustive ``match`` finished by
+# ``typing.assert_never``: an op added to the union but missing from a pass becomes a
+# *mypy error* instead of a silent capability gap.
+#
+# This exists because omission-by-accident is polyarray's measured failure mode, not a
+# hypothetical one.  Three defects in one day, all "the op was simply not in the ladder":
+# ``KronOp``/``KronFreeOp`` missing from ``exact_fold._sym_apply`` froze the FEEC ``Λ²``
+# certificate at 0%; ``SwitchOp`` missing from ``exact_fold`` entirely froze every
+# ``select_x``; and a degree table keyed by class-NAME strings went stale across the
+# grassmann→polyarray op relocation (see ``degree.DEFAULT_DEGREE_KINDS``).  In every case
+# the op was opaque **by omission, never by decision**.
+#
+# Rule for a new op (with `CLAUDE.md`'s "new ops are rare events"): add it to
+# :data:`StmtFn` here, then run mypy — it will name every pass that must now state a
+# decision.  A *deliberate* non-handling is fine, but it must be an explicit arm that
+# says why.
+StmtFn: TypeAlias = Union[
+    # linalg / scalar deferrals
+    DetOp, InvOp, PinvOp, SolveOp, SqrtOp, AbsOp, SignOp, SvdOp, GSvdOp, QrOp,
+    InvTransposeOp, ComposeViaStdOp, SqrtSpdOp, RankOp, MetricOrthonormalOp,
+    SinvFullOp, GSvdFullOp,
+    # contraction / structural
+    TensordotOp, MoveaxisOp, EinsumOp, EinsumStmtOp, TransposeOp, ReshapeOp,
+    HStackOp, ColStackOp, ConcatOp, AddOp, ScaleOp, ScaleByOp, AxisLenOp,
+    BlockDiagOp, BlockRepeatOp, DynBlockRepeatOp, KronOp, KronFreeOp,
+    FirstColsOp, LastColsOp, ProjectOp, EmbedOp,
+    # constants / shape-derived sizes (DimAtom sources)
+    ConstOp, EyeOp, DynEyeOp, DynZerosOp, DynEyeTensorOp, ProdShapeOp, SumShapeOp,
+    SumDimOp, ProdDimOp, ScaleAxisDimOp, MulAxisDimOp, CompRankOp,
+    # capture / guard / control flow
+    IdentityOp, AssertOp, SwitchOp, CallOp, WhileOp,
+]
+
+#: The same vocabulary as a runtime ``isinstance`` tuple — derived from :data:`StmtFn`,
+#: so the two can never drift.
+STMT_FN_OPS: tuple[type, ...] = get_args(StmtFn)
+
+
+def is_builtin_op(fn: object) -> TypeGuard[StmtFn]:
+    """Whether ``fn`` is one of polyarray's OWN ops (:data:`StmtFn`).
+
+    The narrowing gate in front of an exhaustive ``match``: everything else a
+    ``Stmt.fn`` may hold — a sub-:class:`Program`, a ``vmap`` closure, a front-end op
+    class, a plain callable, ``None`` — is genuinely open and must be handled *before*
+    this check, not inside the match.
+    """
+    return isinstance(fn, STMT_FN_OPS)
 
 
 def _einsum_int_to_str(args: Sequence[Any]) -> tuple[str, list[np.ndarray]]:

@@ -47,22 +47,36 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, assert_never
 
 import numpy as np
 
 from .ir import (
+    AbsOp,
     AddOp,
     AssertOp,
     AxisLenOp,
+    BlockDiagOp,
+    BlockRepeatOp,
     CallOp,
     ColStackOp,
+    CompRankOp,
+    ComposeViaStdOp,
     ConcatOp,
     Const,
+    ConstOp,
     DetOp,
+    DynBlockRepeatOp,
+    DynEyeOp,
+    DynEyeTensorOp,
+    DynZerosOp,
     EinsumOp,
     EinsumStmtOp,
     EmbedOp,
+    EyeOp,
+    FirstColsOp,
+    GSvdFullOp,
+    GSvdOp,
     HStackOp,
     IdentityOp,
     InputRef,
@@ -71,22 +85,39 @@ from .ir import (
     InvTransposeOp,
     KronFreeOp,
     KronOp,
-    SwitchOp,
+    LastColsOp,
+    MetricOrthonormalOp,
     MoveaxisOp,
+    MulAxisDimOp,
     OutputRef,
     PinvOp,
+    ProdDimOp,
+    ProdShapeOp,
     Program,
     ProjectOp,
+    QrOp,
+    RankOp,
     RationalRef,
     ReshapeOp,
+    ScaleAxisDimOp,
     ScaleByOp,
     ScaleOp,
+    SignOp,
+    SinvFullOp,
     SolveOp,
+    SqrtOp,
+    SqrtSpdOp,
     Stmt,
+    StmtFn,
+    SumDimOp,
+    SumShapeOp,
+    SvdOp,
+    SwitchOp,
     SymArrayRef,
     TensordotOp,
     TransposeOp,
     WhileOp,
+    is_builtin_op,
     is_dynamic,
 )
 from .rational import RationalFunction
@@ -574,61 +605,108 @@ def _obj(a: Any) -> np.ndarray:
 
 # --- symbolic op twins ------------------------------------------------------
 
+def _opaque_name(fn: Any) -> str:
+    """The human name this lane reports for an op it will not execute symbolically."""
+    name = type(fn).__name__
+    if isinstance(fn, CallOp):
+        inner = fn.fn
+        return f"CallOp({'vmap closure' if hasattr(inner, '_vmap_body') else type(inner).__name__})"
+    if hasattr(fn, "_vmap_body"):
+        return f"vmap closure ({name})"
+    return name
+
+
+def _opaque(fn: Any, reason: _Reason) -> list[Any] | None:
+    """Record ``fn`` as opaque on the symbolic path; always ``None`` (never a guess)."""
+    reason.note(f"opaque op {_opaque_name(fn)} on the symbolic path")
+    return None
+
+
 def _sym_apply(
     fn: Any, args: list[Any], deadline: float, depth: int, reason: _Reason,
     max_sym_mass: int,
 ) -> list[Any] | None:
-    """Execute one op over exact symbolic operands; ``None`` = opaque (no guess)."""
-    if isinstance(fn, EinsumStmtOp):
+    """Execute one op over exact symbolic operands; ``None`` = opaque (no guess).
+
+    Two layers, because ``Stmt.fn`` is only *half* closed.  The OPEN half — a
+    sub-:class:`~polyarray.ir.Program`, a ``vmap`` closure, a front-end op class, a plain
+    callable — is dispatched here; polyarray's own :data:`~polyarray.ir.StmtFn` vocabulary
+    is dispatched by :func:`_sym_apply_builtin`, exhaustively.
+    """
+    if isinstance(fn, Program):
+        return _run_program(fn, args, deadline, depth + 1, reason, max_sym_mass)
+    if isinstance(fn, CallOp) and isinstance(fn.fn, Program):
+        return _run_program(fn.fn, args, deadline, depth + 1, reason, max_sym_mass)
+    closure = _vmap_closure(fn)
+    if closure is not None:
+        return _run_vmap(closure, args, deadline, depth, reason, max_sym_mass)
+    if is_builtin_op(fn):
+        return _sym_apply_builtin(fn, args, deadline, reason)
+    return _opaque(fn, reason)                 # front-end op / plain callable / hookless vmap
+
+
+def _sym_apply_builtin(
+    fn: StmtFn, args: list[Any], deadline: float, reason: _Reason,
+) -> list[Any] | None:
+    """The EXACT twin of one polyarray-owned op; ``None`` = opaque (no guess).
+
+    EXHAUSTIVE over :data:`~polyarray.ir.StmtFn` — every op either has a rational twin or
+    an explicit arm **stating why it has none**.  ``assert_never`` at the bottom makes a
+    newly added op a mypy error here, which is the whole point: ``KronOp`` / ``KronFreeOp``
+    (FEEC ``Λ²`` certified at 0%) and ``SwitchOp`` (every ``select_x`` frozen) were both
+    silently absent from the ladder this replaced, and nothing said so.
+    """
+    match fn:
+      case EinsumStmtOp():
         return [np.einsum(fn.spec, *[_obj(a) for a in args], optimize=False)]
-    if isinstance(fn, EinsumOp):
+      case EinsumOp():
         rhs = np.frombuffer(fn.rhs_bytes, dtype=fn.rhs_dtype).reshape(fn.rhs_shape)
         return [np.einsum(fn.spec, _obj(args[0]), _obj(rhs), optimize=False)]
-    if isinstance(fn, TensordotOp):
+      case TensordotOp():
         return [np.tensordot(_obj(args[0]), _obj(args[1]), axes=fn.axes)]
-    if isinstance(fn, TransposeOp):
+      case TransposeOp():
         return [np.asarray(args[0]).T]
-    if isinstance(fn, MoveaxisOp):
+      case MoveaxisOp():
         return [np.moveaxis(np.asarray(args[0]), fn.source, fn.destination)]
-    if isinstance(fn, ReshapeOp):
+      case ReshapeOp():
         return [np.asarray(args[0]).reshape(fn.shape)]
-    if isinstance(fn, IdentityOp):
+      case IdentityOp():
         return [np.asarray(args[0])]
-    if isinstance(fn, AddOp):
+      case AddOp():
         out = _obj(args[0]).copy()
         for x in args[1:]:
             out = out + _obj(x)
         return [out]
-    if isinstance(fn, ScaleOp):
+      case ScaleOp():
         return [fn.factor * _obj(args[0])]
-    if isinstance(fn, ScaleByOp):
+      case ScaleByOp():
         return [_obj(args[1]) * _obj(args[0])]
-    if isinstance(fn, ConcatOp):
+      case ConcatOp():
         return [np.concatenate([_obj(x).reshape(-1) for x in args])]
-    if isinstance(fn, HStackOp):
+      case HStackOp():
         return [np.hstack([_obj(m) for m in args])]
-    if isinstance(fn, ColStackOp):
+      case ColStackOp():
         return [np.stack([_obj(c).reshape(-1) for c in args], axis=1)]
-    if isinstance(fn, InvOp):
+      case InvOp():
         return [_exact_inv(args[0], deadline)]
-    if isinstance(fn, InvTransposeOp):
+      case InvTransposeOp():
         return [_exact_inv(args[0], deadline).T]
-    if isinstance(fn, SolveOp):
+      case SolveOp():
         return [_exact_solve(args[0], args[1], deadline)]
-    if isinstance(fn, DetOp):
+      case DetOp():
         return [np.asarray(_exact_det(args[0], deadline), dtype=object)]
-    if isinstance(fn, PinvOp):
+      case PinvOp():
         return [_exact_pinv(args[0], deadline)]
-    if isinstance(fn, ProjectOp):
+      case ProjectOp():
         # ``Pᵀ @ v.reshape(-1)`` — the grassmann-origin drop-complement matvec.  Pure field
         # arithmetic (no float coercion, unlike ``ProjectOp.__call__``'s numeric contract), so
         # it threads RF cells exactly.
         return [np.einsum("nr,n->r", _obj(args[0]), _obj(args[1]).reshape(-1), optimize=False)]
-    if isinstance(fn, EmbedOp):
+      case EmbedOp():
         # ``(P @ vsub).reshape(op.shape)`` — the ambient reconstruction.
         out = np.einsum("ij,j...->i...", _obj(args[0]), _obj(args[1]), optimize=False)
         return [out.reshape(fn.shape) if fn.shape else out]
-    if isinstance(fn, SwitchOp):
+      case SwitchOp():
         # `select_x` over an `IntAtom`: inputs are `(scrutinee, branch_0, …, branch_{n-1})`.
         #
         # MINIMAL fold, deliberately (Teo 2026-08-01) — two sound cases and no guessing:
@@ -668,7 +746,7 @@ def _sym_apply(
                     return [vals[k]]
         reason.note("SwitchOp: branches differ and the scrutinee is not a build-time constant")
         return None
-    if isinstance(fn, KronOp):
+      case KronOp():
         # Chained Kronecker product — pure field MULTIPLICATION of entries, so it threads
         # RationalFunction cells exactly (unlike `KronOp.__call__`, which coerces to float).
         # STRICTLY 2-D only: the twin below is the matrix Kronecker product, and a non-matrix
@@ -684,7 +762,7 @@ def _sym_apply(
             out = (out[:, None, :, None] * m[None, :, None, :]).reshape(
                 out.shape[0] * m.shape[0], out.shape[1] * m.shape[1])
         return [out]
-    if isinstance(fn, KronFreeOp):
+      case KronFreeOp():
         # The Kron block with trailing free axes — the same elementwise product as
         # `KronFreeOp.__call__`, done in object dtype so exact cells survive.  Leaving this
         # un-normalizable made the exact lane refuse every FEEC `Λᵏ` certificate: the wedge's
@@ -703,27 +781,81 @@ def _sym_apply(
         fr = F.reshape(df, 1, cf, 1, *ff, *([1] * fn.ng_free))
         gr = G.reshape(1, dg, 1, cg, *([1] * fn.nf_free), *gg)
         return [(fr * gr).reshape(df * dg, cf * cg, *ff, *gg)]
-    if isinstance(fn, AxisLenOp):
+      case AxisLenOp():
         # A STRUCTURAL read: the operand's static axis length, independent of its cells — so it
         # is exact (and constant) even when the operand is fully symbolic.
         return [np.asarray(float(np.asarray(args[0]).shape[fn.axis]))]
-    if isinstance(fn, AssertOp):
+      case AssertOp():
         return _exact_assert(fn, args, deadline)
-    if isinstance(fn, Program):
-        return _run_program(fn, args, deadline, depth + 1, reason, max_sym_mass)
-    if isinstance(fn, CallOp) and isinstance(fn.fn, Program):
-        return _run_program(fn.fn, args, deadline, depth + 1, reason, max_sym_mass)
-    closure = _vmap_closure(fn)
-    if closure is not None:
-        return _run_vmap(closure, args, deadline, depth, reason, max_sym_mass)
-    name = type(fn).__name__
-    if isinstance(fn, CallOp):
-        inner = fn.fn
-        name = f"CallOp({'vmap closure' if hasattr(inner, '_vmap_body') else type(inner).__name__})"
-    elif hasattr(fn, "_vmap_body"):
-        name = f"vmap closure ({name})"
-    reason.note(f"opaque op {name} on the symbolic path")
-    return None                               # opaque: QR / SVD / sqrt / vmap / front-end op
+
+      # --- deliberately opaque: NOT a rational function of the operands ------------
+      #
+      # The exact lane's field is ℚ(atoms) — rational functions with exact `fmpq`
+      # coefficients.  Each op below leaves that field, so there is no twin to write; a
+      # symbolic operand here is genuinely unresolved and the statement degrades to the
+      # (warned) probe fallback.  This is a DECISION, not an omission.
+      case QrOp() | SvdOp() | GSvdOp() | GSvdFullOp() | SqrtOp() | SqrtSpdOp() \
+              | MetricOrthonormalOp() | SinvFullOp():
+        # Orthogonal / singular-value factorizations, square roots and Cholesky: the
+        # entries are ALGEBRAIC (roots of the operand's entries), not rational, and the
+        # factors are not even unique without a sign/ordering convention.  `SinvFullOp`
+        # additionally divides by singular values under a runtime rank cut.
+        return _opaque(fn, reason)
+      case AbsOp() | SignOp() | RankOp() | CompRankOp():
+        # ORDER predicates on the reals (|·|, sign, a tolerance-gated numeric rank).  A
+        # rational function has no decidable sign over ℚ(atoms) — deciding one would mean
+        # choosing a branch, i.e. guessing.  (`CompRankOp` = ambient − rank inherits it.)
+        return _opaque(fn, reason)
+      case WhileOp():
+        # Control flow: never executed at build time.  `_exec_stmt` bails on a `WhileOp`
+        # before it reaches here; the arm exists so the decision is stated, not implied.
+        return _opaque(fn, reason)
+      case CallOp():
+        # A `CallOp` over a `Program` or a REBUILDABLE vmap closure is descended by
+        # `_sym_apply` before this function is called.  What is left wraps something this
+        # lane cannot enter — a front-end callable, or a vmap closure that does not expose
+        # its axis tuples (slicing it would be a guess).
+        return _opaque(fn, reason)
+
+      # --- deliberately opaque: unreachable on the symbolic path -------------------
+      #
+      # `_exec_stmt` only calls this function when at least one operand failed to resolve
+      # numerically.  These ops take NO operands at all, so they are always numeric-closed
+      # and run their real `__call__` on the numeric lane (the `fold_numeric` contract).
+      case ConstOp() | EyeOp():
+        return _opaque(fn, reason)
+
+      # --- NOT YET IMPLEMENTED: real capability gaps, not opacity ------------------
+      #
+      # Each op below IS expressible over ℚ(atoms) — it is pure field arithmetic, a pure
+      # slice, or a read of static SHAPE data — so a twin would extend the certificate.
+      # None exists yet.  Writing one changes what folds (hence numerics downstream), so
+      # they are listed, not silently grouped with the algebraic ops above.  Ranked by the
+      # evidence in `polyarray/CLAUDE.md`'s ledger, `ComposeViaStdOp` is the sharpest: it
+      # is literally `solve(R_to, R_from)`, and `_exact_solve` — the twin it needs — is
+      # already in this module, used by the `SolveOp` arm above.
+      case ComposeViaStdOp():
+        # `solve(R_to, R_from)` — the SAME exact Gauss elimination as the `SolveOp` arm.
+        return _opaque(fn, reason)
+      case BlockDiagOp() | BlockRepeatOp() | DynBlockRepeatOp():
+        # Block assembly / `kron(eye(n), A)`.  Pure structure + field arithmetic, the same
+        # argument that earned `KronOp` its twin (`BlockRepeatOp` IS a Kronecker product).
+        # `DynBlockRepeatOp` additionally needs its runtime count to resolve to a constant.
+        return _opaque(fn, reason)
+      case FirstColsOp() | LastColsOp():
+        # `A[:, :int(rank)]` / `A[:, int(rank):]` — a pure SLICE, exact over RF cells
+        # whenever the `rank` operand resolves to a build-time constant.
+        return _opaque(fn, reason)
+      case DynEyeOp() | DynZerosOp() | DynEyeTensorOp() | ProdShapeOp() | SumShapeOp() \
+              | SumDimOp() | ProdDimOp() | ScaleAxisDimOp() | MulAxisDimOp():
+        # STRUCTURAL reads: the result is a function of the operands' static SHAPES, not of
+        # their cells, so it is an exact constant even under a fully symbolic operand —
+        # exactly the argument that makes the `AxisLenOp` arm above sound.  (`MulAxisDimOp`
+        # additionally needs its runtime count operand to resolve.)
+        return _opaque(fn, reason)
+
+      case _ as unreachable:
+        assert_never(unreachable)
 
 
 def _vmap_closure(fn: Any) -> tuple[Program, tuple, tuple] | None:

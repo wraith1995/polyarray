@@ -39,34 +39,86 @@ Modeled propagation rules
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeAlias, assert_never
 
 import numpy as np
 
 from .ir import (
+    AbsOp,
+    AddOp,
     AssertOp,
+    AxisLenOp,
+    BlockDiagOp,
+    BlockRepeatOp,
+    CallOp,
+    ColStackOp,
+    CompRankOp,
+    ComposeViaStdOp,
+    ConcatOp,
     Const,
+    ConstOp,
+    DetOp,
+    DynBlockRepeatOp,
+    DynEyeOp,
+    DynEyeTensorOp,
+    DynZerosOp,
     EinsumOp,
     EinsumStmtOp,
+    EmbedOp,
+    EyeOp,
+    FirstColsOp,
+    GSvdFullOp,
+    GSvdOp,
+    HStackOp,
     IdentityOp,
     InputRef,
     IntAtomRef,
+    InvOp,
+    InvTransposeOp,
+    KronFreeOp,
+    KronOp,
+    LastColsOp,
+    MetricOrthonormalOp,
     MoveaxisOp,
+    MulAxisDimOp,
     OutputRef,
+    PinvOp,
+    ProdDimOp,
+    ProdShapeOp,
     Program,
+    ProjectOp,
+    QrOp,
+    RankOp,
     RationalRef,
+    ReshapeOp,
+    ScaleAxisDimOp,
+    ScaleByOp,
+    ScaleOp,
+    SignOp,
+    SinvFullOp,
+    SolveOp,
+    SqrtOp,
+    SqrtSpdOp,
     Stmt,
+    StmtFn,
+    SumDimOp,
+    SumShapeOp,
+    SvdOp,
+    SwitchOp,
     SymArray,
     SymArrayRef,
     TensordotOp,
+    TransposeOp,
+    WhileOp,
     cells_sparsity,
+    is_builtin_op,
     is_dynamic,
 )
 from .rational import simple_zero
 
 # A mask is an ``ndarray`` of bool (True = structurally zero), or ``None`` when
 # the shape is dynamic / unknown (treated as all-False / unknown by consumers).
-Mask = "np.ndarray | None"
+Mask: TypeAlias = "np.ndarray | None"
 
 
 # ---------------------------------------------------------------------------
@@ -289,14 +341,38 @@ def _checked(m: Mask, osa: SymArray) -> Mask:
 def _apply_op(stmt: Stmt, in_masks: list[Mask]) -> list[Mask]:
     """Apply the modeled propagation rule for ``stmt.fn`` to its input masks.
 
-    Any op not modeled here (every opaque numeric op, control flow, a
-    sub-``Program``) resets every output to all-False (unknown).
+    ``stmt.fn`` is only half closed: a sub-:class:`~polyarray.ir.Program`, a ``vmap``
+    closure and a front-end op class are all legal and have no modeled rule here, so they
+    reset to unknown.  polyarray's OWN vocabulary is dispatched exhaustively by
+    :func:`_apply_builtin_op`.
     """
-    fn = stmt.fn
     outs = stmt.out
+    unknown = [_false_mask(o) for o in outs]
+    if not is_builtin_op(stmt.fn):
+        return unknown                    # sub-Program / vmap closure / front-end op
+    return _apply_builtin_op(stmt.fn, in_masks, outs, unknown)
 
-    # --- contraction ops -------------------------------------------------
-    if isinstance(fn, TensordotOp) and len(in_masks) == 2 and len(outs) == 1:
+
+def _apply_builtin_op(
+    fn: StmtFn, in_masks: list[Mask], outs: tuple[SymArray, ...], unknown: list[Mask],
+) -> list[Mask]:
+    """The modeled mask rule for one polyarray-owned op.
+
+    EXHAUSTIVE over :data:`~polyarray.ir.StmtFn`; ``assert_never`` makes a newly added op
+    a mypy error rather than a silent fall-through.
+
+    **Unlike the exact-fold lane, an omission here is not a soundness bug**: ``unknown``
+    (all-False) is the conservative answer for every op, and the pass's hard rule is that
+    false *negatives* are safe while false *positives* are a correctness bug.  So the
+    grouped arm below is a PRECISION ledger, not a correctness one — but it is still a
+    ledger, which is the point: "no rule yet" now has to be written down per op instead of
+    being the silent default.
+    """
+    match fn:
+      # --- contraction ops -------------------------------------------------
+      case TensordotOp():
+        if len(in_masks) != 2 or len(outs) != 1:
+            return unknown
         a, b = in_masks
         if a is None or b is None:
             return [_false_mask(outs[0])]
@@ -306,7 +382,9 @@ def _apply_op(stmt: Stmt, in_masks: list[Mask]) -> list[Mask]:
             return [_false_mask(outs[0])]
         return [_checked(m, outs[0])]
 
-    if isinstance(fn, EinsumOp) and len(in_masks) == 1 and len(outs) == 1:
+      case EinsumOp():
+        if len(in_masks) != 1 or len(outs) != 1:
+            return unknown
         lhs = in_masks[0]
         if lhs is None:
             return [_false_mask(outs[0])]
@@ -317,7 +395,9 @@ def _apply_op(stmt: Stmt, in_masks: list[Mask]) -> list[Mask]:
             return [_false_mask(outs[0])]
         return [_checked(m, outs[0])]
 
-    if isinstance(fn, EinsumStmtOp) and len(outs) == 1:
+      case EinsumStmtOp():
+        if len(outs) != 1:
+            return unknown
         if any(m is None for m in in_masks):
             return [_false_mask(outs[0])]
         try:
@@ -326,8 +406,10 @@ def _apply_op(stmt: Stmt, in_masks: list[Mask]) -> list[Mask]:
             return [_false_mask(outs[0])]
         return [_checked(m, outs[0])]
 
-    # --- shape / passthrough ops ----------------------------------------
-    if isinstance(fn, MoveaxisOp) and len(in_masks) == 1 and len(outs) == 1:
+      # --- shape / passthrough ops ----------------------------------------
+      case MoveaxisOp():
+        if len(in_masks) != 1 or len(outs) != 1:
+            return unknown
         x = in_masks[0]
         if x is None:
             return [_false_mask(outs[0])]
@@ -337,17 +419,59 @@ def _apply_op(stmt: Stmt, in_masks: list[Mask]) -> list[Mask]:
             return [_false_mask(outs[0])]
         return [_checked(m, outs[0])]
 
-    # ``IdentityOp`` freezes a heavy cell as a fresh atom — value-preserving.
-    # ``AssertOp`` returns its first input unchanged.  Both pass the (first)
-    # input's mask straight through.
-    if isinstance(fn, (IdentityOp, AssertOp)) and in_masks and len(outs) == 1:
+      # ``IdentityOp`` freezes a heavy cell as a fresh atom — value-preserving.
+      # ``AssertOp`` returns its first input unchanged.  Both pass the (first)
+      # input's mask straight through.
+      case IdentityOp() | AssertOp():
+        if not in_masks or len(outs) != 1:
+            return unknown
         x = in_masks[0]
         if x is None:
             return [_false_mask(outs[0])]
         return [_checked(x, outs[0])]
 
-    # --- everything else is opaque: reset to unknown --------------------
-    return [_false_mask(o) for o in outs]
+      # --- genuinely opaque: a structural zero cannot survive --------------
+      #
+      # A zero entry of the operand says nothing about a zero entry of the result: an
+      # inverse / factorization / square root / sign mixes every entry, a rank or shape
+      # read is not entrywise at all, and control flow picks a branch this pass does not
+      # follow.  All-False (unknown) is the RIGHT answer here, not merely a safe one.
+      case DetOp() | InvOp() | InvTransposeOp() | PinvOp() | SolveOp() | ComposeViaStdOp() \
+              | SqrtOp() | SqrtSpdOp() | QrOp() | SvdOp() | GSvdOp() | GSvdFullOp() \
+              | SinvFullOp() | MetricOrthonormalOp() | AbsOp() | SignOp() | RankOp() \
+              | CompRankOp() | SwitchOp() | CallOp() | WhileOp():
+        return unknown
+
+      # --- constants: a mask could be read off the value, but is not -------
+      #
+      # `ConstOp` / `EyeOp` / `DynEyeOp` / `DynZerosOp` / `DynEyeTensorOp` produce
+      # KNOWN arrays (an identity is zero off the diagonal; `DynZerosOp` is zero
+      # everywhere).  Modeling them would be sound and would seed real structure into a
+      # downstream contraction — the `DynZerosOp` case especially, since it is *entirely*
+      # zero and currently propagates as fully unknown.  Not implemented: a precision gap.
+      case ConstOp() | EyeOp() | DynEyeOp() | DynZerosOp() | DynEyeTensorOp():
+        return unknown
+
+      # --- shape-derived 0-d ints: no cells to mask ------------------------
+      case AxisLenOp() | ProdShapeOp() | SumShapeOp() | SumDimOp() | ProdDimOp() \
+              | ScaleAxisDimOp() | MulAxisDimOp():
+        return unknown
+
+      # --- structural rearrangement: modelable, NOT modeled ----------------
+      #
+      # Every op here permutes / slices / tiles / adds / scales entries, so its output mask
+      # is an exact function of its input masks (the same class of rule as `MoveaxisOp`
+      # above, which IS modeled).  These are the real precision gaps in this pass:
+      # `ReshapeOp` and `TransposeOp` in particular sit on ordinary lowering paths and
+      # currently erase a mask that was fully known one statement earlier.
+      case TransposeOp() | ReshapeOp() | HStackOp() | ColStackOp() | ConcatOp() \
+              | AddOp() | ScaleOp() | ScaleByOp() | BlockDiagOp() | BlockRepeatOp() \
+              | DynBlockRepeatOp() | KronOp() | KronFreeOp() | FirstColsOp() \
+              | LastColsOp() | ProjectOp() | EmbedOp():
+        return unknown
+
+      case _ as unreachable:
+        assert_never(unreachable)
 
 
 # ---------------------------------------------------------------------------
