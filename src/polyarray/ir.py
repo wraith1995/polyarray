@@ -1005,17 +1005,33 @@ class SymArray:
         ``"mi...,ip->mp..."``). Numeric short-circuit when every operand is a float array; object
         cell-arithmetic (``RationalFunction`` ``*``/``+``) otherwise. One program, two lanes (as
         :meth:`matmul`). The bound program is ``self``'s; any ``SymArray`` operand must share it (or be
-        program-less / numeric)."""
+        program-less / numeric).
+
+        **Bulk in, bulk out** (as :meth:`reshape`): a contraction wants no per-cell VALUES, only the
+        contraction itself — but ``.cells`` auto-unpacks a bulk array (one ``unpack`` Stmt materialising
+        every per-cell atom, then an object-dtype ``np.einsum`` doing ring arithmetic over them). When any
+        operand is a bulk (deferred whole-tensor) :class:`SymArray` and a program is present, the
+        contraction is handed to :func:`runtime_einsum_multi`, whose bulk branch emits ONE
+        :class:`EinsumStmtOp` :class:`Stmt` and keeps the chain deferred. Mathematically the same
+        contraction; it is simply not densified into the symbolic ring on the way. A bulk array is by
+        construction a Stmt output (opaque atoms), so this never intercepts the numeric lane, and a
+        non-bulk operand set takes exactly the code below."""
         prog = self.program
-        cells = [self.cells]
+        operands: list[SymArray | np.ndarray] = [self]
         for o in others:
             if isinstance(o, SymArray):
                 if o.program is not None and prog is not None and o.program is not prog:
                     raise ValueError("SymArray.einsum: operands bind different programs")
                 prog = prog or o.program
-                cells.append(o.cells)
-            else:
-                cells.append(_to_cells(o))
+            operands.append(o)
+        if prog is not None and any(
+            isinstance(o, SymArray) and o._bulk is not None for o in operands
+        ):
+            out = runtime_einsum_multi(
+                subscripts, *operands, program=prog,
+                out_shape=_einsum_output_shape(subscripts, operands), name="einsum")
+            return out if isinstance(out, SymArray) else SymArray(np.asarray(out), program=prog)
+        cells = [_to_cells(o) for o in operands]
         if all(c.dtype.kind == "f" for c in cells):                # numeric lane
             return SymArray(np.einsum(subscripts, *cells), program=prog)
         return SymArray(np.einsum(subscripts, *[_ensure_object(c) for c in cells]), program=prog)  # object lane
@@ -2443,9 +2459,12 @@ def _op_shape(o: Any) -> tuple[int, ...]:
 
 
 def _einsum_label_dims(
-    input_parts: Sequence[str], operands: Sequence[np.ndarray],
+    input_parts: Sequence[str], operands: Sequence[SymArray | np.ndarray],
 ) -> dict[str, int]:
-    """Map each non-ellipsis label in the spec to the operand axis size it carries."""
+    """Map each non-ellipsis label in the spec to the operand axis size it carries.
+
+    Operands may be ``SymArray`` (including BULK ones): shapes are read through
+    :func:`_op_shape`, which answers from the placeholder and never materialises cells."""
     label_dim: dict[str, int] = {}
     for part, arr in zip(input_parts, operands):
         shp = _op_shape(arr)
@@ -2502,7 +2521,7 @@ def _estimate_einsum_output_terms(
 
 
 def _einsum_output_shape(
-    spec: str, operands: Sequence[np.ndarray],
+    spec: str, operands: Sequence[SymArray | np.ndarray],
 ) -> tuple[int, ...]:
     """Compute the output shape of ``np.einsum(spec, *operands)``.
 
