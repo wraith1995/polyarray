@@ -1028,13 +1028,17 @@ def exact_partial_eval(
                 state.unresolved[j] = "time budget exhausted"
             break
         if verdict == "fold":
+            # All-or-nothing WITHOUT copying the accumulated bindings per statement (the same
+            # quadratic spelling `simplify`'s probe lane carried): `_record_known` only WRITES
+            # into the dict it is given, so recording into an empty one and merging on success
+            # is entry-for-entry identical, while a raise still leaves `state.known` untouched.
+            staged: dict[str, Any] = {}
             try:
-                staged = dict(state.known)
                 _record_known(stmt, const_outs, staged)
             except ValueError:
                 state.unresolved[i] = "fold shape mismatch"
                 continue
-            state.known = staged
+            state.known.update(staged)
             state.folded.add(i)
             # Downstream exact execution should see the folded constants.
             for k, num in enumerate(const_outs):

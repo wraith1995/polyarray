@@ -101,9 +101,19 @@ def _try_eval_ref(
     prog: Program, ref: Any, stmt_idx: int, known: Mapping[str, float],
 ) -> np.ndarray | None:
     """Resolve ``ref`` to a concrete float array using ``known``; None if any
-    needed generator is still symbolic."""
+    needed generator is still symbolic.
+
+    NO DEFENSIVE COPY when ``known`` is already a ``dict``: every branch of
+    :meth:`Program._resolve_ref` only READS its ``bindings`` (``_eval_symarray`` →
+    ``_evaluate_cells`` → ``_eval_cell`` → ``_eval_rf``, ``_eval_rf`` on a
+    ``RationalRef``, a plain lookup for an ``IntAtomRef``/bulk name) — nothing writes
+    back. The ``dict(known)`` this used to do was a type coercion, and it ran ONCE PER
+    REF of every surviving statement over a ``known`` that reaches 10⁵+ atoms on the
+    P⁻₄Λ¹(TET) affine gate. A non-``dict`` ``Mapping`` is still materialised, so the
+    signature's contract is unchanged."""
+    b: dict[str, float] = known if isinstance(known, dict) else dict(known)
     try:
-        return np.asarray(prog._resolve_ref(ref, stmt_idx, dict(known)), dtype=float)
+        return np.asarray(prog._resolve_ref(ref, stmt_idx, b), dtype=float)
     except Exception:
         return None
 
@@ -865,12 +875,20 @@ def _partial_eval_numeric(
             )
             if not invariant:
                 continue
+            # ATOMICITY WITHOUT AN O(N²) COPY. `_record_known` must be all-or-nothing (it
+            # raises `ValueError` on a shape mismatch, and a half-recorded fold would poison
+            # `known`), which used to be spelled `staged = dict(known)` — a FULL COPY of the
+            # accumulated bindings for EVERY frozen statement, i.e. quadratic in the number of
+            # freezes. `_record_known` only ever WRITES into the dict it is handed (it never
+            # reads it), so recording into an EMPTY dict and merging on success writes exactly
+            # the same entries, and a raise still leaves `known` untouched. Measured on the
+            # P⁻₄Λ¹(TET) affine gate: 74 252 freezes over a `known` that grows past 10⁵ atoms.
+            staged: dict[str, Any] = {}
             try:
-                staged = dict(known)
                 _record_known(stmt, outs0, staged)
             except ValueError:
                 continue
-            known = staged
+            known.update(staged)
             probe_frozen.add(i)
         foldable |= probe_frozen
 

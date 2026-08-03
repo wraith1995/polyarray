@@ -1376,7 +1376,7 @@ class _Lowerer:
     def _const_expr(self, value: Any) -> Any:
         c = self.core
         if isinstance(value, np.ndarray):
-            return c.ArrayExpr(obj=_nested_tuple(c, value.tolist()), dtype=self._dtype_f64())
+            return _const_array_expr(c, value)
         return c.FloatLit(value=float(value))
 
     def _cells_expr_shared(self, cells: np.ndarray) -> Any:
@@ -1384,10 +1384,18 @@ class _Lowerer:
         OBJECT-dtype cell array ONCE into a Var (keyed on ``id(cells)``) and reuse it,
         so a SymArray consumed as an operand by many Stmts is materialised a single time
         rather than re-scattered element-wise (nested ``stack`` of per-cell ``_poly_to_ir``
-        trees) at every consumption site — the dominant non-bulk codegen blow-up.  Float /
-        empty arrays fall through (a cheap single ``ArrayExpr``; not worth a Var)."""
+        trees) at every consumption site — the dominant non-bulk codegen blow-up.
+
+        Float arrays go through the same Var now.  They used to fall through ("not worth
+        a Var") because each was a unique object and a cheap single expression; neither
+        holds any more.  ``ConstArrayExpr`` makes the operand one node carrying the whole
+        table, and pyab's CSE only dedupes an expression that is an assignment RHS — an
+        inline operand is re-emitted in full at every use site.  Binding the Var turns
+        those uses into references; pyab's content-addressed CSE then collapses the
+        bindings themselves, so an id-keyed memo here still lands on distinct-by-content.
+        Empty arrays keep falling through (nothing to share)."""
         arr = np.asarray(cells)
-        if arr.dtype != object or arr.size == 0:
+        if arr.size == 0:
             return self._cells_expr(cells)
         key = id(cells)
         hit = self._cells_cse.get(key)
@@ -1409,7 +1417,7 @@ class _Lowerer:
                 dtype=self._dtype_f64(),
             )
         if cells.dtype.kind == "f":
-            return c.ArrayExpr(obj=_nested_tuple(c, cells.tolist()), dtype=self._dtype_f64())
+            return _const_array_expr(c, cells)
         # Object dtype: RationalFunction and/or python floats. Assemble scalar
         # tensor leaves with ``stack`` so the result is a real backend tensor.
         return self._stack_cells(cells)
@@ -1495,6 +1503,20 @@ def _pylit(core: Any, value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return core.TupleExpr(elts=tuple(core.IntLit(value=int(v)) for v in value))
     return core.IntLit(value=int(value))
+
+
+def _const_array_expr(core: Any, value: Any) -> Any:
+    """A dense float constant as ONE ``ConstArrayExpr``.
+
+    The element-wise spelling (``ArrayExpr`` over a nested ``TupleExpr`` of
+    ``FloatLit``) costs one IR node per entry, which the FEEC tables make the
+    dominant term in everything downstream: at 3D r=4 it was 96% of the nodes
+    handed to the pyab passes and 84% of the emitted source text. ``ConstArray``
+    carries the raw buffer instead — exact, content-addressed, one node.
+    """
+    return core.ConstArrayExpr(
+        value=core.ConstArray.from_numpy(np.asarray(value, dtype=float))
+    )
 
 
 def _nested_tuple(core: Any, obj: Any) -> Any:
