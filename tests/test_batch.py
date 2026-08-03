@@ -56,3 +56,85 @@ def test_pinv_stmt_lane():
 def test_batch_unsupported_is_notimplemented():
     # the caller (pointwise `_assemble`) catches this to fall back to the per-element loop
     assert issubclass(BatchUnsupported, NotImplementedError)
+
+
+# ── the rules that shipped DEAD (keyed `_ScaleOp` … `_EmbedOp`, classes that never existed) ──────
+# Each is structural or elementwise, so batched == per-element BYTE-for-byte (atol=rtol=0), not
+# merely close. See `test_batch_rules_named.py` for the guard that keeps the keys honest.
+
+def _stmt_prog(name, fn, ins, out_shape, budget_force=True):
+    """A one-Stmt program: inputs `ins` = [(name, shape)], output = `fn(*inputs)`."""
+    from polyarray.ir import OutSpec, SymbolicBudget
+    p = Program(name, inputs=[SymInput(n, s, _prov(n)) for n, s in ins],
+                budget=SymbolicBudget.force_stmts() if budget_force else None)
+    (out,) = p.emit_stmt(fn, [p.input(n) for n, _ in ins], [OutSpec("r", out_shape)])
+    p.add_output("result", out.cells)
+    return p
+
+
+def _exact(prog, batched):
+    """Batched result must equal the per-element loop EXACTLY."""
+    got = np.asarray(batched_run(prog, batched), float)
+    ref = _loop(prog, batched)
+    assert got.shape == ref.shape, (got.shape, ref.shape)
+    np.testing.assert_array_equal(got, ref)
+
+
+def test_reshape_op_batched():
+    from polyarray.ir import ReshapeOp
+    p = _stmt_prog("rs", ReshapeOp((2, 3)), [("A", (6,))], (2, 3))
+    _exact(p, {"A": _rng.standard_normal((B, 6))})
+
+
+def test_scale_op_batched():
+    from polyarray.ir import ScaleOp
+    p = _stmt_prog("sc", ScaleOp(2.5), [("A", (3,))], (3,))
+    _exact(p, {"A": _rng.standard_normal((B, 3))})
+
+
+def test_scale_by_op_batched_scalar():
+    """`ScaleByOp` had NO rule at all. The runtime scalar is itself batched here — the case that
+    needs the trailing-axis reshape, not a bare broadcast."""
+    from polyarray.ir import ScaleByOp
+    p = _stmt_prog("sb", ScaleByOp(), [("A", (3,)), ("s", ())], (3,))
+    _exact(p, {"A": _rng.standard_normal((B, 3)), "s": _rng.standard_normal((B,))})
+
+
+def test_add_op_three_operands():
+    """The dead `_AddOp` body summed only TWO operands; `AddOp` is a left-fold over `n`. Had the
+    key been right without this fix, a 3-way sum would have silently dropped a term."""
+    from polyarray.ir import AddOp
+    p = _stmt_prog("ad", AddOp(3), [("A", (3,)), ("C", (3,)), ("D", (3,))], (3,))
+    _exact(p, {"A": _rng.standard_normal((B, 3)), "C": _rng.standard_normal((B, 3)),
+               "D": _rng.standard_normal((B, 3))})
+
+
+def test_axis_len_op_is_batch_invariant():
+    from polyarray.ir import AxisLenOp, ScaleByOp, OutSpec, SymbolicBudget
+    p = Program("al", inputs=[SymInput("A", (4, 3), _prov("A"))],
+                budget=SymbolicBudget.force_stmts())
+    (n,) = p.emit_stmt(AxisLenOp(0), [p.input("A")], [OutSpec("n", ())])
+    (out,) = p.emit_stmt(ScaleByOp(), [p.input("A"), n], [OutSpec("r", (4, 3))])
+    p.add_output("result", out.cells)
+    _exact(p, {"A": _rng.standard_normal((B, 4, 3))})       # axis 0 stays 4 under the batch axis
+
+
+def test_first_and_last_cols_batched():
+    from polyarray.ir import FirstColsOp, LastColsOp, ConstOp
+    for op, shape in ((FirstColsOp(), (4, 2)), (LastColsOp(), (4, 3))):
+        from polyarray.ir import OutSpec, SymbolicBudget, Const
+        p = Program("fc", inputs=[SymInput("A", (4, 5), _prov("A"))],
+                    budget=SymbolicBudget.force_stmts())
+        (out,) = p.emit_stmt(op, [p.input("A"), Const(np.asarray(2))], [OutSpec("r", shape)])
+        p.add_output("result", out.cells)
+        _exact(p, {"A": _rng.standard_normal((B, 4, 5))})
+
+
+def test_project_and_embed_batched():
+    from polyarray.ir import ProjectOp, EmbedOp, OutSpec, SymbolicBudget, Const
+    P = np.linalg.qr(_rng.standard_normal((4, 4)))[0][:, :2]          # a 4→2 orthonormal projector
+    p = Program("pj", inputs=[SymInput("v", (4,), _prov("v"))], budget=SymbolicBudget.force_stmts())
+    (sub,) = p.emit_stmt(ProjectOp(), [Const(P), p.input("v")], [OutSpec("s", (2,))])
+    (amb,) = p.emit_stmt(EmbedOp((4,)), [Const(P), sub], [OutSpec("a", (4,))])
+    p.add_output("result", amb.cells)
+    _exact(p, {"v": _rng.standard_normal((B, 4))})
