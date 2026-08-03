@@ -40,8 +40,13 @@ def test_batched_torch_matches_batched_run():
 # lowering hook (the twin of `numpy_source`'s `__numpy_source__`), which pyab's `_render_op` discovers by
 # getattr — so plain `LowerOpts()` lowers them (no `op_lowerings` dict). The real ops are validated
 # byte-identically on the FEEC residual; these give in-repo coverage without a grassmann dependency.
+#
+# ⚠ `Mock`-prefixed on purpose. These once carried the grassmann-era private names `_ReshapeOp` /
+# `_ScaleOp` / `_AddOp` — which happened to be the (misspelled, therefore DEAD) keys `batch._apply`
+# dispatched on, so `batched_run` recognized the mocks and nothing else. A local test double must not
+# be able to answer to a production dispatch name; keep these distinct from anything in `polyarray.ir`.
 @dataclass(frozen=True)
-class _ReshapeOp:
+class _MockReshapeOp:
     shape: tuple
     def __call__(self, A): return np.asarray(A, float).reshape(self.shape)
 
@@ -51,7 +56,7 @@ class _ReshapeOp:
 
 
 @dataclass(frozen=True)
-class _ScaleOp:
+class _MockScaleOp:
     factor: float
     def __call__(self, A): return self.factor * np.asarray(A, float)
 
@@ -61,7 +66,7 @@ class _ScaleOp:
 
 
 @dataclass(frozen=True)
-class _AddOp:
+class _MockAddOp:
     def __call__(self, a, b): return np.asarray(a, float) + np.asarray(b, float)
 
     def __pyab_lower__(self, builder, args, low):
@@ -71,16 +76,18 @@ class _AddOp:
 
 @pytest.mark.skipif(not torch_available(), reason="torch/pyarraybackend not available")
 def test_feec_op_lowerings_reshape_scale_add():
-    # x -> reshape(2,3) -> scale 2.0 -> add(self) ; exercises _ReshapeOp/_ScaleOp/_AddOp lowerings
+    # x -> reshape(2,3) -> scale 2.0 -> add(self) ; exercises the three `__pyab_lower__` hooks.
+    # Reference is the per-element `Program.run` loop, NOT `batched_run`: this is a test of the TORCH
+    # lowering, so its oracle must not route through the other batched backend.
     p = Program("g", inputs=[SymInput("x", (6,), _prov("x"))])
-    (r,) = p.emit_stmt(_ReshapeOp((2, 3)), [p.input("x")], [OutSpec("r", (2, 3))])
-    (s,) = p.emit_stmt(_ScaleOp(2.0), [r], [OutSpec("s", (2, 3))])
-    (a,) = p.emit_stmt(_AddOp(), [s, r], [OutSpec("a", (2, 3))])
+    (r,) = p.emit_stmt(_MockReshapeOp((2, 3)), [p.input("x")], [OutSpec("r", (2, 3))])
+    (s,) = p.emit_stmt(_MockScaleOp(2.0), [r], [OutSpec("s", (2, 3))])
+    (a,) = p.emit_stmt(_MockAddOp(), [s, r], [OutSpec("a", (2, 3))])
     p.add_output("result", a.cells)
     B = 16
     xs = np.random.default_rng(4).standard_normal((B, 6))
     got = batched_torch(p, {"x": xs})
-    ref = batched_run(p, {"x": xs})
+    ref = np.stack([np.asarray(p.run({"x": xs[b]})["result"], float) for b in range(B)])
     assert got.shape == ref.shape
     np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-9)
 

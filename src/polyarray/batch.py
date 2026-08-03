@@ -15,10 +15,19 @@ Two lanes, mirroring :meth:`Program.run`:
   this module has no dependency on the front end (grassmann) that defines some of them; einsum ellipsis-
   batches, ``numpy`` linalg batches over leading axes, axis ops shift by one.
 
-BYTE-IDENTICAL to the per-element loop: numpy's batched ops perform the same per-element floating-point
-computation as the scalar ops, just vectorized (verified max|Δ|=0 on the FEEC residuals).  Raises
-:class:`NotImplementedError` for any op without a batch rule (or a sub-Program / dynamic construct it does
-not handle) so the caller can fall back to the per-element loop.
+Agreement with the per-element loop is EXACT for the structural and elementwise ops (reshape, scale,
+add, slice, axis length — verified ``assert_array_equal`` in ``tests/test_batch.py``), but NOT exact in
+general.  ``EinsumStmtOp`` batches by rewriting the spec with an ellipsis and passes ``optimize=``, so
+numpy may choose a different contraction ORDER than the unbatched call; ``np.linalg`` likewise takes a
+stacked path rather than a per-matrix one.  Both re-associate floating-point arithmetic.
+
+Measured on the FEEC interpolation residual: 2D r=4 ``P⁻₄Λ¹`` max|Δ| = 0 exactly; 3D r=4 max|Δ| =
+1.0e-13 on values of magnitude ~1.4e2, i.e. ~1 ulp relative — accepted by Teo 2026-08-02.  The older
+"byte-identical, max|Δ|=0" claim in this docstring predated the dispatch-key fix, when 80 % of FEEC
+programs silently fell back to the per-element loop and the batched path was barely exercised.
+
+Raises :class:`NotImplementedError` for any op without a batch rule (or a sub-Program / dynamic
+construct it does not handle) so the caller can fall back to the per-element loop.
 """
 from __future__ import annotations
 
@@ -65,32 +74,49 @@ def _apply(fn: Any, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, boo
         return np.einsum(bspec, *(A(i) for i in range(len(vals))), optimize=fn.optimize), True
     if name in ("AssertOp", "IdentityOp"):                   # runtime check / capture-freeze → passthrough
         return vals[0], bflags[0]
-    if name == "_ScaleOp":
+    if name == "ScaleOp":
         return fn.factor * A(0), bflags[0]
-    if name == "_AddOp":
-        return A(0) + A(1), anyb
+    if name == "ScaleByOp":                                  # s·x, s a RUNTIME scalar (the ScaleOp sibling)
+        x, s = A(0), A(1)
+        if not bflags[1]:                                    # scalar unbatched → plain broadcast
+            return s * x, bflags[0]
+        if not bflags[0]:                                    # (B,)·(*s) → (B, *s)
+            return s.reshape((-1,) + (1,) * x.ndim) * x, True
+        return s.reshape((s.shape[0],) + (1,) * (x.ndim - 1)) * x, True
+    if name == "AddOp":                                      # left-fold over ALL n operands, not just two
+        out = A(0)
+        for i in range(1, len(vals)):
+            out = out + A(i)                                 # (B,*s)+(*s) broadcasts on the trailing axes
+        return out, anyb
     if name in ("PinvOp", "InvOp", "DetOp"):                 # numpy linalg batches over leading axes
         return getattr(np.linalg, {"PinvOp": "pinv", "InvOp": "inv", "DetOp": "det"}[name])(A(0)), bflags[0]
     if name == "SolveOp":
         return np.linalg.solve(A(0), A(1)), anyb
     if name in ("SqrtOp", "AbsOp", "SignOp"):
         return {"SqrtOp": np.sqrt, "AbsOp": np.abs, "SignOp": np.sign}[name](A(0)), bflags[0]
-    if name == "_AxisLenOp":                                 # axis length is batch-invariant (a 0-d int)
+    if name == "AxisLenOp":                                  # axis length is batch-invariant (a 0-d int)
         return np.asarray(int(A(0).shape[fn.axis + (1 if bflags[0] else 0)])), False
-    if name == "_ReshapeOp":
+    if name == "ReshapeOp":
         if bflags[0]:
             return A(0).reshape((A(0).shape[0],) + tuple(fn.shape)), True
         return A(0).reshape(fn.shape), False
-    if name == "_FirstColsOp":
+    if name in ("FirstColsOp", "LastColsOp"):                # A[:, :rank] / A[:, rank:]; rank is a runtime int
+        if bflags[1]:
+            raise BatchUnsupported(f"{name}: a batched column RANK would give ragged results")
         rank = int(vals[1])
-        return (A(0)[:, :, :rank], True) if bflags[0] else (A(0)[:, :rank], False)
-    if name == "_ProjectOp":                                 # Pᵀ @ v(raveled); P const, v batched
+        sl = slice(None, rank) if name == "FirstColsOp" else slice(rank, None)
+        return (A(0)[:, :, sl], True) if bflags[0] else (A(0)[:, sl], False)
+    if name == "ProjectOp":                                  # Pᵀ @ v(raveled); P const, v batched
         P, v = A(0), A(1)
+        if bflags[0]:
+            raise BatchUnsupported("ProjectOp: batched projector P")
         if bflags[1]:
             return np.einsum("ij,bi->bj", P, v.reshape(v.shape[0], -1)), True
         return P.T @ v.reshape(-1), False
-    if name == "_EmbedOp":                                   # P @ vsub, reshaped to fn.shape
+    if name == "EmbedOp":                                    # P @ vsub, reshaped to fn.shape
         P, v = A(0), A(1)
+        if bflags[0]:
+            raise BatchUnsupported("EmbedOp: batched projector P")
         if bflags[1]:
             out = np.einsum("ij,bj->bi", P, v)
             return (out.reshape((out.shape[0],) + tuple(fn.shape)) if fn.shape else out), True
