@@ -1384,10 +1384,18 @@ class _Lowerer:
         OBJECT-dtype cell array ONCE into a Var (keyed on ``id(cells)``) and reuse it,
         so a SymArray consumed as an operand by many Stmts is materialised a single time
         rather than re-scattered element-wise (nested ``stack`` of per-cell ``_poly_to_ir``
-        trees) at every consumption site — the dominant non-bulk codegen blow-up.  Float /
-        empty arrays fall through (a cheap single ``ArrayExpr``; not worth a Var)."""
+        trees) at every consumption site — the dominant non-bulk codegen blow-up.
+
+        Float arrays go through the same Var now.  They used to fall through ("not worth
+        a Var") because each was a unique object and a cheap single expression; neither
+        holds any more.  ``ConstArrayExpr`` makes the operand one node carrying the whole
+        table, and pyab's CSE only dedupes an expression that is an assignment RHS — an
+        inline operand is re-emitted in full at every use site.  Binding the Var turns
+        those uses into references; pyab's content-addressed CSE then collapses the
+        bindings themselves, so an id-keyed memo here still lands on distinct-by-content.
+        Empty arrays keep falling through (nothing to share)."""
         arr = np.asarray(cells)
-        if arr.dtype != object or arr.size == 0:
+        if arr.size == 0:
             return self._cells_expr(cells)
         key = id(cells)
         hit = self._cells_cse.get(key)
