@@ -524,36 +524,111 @@ def _vmap_closure_of(fn: Any) -> tuple[Any, Any] | None:
     return None
 
 
-def _fold_vmap_body(fn: Any, depth: int, seen: frozenset[int]) -> Any:
-    """Constant-fold the numeric subcomputations INSIDE a vmap body, keeping the vmap closure
-    (its in/out axes and input signature) intact.
+def _drop_unread_inputs(prog: Program) -> Program:
+    """``prog`` with every input NO statement and NO output references removed (`frame-probe`).
+
+    A DEAD input is not a small thing here: it is the only reason the k ≥ 2 FEEC DOF body is not
+    recognised as a build-time constant. grassmann declares a sub-input for every Term-var that
+    the binder's BASIS mentions — for the FEEC wedge slot that is ``J_face``, which NAMES the
+    transported frame but is read through the constant inclusion ``ι`` alone — so the closure
+    carries an input it never touches, and the enclosing Stmt therefore has a non-numeric operand
+    and cannot be folded. Dropping it is value-preserving by definition: nothing reads it.
+
+    Referencing is decided on ATOMS (:func:`symarray_atoms` over every Stmt operand and every
+    output), not on a syntactic scan, so an input reached through a folded cell still counts."""
+    if not prog.inputs:
+        return prog
+    used: set[str] = set()
+    for s in prog.statements:
+        for r in s.in_:
+            used |= {str(a) for a in symarray_atoms(r)}
+    for sa in prog.outputs.values():
+        used |= {str(a) for a in symarray_atoms(sa)}
+    dead = []
+    for inp in prog.inputs:
+        arr = prog.input_arrays.get(inp.name)
+        if arr is None:
+            continue
+        atoms = {str(a) for a in symarray_atoms(arr)}
+        if atoms and not (atoms & used):
+            dead.append(inp.name)
+    if not dead:
+        return prog
+    out = prog.copy()
+    out.inputs = tuple(i for i in out.inputs if i.name not in dead)
+    for nm in dead:
+        out.input_arrays.pop(nm, None)
+    return out
+
+
+def _fold_vmap_body(
+    fn: Any, depth: int, seen: frozenset[int],
+    operand_values: list[Any] | None = None,
+) -> tuple[Any, list[bool] | None]:
+    """Constant-fold the numeric subcomputations INSIDE a vmap body, keeping the batching.
 
     :func:`_descent_body` deliberately refuses to descend a vmap closure, because swapping the
     closure for the bare body would drop the per-point batching. But the body's INTERNAL Stmts
     whose inputs are all build-time-numeric — e.g. a QR/SVD frame orthonormalization on a FIXED
     reference basis, data-INDEPENDENT of the per-point vmap args — can still be folded to
-    constants without touching the batching. Recurse the floor-fold (``_specialize`` with an
-    EMPTY bind, which never drops an input, so the vmap ``in_axes`` stay aligned) into the body;
-    if it folded anything away, rewrap the folded body in an equivalent vmap closure. Falls back
-    to ``fn`` unchanged whenever nothing folds or anything looks off — always a sound no-op
-    degrade (identity/sharing preserved when there is nothing to gain)."""
+    constants without touching the batching. Recurse the floor-fold into the body; if it folded
+    anything away, rewrap the folded body in an equivalent vmap closure. Falls back to ``fn``
+    unchanged whenever nothing folds or anything looks off — always a sound no-op degrade
+    (identity/sharing preserved when there is nothing to gain).
+
+    ``operand_values`` (`frame-probe`) — the caller's already-resolved Stmt operands, ``None``
+    where an operand is not build-time numeric. An operand whose ``in_axes`` entry is ``None`` is
+    **not batched**: the very same array is handed to every slice of the body, so substituting its
+    value INTO the body is value-preserving by the definition of ``vmap``, and the batched
+    (``in_axes`` integer) operands are untouched. Doing so is what lets the floor-fold see a
+    closed-over operand that the body does not actually read — the k ≥ 2 FEEC case, where the
+    binder's basis NAMES a frame map (``J_face``) that only the constant inclusion ``ι`` is read
+    through, so the whole DOF is a build-time constant hidden behind a closure.
+
+    Returns ``(fn', keep)``: ``keep`` is ``None`` when the operand list is unchanged, else a
+    per-operand mask the caller applies (a bound operand is no longer an input of the body, so it
+    must leave the Stmt too, or the ``in_axes`` would misalign)."""
     info = _vmap_closure_of(fn)
     if info is None or depth >= _MAX_DESCENT_DEPTH:
-        return fn
+        return fn, None
     closure, rewrap = info
     body = closure._vmap_body
     if id(body) in seen:
-        return fn  # cycle guard
+        return fn, None  # cycle guard
+    in_axes = closure._in_axes
+    inner_bind: dict[str, Any] = {}
+    if (operand_values is not None and isinstance(in_axes, (tuple, list))
+            and len(in_axes) == len(body.inputs) == len(operand_values)):
+        for ax, inp, val in zip(in_axes, body.inputs, operand_values):
+            if ax is None and val is not None:
+                inner_bind[inp.name] = np.asarray(val, dtype=float)
     try:
-        folded = _specialize(body, {}, depth + 1, seen | {id(body)})
+        folded = _specialize(body, inner_bind, depth + 1, seen | {id(body)})
+        folded = _drop_unread_inputs(folded)
     except Exception:
-        return fn
-    if len(folded.statements) >= len(body.statements):
-        return fn  # nothing folded away -> keep the original (preserve id / lowerer sharing)
-    if [i.name for i in folded.inputs] != [i.name for i in body.inputs]:
-        return fn  # input signature changed -> vmap axes would misalign; degrade
+        return fn, None
+    if (len(folded.statements) >= len(body.statements)
+            and len(folded.inputs) >= len(body.inputs)):
+        return fn, None  # nothing folded away -> keep the original (preserve id / sharing)
+    kept = [inp.name for inp in folded.inputs]
+    orig = [inp.name for inp in body.inputs]
+    if kept != orig:
+        # `_specialize` + `_drop_unread_inputs` only ever REMOVE inputs (bound, or unread), never
+        # reorder or add — so a `kept` that is a SUBSEQUENCE of `orig` is exactly a set of drops
+        # and the surviving `in_axes` are its parallel restriction. Anything else means the
+        # signature moved under us: degrade.
+        kept_set = set(kept)
+        if not set(orig) >= kept_set or [n for n in orig if n in kept_set] != kept:
+            return fn, None
+        keep = [n in kept_set for n in orig]
+        if not isinstance(in_axes, (tuple, list)) or len(in_axes) != len(orig):
+            return fn, None
+        new_axes = tuple(ax for ax, k in zip(in_axes, keep) if k)
+    else:
+        keep = None
+        new_axes = tuple(in_axes) if isinstance(in_axes, (tuple, list)) else in_axes
     from .ir import vmap as _vmap
-    return rewrap(_vmap(folded, in_axes=closure._in_axes, out_axes=closure._out_axes))
+    return rewrap(_vmap(folded, in_axes=new_axes, out_axes=closure._out_axes)), keep
 
 
 # ---------------------------------------------------------------------------
@@ -656,9 +731,14 @@ def _specialize(
         else:
             # P6b: descend the floor-fold into a surviving vmap body to collapse its
             # data-independent (constant) subcomputations — the QR/SVD frame prep on the
-            # fixed reference basis — without dropping the per-point batching.
-            new_fn = _fold_vmap_body(s.fn, depth, seen_here)
+            # fixed reference basis — without dropping the per-point batching.  The already-
+            # resolved operand VALUES ride along so an UNBATCHED (``in_axes=None``) numeric
+            # operand can be substituted inside the body; ``keep`` then prunes it from the Stmt.
+            vals = [_try_eval_ref(new, r, i, known) for r in s.in_]
+            new_fn, keep = _fold_vmap_body(s.fn, depth, seen_here, vals)
             new_in = tuple(_fold_ref(new, r, i, known, idx_map) for r in s.in_)
+            if keep is not None and len(keep) == len(new_in):
+                new_in = tuple(r for r, k in zip(new_in, keep) if k)
         new_statements.append(
             Stmt(fn=new_fn, in_=new_in, out=s.out, note=s.note,
                  provenance=s.provenance, inline=s.inline)
