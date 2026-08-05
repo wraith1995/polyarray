@@ -187,7 +187,7 @@ def test_entry_level_cancellation_certifies_exactly() -> None:
 
 
 def test_non_dyadic_constant_through_cancellation_is_folded_not_refuted() -> None:
-    """REGRESSION (adversarial audit, 2026-07-30): the old two-point short-circuit
+    """REGRESSION: the old two-point short-circuit
     evaluated cells by FLOAT term-summation, so a constant-through-cancellation cell
     with a non-dyadic constant — ``c·p/p`` with ``c = 1/3`` — produced two different
     floats and was declared "provably non-constant" WITHOUT the exact gcd running.
@@ -225,7 +225,7 @@ def test_non_dyadic_constant_through_cancellation_is_folded_not_refuted() -> Non
 
 
 def test_time_budget_degrades_to_unresolved_not_hang() -> None:
-    """REGRESSION (re-audit, 2026-07-30): the exact filter/classification must honor
+    """REGRESSION: the exact filter/classification must honor
     ``time_budget`` — a pathological cell degrades to *unresolved* (⇒ the warned
     probe fallback in hybrid), never a gate hang.  Pinned at three levels."""
     import time as _time
@@ -268,7 +268,7 @@ def test_time_budget_degrades_to_unresolved_not_hang() -> None:
 
 
 def test_oversized_symbolic_op_is_rejected_before_it_runs() -> None:
-    """REGRESSION (oracle lowering stall, 2026-07-30): the time budget alone cannot
+    """REGRESSION (oracle lowering stall): the time budget alone cannot
     bound the exact lane — ONE ``np.einsum`` over object-dtype RF cells runs to
     completion inside a single deadline interval (Bell's degree-5 symbolic W stalled
     the oracle pyab-lowering gate >55 min under a nominal 10 s budget).  Operands
@@ -353,7 +353,7 @@ def test_probe_mode_is_silent_and_env_default_is_overridden(
 
 
 # ---------------------------------------------------------------------------
-# The vmap-closure descent + the front-end-op rational twins (2026-07-31).
+# The vmap-closure descent + the front-end-op rational twins.
 #
 # Before these, a vmap closure was OPAQUE to the exact lane and everything downstream of
 # it fell back to probe-and-freeze (measured: 1120 of 1180 statements of the P⁻₂Λ¹(TET)

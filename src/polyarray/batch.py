@@ -3,7 +3,7 @@
 ``batched_run(program, values)`` evaluates ``program`` for a whole BATCH of inputs at once — each entry of
 ``values`` carries a leading batch axis of length ``B`` — reproducing ``[program.run(values[b]) for b in
 range(B)]`` in ONE vectorized pass, but without the Python-per-call / per-Stmt interpreter overhead that
-dominates when a program is tiny and run many times (the FEEC per-quadrature-point loop).
+dominates when a program is tiny and run many times (a per-quadrature-point loop).
 
 Two lanes, mirroring :meth:`Program.run`:
 
@@ -21,10 +21,10 @@ general.  ``EinsumStmtOp`` batches by rewriting the spec with an ellipsis and pa
 numpy may choose a different contraction ORDER than the unbatched call; ``np.linalg`` likewise takes a
 stacked path rather than a per-matrix one.  Both re-associate floating-point arithmetic.
 
-Measured on the FEEC interpolation residual: 2D r=4 ``P⁻₄Λ¹`` max|Δ| = 0 exactly; 3D r=4 max|Δ| =
-1.0e-13 on values of magnitude ~1.4e2, i.e. ~1 ulp relative — accepted by Teo 2026-08-02.  The older
-"byte-identical, max|Δ|=0" claim in this docstring predated the dispatch-key fix, when 80 % of FEEC
-programs silently fell back to the per-element loop and the batched path was barely exercised.
+Measured on a high-degree interpolation residual: in 2D max|Δ| = 0 exactly; in 3D max|Δ| =
+1.0e-13 on values of magnitude ~1.4e2, i.e. ~1 ulp relative — within tolerance. An earlier
+"byte-identical, max|Δ|=0" claim here was measured when most programs silently fell back to the
+per-element loop, so the batched path was barely exercised; do not restore it.
 
 Raises :class:`NotImplementedError` for any op without a batch rule (or a sub-Program / dynamic
 construct it does not handle) so the caller can fall back to the per-element loop.

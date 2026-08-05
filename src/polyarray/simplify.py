@@ -1,7 +1,7 @@
 """Post-build partial evaluation of a Program (the `simplify` pass).
 
 First cut: ``fold_numeric`` / ``bind_inputs`` — the numeric-propagation floor
-described in ``plans/00-simplify-design.md`` §"fold_numeric, precisely".
+of "fold_numeric, precisely".
 
 The pass re-interprets a Program against a *partial* numeric environment,
 seeded by ``bind`` (empty for a bare ``fold_numeric``).  It maintains a growing
@@ -108,8 +108,8 @@ def _try_eval_ref(
     ``_evaluate_cells`` → ``_eval_cell`` → ``_eval_rf``, ``_eval_rf`` on a
     ``RationalRef``, a plain lookup for an ``IntAtomRef``/bulk name) — nothing writes
     back. The ``dict(known)`` this used to do was a type coercion, and it ran ONCE PER
-    REF of every surviving statement over a ``known`` that reaches 10⁵+ atoms on the
-    P⁻₄Λ¹(TET) affine gate. A non-``dict`` ``Mapping`` is still materialised, so the
+    REF of every surviving statement over a ``known`` that reaches 10⁵+ atoms on a
+    high-degree affine gate. A non-``dict`` ``Mapping`` is still materialised, so the
     signature's contract is unchanged."""
     b: dict[str, float] = known if isinstance(known, dict) else dict(known)
     try:
@@ -144,7 +144,7 @@ def _fold_cells(cells: np.ndarray, known: Mapping[str, float]) -> np.ndarray:
     consumer by ``id(ref._cells) == id(out._cells)`` and, on a miss, falls back to scoring
     the cells' generators by NAME — a fallback that knows FIELD degrees but not the
     geometry/position generators, so a broken link silently drops the position's degree
-    (the Koszul ``κ = x·`` factor) and under-integrates the FEEC drop-Vandermonde.  A fold
+    (the Koszul ``κ = x·`` factor) and under-integrates the drop-Vandermonde.  A fold
     that substitutes nothing must therefore leave the cell array's identity intact."""
     if cells.dtype.kind == "f":
         return cells.copy()
@@ -527,9 +527,9 @@ def _vmap_closure_of(fn: Any) -> tuple[Any, Any] | None:
 def _drop_unread_inputs(prog: Program) -> Program:
     """``prog`` with every input NO statement and NO output references removed (`frame-probe`).
 
-    A DEAD input is not a small thing here: it is the only reason the k ≥ 2 FEEC DOF body is not
+    A DEAD input is not a small thing here: it is the only reason a higher-form DOF body is not
     recognised as a build-time constant. grassmann declares a sub-input for every Term-var that
-    the binder's BASIS mentions — for the FEEC wedge slot that is ``J_face``, which NAMES the
+    the binder's BASIS mentions — for a wedge slot that is ``J_face``, which NAMES the
     transported frame but is read through the constant inclusion ``ι`` alone — so the closure
     carries an input it never touches, and the enclosing Stmt therefore has a non-numeric operand
     and cannot be folded. Dropping it is value-preserving by definition: nothing reads it.
@@ -581,7 +581,7 @@ def _fold_vmap_body(
     **not batched**: the very same array is handed to every slice of the body, so substituting its
     value INTO the body is value-preserving by the definition of ``vmap``, and the batched
     (``in_axes`` integer) operands are untouched. Doing so is what lets the floor-fold see a
-    closed-over operand that the body does not actually read — the k ≥ 2 FEEC case, where the
+    closed-over operand that the body does not actually read — the higher-form case, where the
     binder's basis NAMES a frame map (``J_face``) that only the constant inclusion ``ι`` is read
     through, so the whole DOF is a build-time constant hidden behind a closure.
 
@@ -656,7 +656,7 @@ def specialize(
     * ``budget`` (a :class:`~polyarray.budget.SimplifyBudget`) — the post-build
       moderation control surface (P5): after the unconditional numeric-fold
       floor runs, it collapses / extracts / keeps the residual symbolic
-      structure per ``plans/01-budget-moderated-simplification.md``.
+      structure.
       ``budget=None`` is the floor only.
 
     ``sparsity`` (P4) is accepted for API parity but is a no-op passthrough
@@ -715,7 +715,7 @@ def _specialize(
 
     # Resolve every δ a folded Stmt created into its concrete rank across all
     # remaining shapes, so a folded constant SVD/GSVD/… leaves no lingering
-    # dynamic dim downstream (the FEEC Vandermonde stays square, etc.).
+    # dynamic dim downstream (the Vandermonde stays square, etc.).
     _substitute_dims(new, dim_subst)
 
     survivors = [i for i in range(len(new.statements)) if i not in foldable]
@@ -874,7 +874,7 @@ def _partial_eval_numeric(
     ancestor). This pass folds the strictly larger class of subcomputations whose
     outputs merely do not DEPEND on the symbolic inputs. The canonical case: a
     chain ``inv(A) → A·inv(A)`` is identically ``I`` for every ``A`` — dataflow says
-    symbolic, identity testing says constant. (The FEEC motivation: a metric-free
+    symbolic, identity testing says constant. (The motivating case: a metric-free
     DOF's nested grass program is fed one vertex-symbolic Jacobian buffer whose
     contribution provably cancels; this pass collapses the whole ``grass_dof`` Stmt
     to its reference value, making the symbolic Vandermonde STRUCTURALLY constant.)
@@ -962,7 +962,8 @@ def _partial_eval_numeric(
             # freezes. `_record_known` only ever WRITES into the dict it is handed (it never
             # reads it), so recording into an EMPTY dict and merging on success writes exactly
             # the same entries, and a raise still leaves `known` untouched. Measured on the
-            # P⁻₄Λ¹(TET) affine gate: 74 252 freezes over a `known` that grows past 10⁵ atoms.
+            # A high-degree affine gate freezes tens of thousands of times over a `known` that
+            # grows past 10⁵ atoms.
             staged: dict[str, Any] = {}
             try:
                 _record_known(stmt, outs0, staged)
@@ -1218,7 +1219,7 @@ def symarray_atoms(sa: SymArray) -> set:
     """The run-time binding-key atoms a ``SymArray`` reads — the PUBLIC name for what
     :func:`_symarray_atoms` has always computed.
 
-    Exported (2026-08-01) so a consumer can ask "does this value DEPEND on that atom?" without
+    Exported so a consumer can ask "does this value DEPEND on that atom?" without
     reimplementing the traversal. First caller: savo's σ-channel invariant INV-3, which must show
     that the geometry reaching ``AssemblyInput.sample`` carries no orientation atom. Reading the
     cells' generators is exactly the question, and the alternative — a consumer hand-rolling it —

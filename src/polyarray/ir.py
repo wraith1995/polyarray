@@ -322,8 +322,8 @@ class SymbolicBudget:
     defer_frame_contraction: bool = False
     # Downstream block-inverse deferral (oracle's Schur `symbolic_inverse`): the matrix size at/above
     # which a base-case inverse / a Schur-combine matrix product offloads to a NUMERIC Stmt instead of
-    # inline RationalFunction arithmetic (the degree blow-up on a single connected component — e.g.
-    # Argyris). ``None`` ⇒ the consumer's own module defaults; ``build_big_symbols`` raises them (stay
+    # inline RationalFunction arithmetic (the degree blow-up on a single connected
+    # component). ``None`` ⇒ the consumer's own module defaults; ``build_big_symbols`` raises them (stay
     # symbolic / never defer), ``force_stmts`` lowers them (always defer). Read via
     # ``current_budget_override``; other budget fields left at legacy keep sampling byte-identical, so a
     # caller can tune ONLY the inverse without perturbing the sampling lane.
@@ -2284,7 +2284,7 @@ def cells_use_only_stmt_atoms(arr: np.ndarray, env: SymbolEnv) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Multi-operand symbolic einsum offload (plans/archive/einsum_offload.md slice 1)
+# Multi-operand symbolic einsum offload
 # ---------------------------------------------------------------------------
 
 _EINSUM_BAG_THRESHOLD_DEFAULT = 64
@@ -2303,7 +2303,7 @@ def _einsum_bag_threshold() -> int:
 # Contraction paths depend only on (spec, optimize, operand shapes), never on values, but
 # ``np.einsum(..., optimize=True)`` recomputes the path on EVERY call — ~28 µs of pure
 # planning that dominated symbolic-Vandermonde builds (hundreds of thousands of identical
-# small einsums at high FEEC degree). Cache the path by that key and pass it back: numpy
+# small einsums at high degree). Cache the path by that key and pass it back: numpy
 # then skips the planning and runs the SAME contraction order ⇒ bit-identical results.
 _EINSUM_PATH_CACHE: dict[tuple[str, object, tuple[tuple[int, ...], ...]], Any] = {}
 
@@ -2397,7 +2397,7 @@ class SwitchOp:
 #
 # This exists because omission-by-accident is polyarray's measured failure mode, not a
 # hypothetical one.  Three defects in one day, all "the op was simply not in the ladder":
-# ``KronOp``/``KronFreeOp`` missing from ``exact_fold._sym_apply`` froze the FEEC ``Λ²``
+# ``KronOp``/``KronFreeOp`` missing from ``exact_fold._sym_apply`` froze the ``Λ²``
 # certificate at 0%; ``SwitchOp`` missing from ``exact_fold`` entirely froze every
 # ``select_x``; and a degree table keyed by class-NAME strings went stale across the
 # grassmann→polyarray op relocation (see ``degree.DEFAULT_DEGREE_KINDS``).  In every case
@@ -3679,7 +3679,7 @@ def _eval_cell(cell: Cell, bindings: dict[str, float]) -> float:
 # codegen-and-cache ``eval_numeric_fast``. The codegen amortizes over MANY runs of the same
 # program, but the structural-mask probe (:func:`polyarray.schur._structural_mask`) runs a
 # program only 3× — where compiling every RF (``builtins.compile`` + ``_poly_term_strings``)
-# is ~31 s of the ~36 s degree-5 Argyris P(T) build for nothing. Values are byte-identical, so
+# is most of a degree-5 P(T) build for nothing. Values are byte-identical, so
 # the probed mask is unchanged. Module-scoped: symbolic builds are single-threaded.
 _PROBE_DIRECT_EVAL = False
 

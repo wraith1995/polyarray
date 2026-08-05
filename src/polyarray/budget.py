@@ -1,9 +1,8 @@
 """`SimplifyBudget` — the post-build control surface for the `simplify` pass.
 
-Companion implementation to ``plans/01-budget-moderated-simplification.md``.
 
 Where ``simplify.specialize`` runs the *unconditional floor* (numeric folding +
-dead-stmt elimination — see ``plans/00-simplify-design.md``), this module adds
+dead-stmt elimination), this module adds
 the **discretionary band**: a frozen :class:`SimplifyBudget` policy and a
 post-pass :func:`_apply_budget` that moderates how far the residual *symbolic*
 structure is collapsed (toward numeric atoms) or kept/exposed (legible symbols).
@@ -39,7 +38,7 @@ from .rational import RationalFunction, _total_degree
 class SimplifyBudget:
     """Post-build policy moderating the ``simplify`` collapse <-> expose band.
 
-    Knobs (full rationale in ``plans/01-budget-moderated-simplification.md``):
+    Knobs:
 
     * ``max_cell_mass`` — per-cell monomial ceiling.  A symbolic output cell
       whose ``_cell_size`` mass exceeds this is *collapsed* to a fresh atom via
@@ -79,7 +78,7 @@ class SimplifyBudget:
     # --- consistency with how it was built ---
     inherit_freeze: bool = True
 
-    # -- presets (end-state correspondence in plan 01) ------------------
+    # -- presets (end-state correspondence in) ------------------
 
     @classmethod
     def none(cls) -> SimplifyBudget:
@@ -217,7 +216,7 @@ def _apply_budget(program: Program, budget: SimplifyBudget) -> Program:
 
     Operates on the program's **output** cells (a numeric-folded floor is
     assumed to have already run, so any remaining ``RationalFunction`` cell is
-    genuinely symbolic).  Per plan 01 §"The moderation procedure":
+    genuinely symbolic). Per §"The moderation procedure":
 
     1. per-cell pass: ``keep_provenance`` protection, ``den_degree_max``
        intermediate extraction, ``max_cell_mass`` collapse;

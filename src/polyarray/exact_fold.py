@@ -32,14 +32,14 @@ frozen a vertex-dependent value).  Only *unresolved* statements are eligible for
 
 Entry-level folding (:func:`exact_fold_cells`) additionally normalizes each OUTPUT
 CELL as a rational function of the feed atoms — so an entry whose statement-level
-pieces vary but whose composition cancels (the FEEC motivation) still certifies,
+pieces vary but whose composition cancels (the motivating case) still certifies,
 without any statement being frozen.
 
 **Bounded cost — TWO knobs, both required.** ``time_budget`` (seconds) is checked
 BETWEEN operations, and ``max_sym_mass`` (:data:`_MAX_SYM_MASS`) caps the monomial mass
 of ONE symbolic op's operands BEFORE it runs.  The time box alone is not enough: a
 single ``np.einsum`` / Gauss pass over object-dtype cells runs to completion inside one
-deadline interval, so a degree-5 element (Bell) could spend an hour in one uninterrupted
+deadline interval, so a degree-5 element could spend an hour in one uninterrupted
 op while nominally under a 10 s budget.  Rejected-by-size and timed-out statements both
 degrade to *unresolved* ⇒ the (loud) probe fallback — never a hang, never a guess.
 """
@@ -133,13 +133,12 @@ _MAX_DEPTH = 32
 # terms, summed over every symbolic cell) its operands may carry.  The time budget alone
 # cannot bound the exact lane, because a single ``np.einsum`` / Gauss elimination over
 # object-dtype ``RationalFunction`` cells runs to completion INSIDE one deadline
-# interval — the Bell (degree-5, 18-DOF) symbolic Vandermonde stalled the oracle
-# lowering gate for >55 min in one such einsum.  An op whose operands exceed the cap is
+# interval — a degree-5, 18-DOF symbolic Vandermonde stalled the lowering gate for
+# >55 min in one such einsum.  An op whose operands exceed the cap is
 # declared *unresolved* up front (⇒ the warned probe fallback), so the exact lane's cost
 # per statement is bounded BEFORE the expensive work starts, not merely interrupted
 # after it.  Rationale for the size: the entries this lane certifies are small by
-# nature (a vertex-rational Vandermonde entry — Lagrange/FEEC cells measure in the
-# tens of monomials); a five-figure operand mass means the exact route has already lost
+# nature (a vertex-rational Vandermonde entry measures in the tens of monomials); a five-figure operand mass means the exact route has already lost
 # to the probe route, whatever the wall clock says.
 _MAX_SYM_MASS = 4096
 
@@ -148,7 +147,7 @@ _MAX_SYM_MASS = 4096
 # monomial mass is still bounded by ``_MAX_SYM_MASS`` (that is the SUM over the slices, so the
 # total symbolic work stays inside the same box), but each slice also pays the body's fixed
 # per-statement overhead, and one slice's flint arithmetic cannot be interrupted.  So the batch
-# itself is bounded BEFORE the loop starts (the Bell-stall lesson: an uninterruptible op
+# itself is bounded BEFORE the loop starts (the stall lesson: an uninterruptible op
 # ignores a deadline).  Over the cap ⇒ *unresolved* ⇒ the warned probe fallback.
 _MAX_VMAP_BATCH = 512
 
@@ -285,7 +284,7 @@ def _constant_value(rf: RationalFunction, deadline: float | None = None) -> floa
 
     DEADLINE-AWARE: every expensive step (each exact evaluation, the gcd) is
     preceded by a ``deadline`` check that raises :class:`_Timeout` — a pathological
-    cell (an enormous uncancelled quintic; the Argyris regime) must degrade to
+    cell (an enormous uncancelled quintic — the degree-5 regime) must degrade to
     *unresolved* (⇒ the warned probe fallback), never hang the gate."""
     if rf.is_zero():
         return 0.0                           # exact structural zero (num ≡ 0)
@@ -653,7 +652,7 @@ def _sym_apply_builtin(
     EXHAUSTIVE over :data:`~polyarray.ir.StmtFn` — every op either has a rational twin or
     an explicit arm **stating why it has none**.  ``assert_never`` at the bottom makes a
     newly added op a mypy error here, which is the whole point: ``KronOp`` / ``KronFreeOp``
-    (FEEC ``Λ²`` certified at 0%) and ``SwitchOp`` (every ``select_x`` frozen) were both
+    (``Λ²`` certified at 0%) and ``SwitchOp`` (every ``select_x`` frozen) were both
     silently absent from the ladder this replaced, and nothing said so.
     """
     match fn:
@@ -709,7 +708,7 @@ def _sym_apply_builtin(
       case SwitchOp():
         # `select_x` over an `IntAtom`: inputs are `(scrutinee, branch_0, …, branch_{n-1})`.
         #
-        # MINIMAL fold, deliberately (Teo 2026-08-01) — two sound cases and no guessing:
+        # MINIMAL fold, deliberately — two sound cases and no guessing:
         #   (a) EQUAL BRANCHES ⇒ the scrutinee cannot matter, so the switch is that value. This is the
         #       one that pays: it is the same question `savo _blocks_equal` asks at the folded block
         #       ("does reorienting this entity change this value?"), asked per-operand.
@@ -721,7 +720,7 @@ def _sym_apply_builtin(
         # Why it matters: design item B moves the σ switch from the folded OUTPUT to the geometry
         # INPUTS, i.e. UPSTREAM of the whole body. Without (a), every σ-carrying expression would meet
         # an unfoldable node first and degrade to probes — trading the `QrOp` just removed from the
-        # FEEC dependency path for a `SwitchOp`.
+        # dependency path for a `SwitchOp`.
         branches = args[1:]
         if len(branches) != fn.n_branches or not branches:
             reason.note(
@@ -765,7 +764,7 @@ def _sym_apply_builtin(
       case KronFreeOp():
         # The Kron block with trailing free axes — the same elementwise product as
         # `KronFreeOp.__call__`, done in object dtype so exact cells survive.  Leaving this
-        # un-normalizable made the exact lane refuse every FEEC `Λᵏ` certificate: the wedge's
+        # un-normalizable made the exact lane refuse every `Λᵏ` certificate: the wedge's
         # two traced slots meet in exactly this op, so `KronFreeOp` sat directly on the result
         # path with NOTHING irrational about it (a Kronecker product is field arithmetic).
         F, G = _obj(args[0]), _obj(args[1])
@@ -884,7 +883,7 @@ def _run_vmap(
     ``in_axes`` entry, run the body per slice, ``np.stack`` on ``out_axes``), but over exact
     values, so the certificate no longer stops at the closure boundary.
 
-    COST IS BOUNDED BEFORE THE LOOP STARTS (the Bell-stall rule — an uninterruptible flint op
+    COST IS BOUNDED BEFORE THE LOOP STARTS (the stall rule — an uninterruptible flint op
     ignores a deadline): the batched operands' total monomial mass must fit ``max_sym_mass``
     (it is the SUM over the slices, so the whole descent stays inside the one box the caller
     budgeted for this statement), AND the batch size must fit :data:`_MAX_VMAP_BATCH` (each
@@ -994,7 +993,7 @@ def _run_program(
             # This is what unblocks a certificate whose `grass_dof` body still CONTAINS a `QrOp`
             # that nothing downstream reads: liveness becomes implicit — "the result is a number"
             # is itself the proof that the op did not matter, and the statements can be discarded
-            # afterwards.  (Measured: the FEEC `Λᵏ` face DOFs reach 0 LIVE frame ops but keep a dead
+            # afterwards.  (Measured: `Λᵏ` face DOFs reach 0 LIVE frame ops but keep a dead
             # `QrOp` in the body; presence-based refusal alone kept them on the probe lane.)
             continue
     outs: list[Any] = []
@@ -1132,7 +1131,7 @@ def exact_partial_eval(
             continue
         # Classify: all-constant ⇒ fold; any provably non-constant cell ⇒ refute.
         # DEADLINE-AWARE (the classification is where a pathological cell's exact
-        # evaluation/gcd bill lands — the Argyris regime): expiry degrades this and
+        # evaluation/gcd bill lands — the degree-5 regime): expiry degrades this and
         # every remaining statement to *unresolved* (⇒ the warned probe fallback),
         # exactly like a timeout in the execution loop above.
         const_outs: list[np.ndarray] = []

@@ -1,12 +1,12 @@
 # PLAN — polyarray `simplify` branch
 
-Worktree: /Users/teoc/projects/fem/polyarray-simplify   Branch: `simplify`
+Worktree: <workspace>/polyarray-simplify   Branch: `simplify`
 (off `feat/numpy-source-codegen` @3aa574d). Repo is git; remote = origin (GitHub).
 
 Design docs: `plans/00-simplify-design.md` (mechanism — partial-eval lattice + API +
 phases), `plans/01-budget-moderated-simplification.md` (control surface — post-build
 `SimplifyBudget` moderating collapse↔expose, mirroring build-time `SymbolicBudget`).
-Internals notes (scratch): `/private/tmp/.../scratchpad/polyarray-internals.md`.
+Internals notes (scratch): a scratch directory.
 
 ## Goal
 Post-build partial-evaluation pass on `Program`/`SymArray`: (1) reduce stmts → numeric

@@ -1,4 +1,4 @@
-"""Whole-program polynomial-degree estimation (fem task #9 — lifted from pointwise).
+"""Whole-program polynomial-degree estimation (lifted from pointwise).
 
 :func:`program_degree` walks a :class:`~polyarray.ir.Program`'s statement graph and
 propagates a POLYNOMIAL DEGREE per value from a per-input ``seed``, answering "what

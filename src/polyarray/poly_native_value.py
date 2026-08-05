@@ -6,7 +6,6 @@ coefficient-level op the poly engines call.  It is the genericity seam
 that lets one engine module serve multiple coefficient types
 (``double``, ``mpf``, ``quad``).
 
-See ``plans/archive/poly_native_backend.md`` §1.2 for the full design.
 Slice A1 shipped ``double``; slice A3 adds ``mpf`` (arbitrary precision
 via :mod:`mpmath`) and ``quad`` (113-bit mpf, the closest portable
 "quadruple precision" available without C-toolchain assumptions).

@@ -1,6 +1,6 @@
 """P5 tests: ``SimplifyBudget`` + the moderation procedure.
 
-Covers the properties asserted in ``plans/01-budget-moderated-simplification.md``:
+Covers the budget-moderation properties:
 exactness over presets/seeds, collapse subsuming ``partial_eval``, monotone
 collapse, idempotence, ``keep_provenance`` protection, and ``den_degree_max``
 intermediate extraction.

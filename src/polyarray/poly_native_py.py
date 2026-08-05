@@ -1,5 +1,4 @@
-"""Pure-Python native polynomial backend (Track A of
-``plans/archive/poly_native_backend.md``).
+"""Pure-Python native polynomial backend.
 
 A dict-of-monomial-tuples sparse multivariate polynomial engine,
 generic over the coefficient type via a :class:`ValueHandle`.  Selected

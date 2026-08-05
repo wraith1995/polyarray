@@ -722,8 +722,8 @@ def test_helper_fingerprint_name_normalization():
 
 
 def test_helper_fingerprint_discriminates_the_audit_attack_set():
-    """Regression pins for the properties an adversarial audit verified by construction but
-    which the tests above left unguarded: attribute/kwarg names that COLLIDE with a bound
+    """Regression pins for properties that hold by construction but which the tests above
+    left unguarded: attribute/kwarg names that COLLIDE with a bound
     spelling must not be alpha-renamed, a param permutation must not be erased, and a nested
     scope must REFUSE (``_fp_bound_names`` is unscoped, so a nested binder could otherwise
     alpha-normalize an outer free global of the same spelling)."""

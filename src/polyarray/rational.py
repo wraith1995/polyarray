@@ -19,7 +19,7 @@ Cells of the symbolic interpreter's ``SymArray`` are
 ``RationalFunction | float``: numeric cells are plain Python floats,
 generator-bearing cells are ``RationalFunction``s.
 
-Per the plan (``plans/archive/symbolic_interpreter.md``):
+Per the plan:
 
 * Each instance carries its own ring spanning the generators it
   actually uses.  Arithmetic combining two instances with different
@@ -594,7 +594,7 @@ class RationalFunction:
         points) but is pure waste for a FEW: the 3-point structural-mask probe
         (:func:`polyarray.schur._structural_mask`) compiled every cell of a degree-5 ``C`` and
         used it 3× — ~31 s (``_compile_eval``: ``builtins.compile`` + ``_poly_term_strings``)
-        of the ~36 s Argyris symbolic-P(T) build, for nothing. Byte-identical ⇒ identical mask."""
+        of a high-degree symbolic build, for nothing. Byte-identical ⇒ identical mask."""
         names = _ring_names(self._ring)
         if not names:
             return self._eval_constant_to_float()
