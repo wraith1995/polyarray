@@ -63,7 +63,7 @@ _ENV_CELLS = "FEM_OBSERVE_CELLS_CEILING"
 _ENV_DEGREE = "FEM_OBSERVE_DEGREE_CEILING"
 
 # Warning thresholds.  Generous on purpose: a warning must be signal, not noise.  These are the
-# "this stage is already pathological" marks, not "this stage is big" — an argyris value kernel
+# "this stage is already pathological" marks, not "this stage is big" — a high-degree value kernel
 # legitimately carries tens of thousands of monomials.  Tunable per run via the env vars above.
 _MASS_CEILING = 250_000        # Σ monomials over symbolic OUTPUT cells
 _OPERAND_CEILING = 1_000_000   # Σ monomials over non-bulk RF OPERAND cells (the real lowering cost)
@@ -412,8 +412,9 @@ def _measure(obj: Any, degree_seed: Mapping[str, float] | None) -> Measurement:
 
 
 # Analysis cache.  `forward.analyze` and `program_degree` are both O(program size), and the
-# instrumented boundaries re-measure the SAME program over and over — argyris calls `bind-field`
-# 1170 times against one growing ~2.8M-monomial program, which made the default level 3.3× slower
+# instrumented boundaries re-measure the SAME program over and over — a high-degree element calls
+# `bind-field` ~1000 times against one growing multi-million-monomial program, which made the
+# default level 3.3× slower
 # than no instrumentation at all.  Keyed weakly by program so nothing is kept alive, and
 # invalidated by a cheap structural version (statement / output / input counts), which is what
 # actually changes as a program is built up.
@@ -473,7 +474,7 @@ class Snapshot:
     A stage inside a loop — ``single_compile`` runs once per enumerated match, so its
     ``sample`` / ``represent`` boundaries fire hundreds of times in one assembly — is **rolled
     up**: every recording of the same stage name at the same depth accumulates into this one
-    Snapshot rather than appending a new row.  Without that a plate compile produces an
+    Snapshot rather than appending a new row.  Without that a large compile produces an
     800-row table and 800 dump directories, which is not observability, it is a log flood.
 
     Under roll-up, :attr:`m` is the measurement of the largest MEASURED occurrence (the one that
@@ -659,7 +660,8 @@ class CompileTrace:
         """Whether the ``occurrence``-th run of a stage gets measured, or just counted and timed.
 
         Measuring is O(program size) — a full `forward.analyze` plus a degree walk — and the
-        instrumented boundaries sit inside hot loops: argyris calls `bind-field` 1170 times, each
+        instrumented boundaries sit inside hot loops: a high-degree element calls `bind-field` ~1000
+        times, each
         against a program that has GROWN since the last call, so the analysis cache cannot help
         and measuring every occurrence made the default level **3.3× slower than no
         instrumentation at all** (37s → 122s). That is not a tool anyone would leave on.

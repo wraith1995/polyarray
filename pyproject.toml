@@ -9,7 +9,7 @@ description = "Standalone symbolic-numeric array IR (Program/Stmt/SymArray/Ratio
 readme = "README.md"
 requires-python = ">=3.13"
 authors = [
-    { name = "teocollin1995", email = "teoc@mit.edu" },
+    { name = "Thea Collin", email = "teoc@mit.edu" },
 ]
 dependencies = [
     "numpy>=2.0",

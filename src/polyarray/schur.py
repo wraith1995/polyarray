@@ -20,7 +20,7 @@ special-cased only to *skip* the wasted symbolic work, not for correctness.
 SymArray-native: blocks are SymArray slices, so the owning ``Program`` rides on the carrier — Stmt deferrals
 emit into it, numerics mixed into symbolic arithmetic are coerced by ``RationalFunction`` itself, and a
 float-cell (numeric) block short-circuits to numpy arithmetic. (Ported from oracle ``vandermonde/schur.py`` —
-pure SymArray algebra, so its home is polyarray; oracle's FEEC driver can consume this.)
+pure SymArray algebra, so its home is polyarray; element drivers consume it from here.)
 
 Driver structure:
 1. diagonal / ≤ ``BASE`` → direct (reciprocal / ``cofactor_inverse``);
@@ -168,8 +168,8 @@ def _structural_mask(matrix: SymArray) -> np.ndarray | None:
     mask: np.ndarray | None = None
     # A 3-point probe runs the C program only 3× — no-``compile`` RF evaluation (direct term
     # sum, both in the program runner via ``probe_direct_eval`` and in the output-cell loop
-    # via ``compiled=False``) is ~31 s cheaper than codegen on a degree-5 C (the Argyris/Bell
-    # floor), and byte-identical, so the probed mask is unchanged.
+    # via ``compiled=False``) is much cheaper than codegen on a degree-5 C, and
+    # byte-identical, so the probed mask is unchanged.
     with probe_direct_eval():
         for k in range(_N_PROBES):
             try:
@@ -191,7 +191,7 @@ def _approx_zero(cell: object) -> bool:
     Roundoff is applied ONLY to CONSTANTS: a constant does not vary, so ``|const| < tol`` is genuinely a
     rounded zero. This is the crucial soundness distinction from the retired numeric probe, which read a
     SYMBOLIC cell's magnitude at a few generic points — where a tiny-but-nonzero cell gave a WRONG inverse
-    (the 5e20 Argyris bug). A vertex-dependent ``RationalFunction`` stays EXACT (``simple_zero``, no
+    (the 5e20 wrong-inverse bug). A vertex-dependent ``RationalFunction`` stays EXACT (``simple_zero``, no
     roundoff, no sampling). Guarded end-to-end by the numeric-vs-symbolic P(T) backstop."""
     if simple_zero(cell):
         return True
@@ -221,8 +221,8 @@ def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
 
     The numeric probe ``_structural_mask`` is UNSOUND and NO LONGER the default: it marks a cell zero when
     it is merely SMALL (< ``_MASK_TOL``) at a few sample points, so a *tiny-but-nonzero* cell is dropped
-    and the Schur split silently returns a WRONG inverse (proven on Argyris/Bell — the symbolic ``P(T)``
-    came out ``5e20`` off the true ``inv(C)``; adding sample points does not help, the cells are tiny at
+    and the Schur split silently returns a WRONG inverse (demonstrated on degree-5 elements — the
+    symbolic ``P(T)`` came out ``5e20`` off the true ``inv(C)``; adding sample points does not help, the cells are tiny at
     every point). It survives only behind an explicit, self-labelled-unsound opt-in
     (``POLYARRAY_SCHUR_UNSOUND_PROBE_MASK``) for a large element whose cancellation-sparsity a sound exact
     fold cannot yet recover — and only ever with the numeric-vs-symbolic ``P(T)`` backstop watching it."""
@@ -234,7 +234,7 @@ def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
             import warnings
             warnings.warn(
                 "schur: POLYARRAY_SCHUR_UNSOUND_PROBE_MASK is set — the numeric sparsity probe is UNSOUND "
-                "(it drops tiny-but-nonzero cells, giving a WRONG inverse; proven on Argyris/Bell). Use "
+                "(it drops tiny-but-nonzero cells, giving a WRONG inverse). Use "
                 "only with the numeric-vs-symbolic P(T) backstop.", stacklevel=2)
             return probed
     return _syntactic_mask(matrix.cells)
@@ -432,9 +432,9 @@ def _invert(M: SymArray, mask: np.ndarray | None = None) -> SymArray:
         return rinv[:, np.argsort(new_order)]
     # No beneficial block structure REMAINS here (no triangular split, single bipartite component): the
     # block is effectively DENSE, so recursing a general midpoint split would only churn symbolic
-    # RationalFunction arithmetic on a dense high-degree block — the plate (degree-5 Argyris/Bell) blow-up.
-    # Instead DEFER THE WHOLE BLOCK (any size) to a NUMERIC `InvOp` Stmt that evaluates per cell (§14, Teo:
-    # "stop recursing when the block-zeros stop being useful; defer everywhere"). This also sidesteps the
+    # RationalFunction arithmetic on a dense high-degree block — the degree-5 blow-up.
+    # Instead DEFER THE WHOLE BLOCK (any size) to a NUMERIC `InvOp` Stmt that evaluates per cell (§14:
+    # stop recursing once the block zeros stop being useful, and defer everywhere). This also sidesteps the
     # un-pivoted general-Schur singular-pivot bug — `np.linalg.inv` pivots internally. `_base_inverse` emits
     # the numeric InvOp for a symbolic block riding a program (`_DEFER_INVERSE`), else the exact cofactor.
     return _base_inverse(M)

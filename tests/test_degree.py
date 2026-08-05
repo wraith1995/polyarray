@@ -1,4 +1,4 @@
-"""`polyarray.program_degree` — the whole-program polynomial-degree walker (fem task #9).
+"""`polyarray.program_degree` — the whole-program polynomial-degree walker.
 
 Native-op semantics only (front ends test their own category extensions — pointwise's
 `test_compiler_mass` degree probes ride the same walker through its delegator):

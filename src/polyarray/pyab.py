@@ -823,7 +823,7 @@ class _Lowerer:
         # emitted helper's (params, body) -> its def name. ``helpers`` memoizes by
         # ``id(prog)`` only, so a content-identical sub-Program REBUILT as a fresh object
         # (the per-σ-branch / per-functional ``grass_dof`` closures) re-emitted its whole
-        # def — measured 388 emitted defs collapsing to 168 on the P⁻₂Λ¹(TET) savo
+        # def — measured 388 emitted defs collapsing to 168 on one assembly's
         # kernels. This interns at emission: one def per distinct body, every call site
         # shares it. See ``_helper_fingerprint`` for the soundness argument.
         self.fp_helpers: dict[str, str] = fp_helpers if fp_helpers is not None else {}
@@ -1509,8 +1509,8 @@ def _const_array_expr(core: Any, value: Any) -> Any:
     """A dense float constant as ONE ``ConstArrayExpr``.
 
     The element-wise spelling (``ArrayExpr`` over a nested ``TupleExpr`` of
-    ``FloatLit``) costs one IR node per entry, which the FEEC tables make the
-    dominant term in everything downstream: at 3D r=4 it was 96% of the nodes
+    ``FloatLit``) costs one IR node per entry, which large constant tables make the
+    dominant term in everything downstream: at high degree in 3D it was 96% of the nodes
     handed to the pyab passes and 84% of the emitted source text. ``ConstArray``
     carries the raw buffer instead — exact, content-addressed, one node.
     """

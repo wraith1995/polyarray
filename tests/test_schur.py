@@ -86,7 +86,7 @@ def test_general_split_pivots_singular_midpoint_block():
     # An 8×8 (> BASE) block ANTI-diagonal `[[0, X],[Y, 0]]` — non-singular (det = ±detX·detY) but whose
     # MIDPOINT principal block A (top-left 4×4) is ZERO ⇒ singular. A DENSE mask forces it onto the general
     # Schur split, which must PIVOT columns so A is non-singular; without pivoting A⁻¹ blows up and the
-    # inverse is WRONG even though M is invertible. Regression (2026-07-24): the plate-element P(T) hit this
+    # inverse is WRONG even though M is invertible. Regression: the plate-element P(T) hit this
     # via a conservative sparse mask (Hermite symbolic P(T) → 2.4e30 off inv(C)).
     rng = np.random.default_rng(0)
     X = rng.uniform(1.0, 2.0, (4, 4)) + 5.0 * np.eye(4)

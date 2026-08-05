@@ -1,9 +1,9 @@
-"""The fem-audit gate (fem/AUDITS.md "Gate wiring", decided 2026-07-03).
+"""The fem-audit gate (fem/AUDITS.md "Gate wiring").
 
 Shells out to the workspace's mechanical audit (`fem/audit/run_audits.py`) for THIS repo at
 `--min-severity ERROR` and fails on any ERROR beyond the recorded BASELINE. The baseline is a
 RATCHET — per-rule ceilings owned by queued fem tasks; counts may only fall, and a rule not in
-the baseline must stay at zero. A new ERROR needs a fix or a Teo-approved pragma/allowlist
+the baseline must stay at zero. A new ERROR needs a fix or a maintainer-approved pragma/allowlist
 entry (never agent-added — AUDITS.md approval rules).
 
 Skips when the fem harness is not present (a standalone checkout of this repo).
@@ -76,5 +76,5 @@ def test_fem_audit_gate() -> None:
     over = {r: n for r, n in counts.items() if n > BASELINE.get(r, 0)}
     assert not over, (
         f"fem-audit: ERRORs beyond the recorded baseline {BASELINE}: {over}.\n"
-        "Fix them or get a Teo-approved pragma (agents never add approvals).\n\n" + out.stdout
+        "Fix them or get a maintainer-approved pragma (agents never add approvals).\n\n" + out.stdout
     )

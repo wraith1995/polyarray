@@ -5,8 +5,7 @@ from :class:`RationalFunction`, which carries real rational polynomials.
 Its only operation is to be the scrutinee of a :func:`Interpreter.select_x`
 typed switch.
 
-Used by the orientation-aware sampler API (see
-``plans/archive/sampler_orientations.md``) so that a symbolic orientation value
+Used by the orientation-aware sampler API so that a symbolic orientation value
 can branch the emitted IR over the canonical orientation order of an
 entity type at run time, without participating in any rational arithmetic.
 """

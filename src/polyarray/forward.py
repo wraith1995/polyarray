@@ -101,7 +101,7 @@ class ProgramRow:
     # OUTPUT to fresh atoms (so ``total_mass`` above reads tiny), but pyab lowers each
     # non-bulk RationalFunction OPERAND cell (``stmt.in_``) by expanding its monomials
     # into the codegen AST.  This is where a degree-d symbolic build actually costs —
-    # ``total_mass`` alone hides it (the argyris-P(T) 9K-output / 8.35M-operand mismatch).
+    # ``total_mass`` alone hides it (a 9K-output / 8.35M-operand mismatch is invisible in the sum).
     operand_mass: int = 0     # Σ monomial count over non-bulk RF operand cells
     max_operand: int = 0      # largest single operand-cell monomial count
     n_operand_cells: int = 0  # number of symbolic (RF) operand cells

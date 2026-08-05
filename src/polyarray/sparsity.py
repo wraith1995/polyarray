@@ -1,6 +1,6 @@
 """Structural-zero sparsity propagation over a Program (P4 of the `simplify` plan).
 
-This is the *additive* sparsity pass specified in ``plans/00-simplify-design.md``
+This is the *additive* sparsity pass
 §"Sparsity rules" and §P4.  It threads a structural-zero boolean mask (``True``
 = structurally zero) through ``program.statements`` in run order, computing a
 mask for every :class:`SymArray` — program inputs, each :class:`Stmt` output,
