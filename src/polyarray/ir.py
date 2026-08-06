@@ -2706,7 +2706,10 @@ def runtime_einsum_multi(
     arrs = [np.asarray(o) for o in operands]
     any_object = any(a.dtype == object for a in arrs)
     if program is None or not any_object:
-        return np.einsum(spec, *arrs, optimize=True)
+        # Through the path cache, not `np.einsum(..., optimize=True)` directly: the ORDER is
+        # unchanged (the cache stores and replays the very path numpy would have planned), so
+        # this is bit-identical — it only stops re-planning it on every call.
+        return _cached_einsum(spec, tuple(arrs), True)
 
     if not force_defer:
         bound = _estimate_einsum_output_terms(spec, arrs)
@@ -2714,7 +2717,9 @@ def runtime_einsum_multi(
         bt = program.budget.einsum_bag_threshold
         threshold = _einsum_bag_threshold() if bt is None else bt
         if bound <= threshold:
-            return np.einsum(spec, *arrs, optimize=True)
+            # The under-threshold "bag" lane — the hottest of the build-time einsums, since it
+            # fires on every small symbolic contraction. Same path-cache reasoning as above.
+            return _cached_einsum(spec, tuple(arrs), True)
 
     op = EinsumStmtOp(spec=spec)
     refs = [SymArray(a, program=program) for a in arrs]
