@@ -30,6 +30,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+import warnings
 
 import numpy as np
 import pytest
@@ -157,3 +158,39 @@ def test_the_exact_twin_covers_every_assert_kind_the_op_executes():
     assert not missing, (
         f"AssertOp kinds {missing} are executed by ir but unknown to exact_fold's twin — "
         "the exact lane would raise 'unknown kind' the first time one is certified")
+
+
+# --------------------------------------------------------------------------------------------
+# The two PUBLIC string-keyed extension points, checked where the keys arrive
+# --------------------------------------------------------------------------------------------
+
+def test_a_private_spelling_of_one_of_our_ops_is_reported_at_the_entry_point():
+    """`op_renderers` / `op_lowerings` take FRONT-END names, so polyarray cannot validate them
+    in general — it deliberately cannot see that namespace. It can catch the one spelling that
+    caused every instance so far: `_Name` for an op that now lives here as `Name`.
+
+    These ops were RELOCATED into polyarray from grassmann's lowering layer, so keys like
+    `_AxisLenOp` were correct before the move and silently dead after it — and because the
+    built-in type-keyed renderer takes precedence and handles the op anyway, the results stayed
+    right. That is exactly why it goes unnoticed."""
+    from polyarray import Program, Provenance, SymInput, to_numpy_source
+    from polyarray.numpy_source import DeadOpKeyWarning
+
+    prog = Program("t", inputs=[SymInput("x", (2,), Provenance("vertex", "x", (), "x"))])
+    prog.add_output("y", prog.input("x").cells)
+
+    with pytest.warns(DeadOpKeyWarning, match=r"_AxisLenOp.*PRIVATE spelling"):
+        to_numpy_source(prog, op_renderers={"_AxisLenOp": lambda op, a: "0"})
+
+    # A genuine front-end name resolves to nothing here and must NOT be flagged — a false
+    # alarm on a legitimate key is how a warning gets trained away.
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        to_numpy_source(prog, op_renderers={"_QrSignFixOp": lambda op, a: "0"})
+    assert not [w for w in rec if issubclass(w.category, DeadOpKeyWarning)]
+
+    # And the correct spelling is silent.
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        to_numpy_source(prog, op_renderers={"AxisLenOp": lambda op, a: "0"})
+    assert not [w for w in rec if issubclass(w.category, DeadOpKeyWarning)]

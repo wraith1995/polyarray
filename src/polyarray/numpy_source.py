@@ -28,7 +28,7 @@ Extending to non-polyarray ops
 ------------------------------
 polyarray's own typed ops (``DetOp``/``EinsumStmtOp``/…) are covered by the
 built-in registry.  Front-ends that lower onto polyarray with their *own* Stmt
-ops (e.g. grassmann's ``_AxisLenOp``) pass an ``op_renderers`` mapping keyed by
+ops (keyed by their own class name) pass an ``op_renderers`` mapping keyed by
 the op class name to :func:`to_numpy_source` — keeping polyarray free of any
 dependency on the front-end.  An op with no renderer raises a clear
 ``NotImplementedError`` naming the op.
@@ -49,6 +49,7 @@ any front-end dependency.
 from __future__ import annotations
 
 import keyword
+import warnings
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 
@@ -167,6 +168,46 @@ class _HelperRegistry:
 # A renderer maps ``(op, arg_exprs)`` to a single Python expression string that,
 # when evaluated, yields the op's result (a tuple for multi-output ops).
 OpRenderer = Callable[[Any, "list[str]"], str]
+
+
+class DeadOpKeyWarning(UserWarning):
+    """A caller-supplied op-name key can never match any op, so its entry is unreachable.
+
+    Both public string-keyed extension points (``to_numpy_source(op_renderers=)`` and
+    ``pyab.LowerOpts.op_lowerings``) exist so a front end can render ITS ops without polyarray
+    importing it. The price is that a key naming nothing is INVISIBLE: the lookup simply misses
+    and the caller gets the fallback — which is usually correct, so nothing fails and nothing
+    warns. Seven such keys survived a year in ``batch.py``.
+
+    polyarray cannot validate a genuine front-end name (it deliberately cannot see that
+    namespace). It CAN catch the specific spelling that caused every instance so far: a private
+    ``_Name`` for an op that now lives in polyarray as ``Name``. Ops were relocated here from
+    grassmann's lowering layer, so every such key was correct before the move and silently dead
+    after it — and the fallback kept the results right, which is precisely why nobody noticed.
+    """
+
+
+def _warn_dead_op_keys(keys: Any, where: str) -> None:
+    """Warn about supplied keys that name a polyarray op with a private spelling.
+
+    Deliberately narrow. A key that resolves to nothing at all is NOT flagged: it may name a
+    front-end op polyarray genuinely cannot see, and a false alarm on a legitimate key would
+    train people to ignore this warning. A key whose underscore-stripped form IS one of our op
+    classes is a different matter — there is no reading of it that can ever match."""
+    from . import ir as _ir
+
+    for key in keys or ():
+        if not isinstance(key, str) or isinstance(getattr(_ir, key, None), type):
+            continue
+        public = key.lstrip("_")
+        if public != key and isinstance(getattr(_ir, public, None), type):
+            warnings.warn(
+                f"{where}: the key {key!r} names polyarray's {public!r} with a PRIVATE spelling, "
+                f"so it can never match — dispatch is on `type(fn).__name__`, which is "
+                f"{public!r}. This entry is unreachable; the built-in renderer handles the op "
+                f"instead, so results stay correct and the entry silently does nothing. Key it "
+                f"{public!r}, or drop it if the built-in already covers the op.",
+                DeadOpKeyWarning, stacklevel=3)
 
 
 # ---------------------------------------------------------------------------
@@ -901,8 +942,9 @@ def to_numpy_source(
 
     ``op_renderers`` maps an op *class name* to a renderer
     ``(op, arg_exprs) -> python_expression_str`` so that front-ends with their
-    own Stmt ops (e.g. grassmann's ``_AxisLenOp``) can be emitted without
+    own Stmt ops can be emitted without
     polyarray depending on them.  An op with neither a built-in nor a supplied
     renderer raises :class:`NotImplementedError` naming the op.
     """
+    _warn_dead_op_keys(op_renderers, "to_numpy_source(op_renderers=…)")
     return _Emitter(program, func_name, op_renderers).emit()

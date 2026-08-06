@@ -840,6 +840,10 @@ class _Lowerer:
         # ``SymArrayRef._cells`` identity (stable across refs to the same SymArray).
         self._cells_cse: dict[int, Any] = {}
         self.extra = dict(opts.op_lowerings or {})
+        # Same dead-key check the numpy emitter runs on its own string-keyed extension point:
+        # a private `_Name` for an op that now lives in polyarray as `Name` can never match.
+        from .numpy_source import _warn_dead_op_keys
+        _warn_dead_op_keys(self.extra, "pyab LowerOpts(op_lowerings=…)")
         self.array_ns = self.core.Var(name="torch" if opts.target == "torch" else "np")
         # In-refs of the Stmt currently being rendered — set by ``_render_op`` just
         # before the ``_ARRAY_OP_LOWERINGS`` table dispatch, so a table renderer that
