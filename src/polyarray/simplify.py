@@ -808,7 +808,42 @@ class NonExactFoldWarning(UserWarning):
     ``mode="probe"`` (accept probing), or forbid with ``mode="exact"``."""
 
 
+class NonDeterministicFoldWarning(NonExactFoldWarning):
+    """The exact lane's WALL-CLOCK BACKSTOP fired, so this result is machine-dependent.
+
+    The exact lane is budgeted in deterministic work units precisely so that a certificate
+    means the same thing on every machine.  The clock survives only as a backstop against a
+    mis-calibrated cost model on a pathological program — and if it fires, the very property
+    the work budget exists to provide is gone: re-run on a faster box and more may certify.
+
+    It is a :class:`NonExactFoldWarning` subclass so that every existing consumer of
+    fold provenance (notably pointwise's certificate cache, which decides the ``exact`` bit by
+    walking this hierarchy) treats it as non-exact without changes.  Seeing it means the cost
+    model needs fixing, not the budget raising."""
+
+
 _PARTIAL_EVAL_MODES = ("exact", "hybrid", "probe")
+
+
+def _resolve_legacy_time_budget(time_budget: float | None) -> float | None:
+    """Translate a legacy ``time_budget=`` into a wall-clock BACKSTOP, loudly.
+
+    ``time_budget`` used to decide what the exact lane folded, in seconds — which is exactly
+    the machine dependence the work budget removed.  It stays ACCEPTED because polyarray's
+    committed surface carries it and pointwise has external consumers, but it no longer
+    selects certificates: it now sizes the backstop, i.e. it still guarantees the call
+    terminates, which is the reason callers passed it.  Because the meaning genuinely changed,
+    passing it warns rather than silently doing something else than it used to."""
+    if time_budget is None:
+        return None                            # `None` = exact_fold's default backstop
+    warnings.warn(
+        "partial_eval_numeric(time_budget=…) no longer decides what the exact lane folds — "
+        "that is now `work_budget`, in deterministic work units, so a certificate no longer "
+        "depends on how loaded the machine is. The value is being used as a wall-clock "
+        "BACKSTOP only: it still bounds how long the call may run, and if it fires you get a "
+        "NonDeterministicFoldWarning. Pass work_budget= to bound what folds.",
+        DeprecationWarning, stacklevel=3)
+    return float(time_budget)
 
 
 def _resolve_partial_eval_mode(mode: str | None) -> str:
@@ -865,7 +900,8 @@ def _warn_probe_freezes(
 
 def _partial_eval_numeric(
     program: Program, *, probes: int, seed: int, rtol: float, atol: float,
-    mode: str = "probe", time_budget: float = 10.0, max_sym_mass: int | None = None,
+    mode: str = "probe", work_budget: int | None = None, max_sym_mass: int | None = None,
+    wall_backstop: float | None = None,
 ) -> tuple[Program, dict, Any]:
     """Partial evaluation folding every Stmt whose outputs are INVARIANT under the
     program's symbolic inputs — by exact normalization, probing, or both (``mode``).
@@ -918,7 +954,7 @@ def _partial_eval_numeric(
     if mode in ("exact", "hybrid"):
         from .exact_fold import _MAX_SYM_MASS, exact_partial_eval
         exact_state = exact_partial_eval(
-            program, time_budget=time_budget,
+            program, work_budget=work_budget, wall_backstop=wall_backstop,
             max_sym_mass=_MAX_SYM_MASS if max_sym_mass is None else max_sym_mass)
         known.update(exact_state.known)
         foldable |= exact_state.folded
@@ -973,6 +1009,19 @@ def _partial_eval_numeric(
             probe_frozen.add(i)
         foldable |= probe_frozen
 
+    # The backstop firing is reported REGARDLESS of mode and regardless of whether anything was
+    # probe-frozen: it says the result is machine-dependent, which is a different (and worse)
+    # claim than "some certificates are probabilistic", and `mode="exact"` — the mode chosen
+    # precisely to refuse non-exact folds — must not swallow it.
+    if exact_state is not None and exact_state.hit_wall_clock:
+        warnings.warn(NonDeterministicFoldWarning(
+            f"exact_fold's WALL-CLOCK BACKSTOP fired on program {program.name!r} after "
+            f"{exact_state.spent} work units (budget {exact_state.limit}). The remaining "
+            f"statements were left unresolved on a TIMER, so this result is NOT reproducible: "
+            f"a faster machine would certify more. The work cost model under-counted this "
+            f"program — that is the bug to fix, not the budget to raise."),
+            stacklevel=3)
+
     if mode == "hybrid":
         _warn_probe_freezes(
             program, probe_frozen,
@@ -996,8 +1045,8 @@ def _partial_eval_numeric(
 def partial_eval_numeric(
     program: Program, *, probes: int = 3, seed: int = 0,
     rtol: float = 1e-9, atol: float = 1e-12,
-    mode: str | None = None, time_budget: float = 10.0,
-    max_sym_mass: int | None = None,
+    mode: str | None = None, work_budget: int | None = None,
+    max_sym_mass: int | None = None, time_budget: float | None = None,
 ) -> Program:
     """Fold every Stmt whose outputs are invariant under the program's symbolic
     inputs — see :func:`_partial_eval_numeric` for the mechanics.
@@ -1015,24 +1064,30 @@ def partial_eval_numeric(
 
     ``mode=None`` reads the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default (else
     ``"hybrid"``); the explicit parameter always wins.  ``probes`` configures the
-    probe count of the probe/hybrid-fallback lanes.  ``time_budget`` (seconds,
-    checked BETWEEN operations) and ``max_sym_mass`` (the monomial mass one symbolic
-    op's operands may carry, checked BEFORE it runs — an object-dtype einsum / Gauss
+    probe count of the probe/hybrid-fallback lanes.  ``work_budget`` (DETERMINISTIC
+    work units, charged BETWEEN operations) and ``max_sym_mass`` (the monomial mass one
+    symbolic op's operands may carry, checked BEFORE it runs — an object-dtype einsum / Gauss
     pass is uninterruptible once started) JOINTLY bound the exact lane: oversized or
-    timed-out statements degrade to the (warned) probe fallback rather than hang.
-    ``max_sym_mass=None`` uses ``exact_fold._MAX_SYM_MASS``."""
+    out-of-budget statements degrade to the (warned) probe fallback rather than hang.
+    ``max_sym_mass=None`` uses ``exact_fold._MAX_SYM_MASS``; ``work_budget=None`` uses the
+    ``POLYARRAY_EXACT_WORK_BUDGET`` env knob, else ``exact_fold._DEFAULT_WORK_BUDGET``.
+
+    The budget is work, NOT seconds: what certifies is a function of the program alone, so the
+    same input yields the same certificate on any machine under any load.  See
+    :class:`NonDeterministicFoldWarning` for the one case where that guarantee lapses."""
     new, _known, _state = _partial_eval_numeric(
         program, probes=probes, seed=seed, rtol=rtol, atol=atol,
-        mode=_resolve_partial_eval_mode(mode), time_budget=time_budget,
-        max_sym_mass=max_sym_mass)
+        mode=_resolve_partial_eval_mode(mode), work_budget=work_budget,
+        max_sym_mass=max_sym_mass,
+        wall_backstop=_resolve_legacy_time_budget(time_budget))
     return new
 
 
 def partial_eval_numeric_symarray(
     sa: SymArray, *, probes: int = 3, seed: int = 0,
     rtol: float = 1e-9, atol: float = 1e-12,
-    mode: str | None = None, time_budget: float = 10.0,
-    max_sym_mass: int | None = None,
+    mode: str | None = None, work_budget: int | None = None,
+    max_sym_mass: int | None = None, time_budget: float | None = None,
 ) -> SymArray:
     """:func:`partial_eval_numeric` for a ``SymArray`` whose CELLS reference the
     program's atoms (e.g. a symbolic Vandermonde whose cells are ``grass_dof.result``
@@ -1043,21 +1098,23 @@ def partial_eval_numeric_symarray(
     (:func:`polyarray.exact_fold.exact_fold_cells`): a cell is certified constant iff
     its rational normal form over the feed atoms has total degree zero — so a
     cancellation that completes only at the entry (no single statement invariant)
-    still folds, exact-by-construction.  ``mode``/``probes``/``time_budget``/
+    still folds, exact-by-construction.  ``mode``/``probes``/``work_budget``/
     ``max_sym_mass`` as in
     :func:`partial_eval_numeric`."""
     from .ir import SymArray
     if sa.program is None:
         return sa
     mode_r = _resolve_partial_eval_mode(mode)
+    backstop = _resolve_legacy_time_budget(time_budget)
     new, known, state = _partial_eval_numeric(
         sa.program, probes=probes, seed=seed, rtol=rtol, atol=atol,
-        mode=mode_r, time_budget=time_budget, max_sym_mass=max_sym_mass)
+        mode=mode_r, work_budget=work_budget, max_sym_mass=max_sym_mass,
+        wall_backstop=backstop)
     cells = _fold_cells(np.asarray(sa.cells), known)
     if state is not None:
         from .exact_fold import _MAX_SYM_MASS, exact_fold_cells
         cells = exact_fold_cells(
-            cells, state, sa.program, time_budget=time_budget,
+            cells, state, sa.program, work_budget=work_budget, wall_backstop=backstop,
             max_sym_mass=_MAX_SYM_MASS if max_sym_mass is None else max_sym_mass)
     folded = _numify_constant_cells(cells)
     return SymArray(folded, program=new)
