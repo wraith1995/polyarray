@@ -224,47 +224,124 @@ def test_non_dyadic_constant_through_cancellation_is_folded_not_refuted() -> Non
     np.testing.assert_allclose(got, [c], atol=0.0)
 
 
-def test_time_budget_degrades_to_unresolved_not_hang() -> None:
-    """REGRESSION: the exact filter/classification must honor
-    ``time_budget`` — a pathological cell degrades to *unresolved* (⇒ the warned
-    probe fallback in hybrid), never a gate hang.  Pinned at three levels."""
-    import time as _time
+def _budget_program() -> Program:
+    """A one-statement program whose cell is constant only AFTER cancellation.
 
-    from polyarray.exact_fold import _Timeout, _constant_value
+    ``(1/3)·q / q`` — foldable exactly, but only by paying the gcd, so it is exactly the
+    shape that a budget can starve."""
+    from polyarray.rational import RationalFunction as RF
+    prog = Program("budget", inputs=[SymInput("x", (1,), _prov("x"))])
+    x_rf = np.asarray(prog.input_arrays["x"].cells)[0]
+    q = x_rf * x_rf + x_rf + 1.0
+    sa = SymArray(np.array([(RF.constant(1.0 / 3.0) * q) / q], dtype=object), program=prog)
+    [Y] = prog.emit_stmt(IdentityOp(), [sa], [OutSpec("Y", (1,))], bulk=False)
+    prog.add_output("Y", Y.cells)
+    return prog
+
+
+def test_work_budget_degrades_to_unresolved_not_hang() -> None:
+    """The exact filter/classification honors the WORK budget — a pathological cell degrades
+    to *unresolved* (⇒ the warned probe fallback in hybrid), never a gate hang."""
+    from polyarray.exact_fold import _Exhausted, _Meter, _constant_value
     from polyarray.rational import RationalFunction as RF
 
-    # (1) unit: an expired deadline raises _Timeout before any expensive step.
+    # (1) unit: an exhausted meter raises before any expensive step.
     x = RF.atom("x")
     rf = (RF.constant(1.0 / 3.0) * (x * x + 1.0)) / (x * x + 1.0)
-    with pytest.raises(_Timeout):
-        _constant_value(rf, deadline=_time.monotonic() - 1.0)
-    # no deadline / generous deadline: same exact answer as before.
+    with pytest.raises(_Exhausted):
+        _constant_value(rf, _Meter(limit=1))
+    # no meter / generous meter: same exact answer as before.
     assert _constant_value(rf) == 1.0 / 3.0
-    assert _constant_value(rf, deadline=_time.monotonic() + 60.0) == 1.0 / 3.0
+    assert _constant_value(rf, _Meter(limit=0)) == 1.0 / 3.0
 
-    # (2) end-to-end: time_budget=0 ⇒ the (foldable!) constant-through-cancellation
+    # (2) end-to-end: a budget of 1 unit ⇒ the (foldable!) constant-through-cancellation
     # statement is NOT exact-folded; exact mode leaves it symbolic, silently.
-    def _prog() -> Program:
-        prog = Program("budget", inputs=[SymInput("x", (1,), _prov("x"))])
-        x_rf = np.asarray(prog.input_arrays["x"].cells)[0]
-        q = x_rf * x_rf + x_rf + 1.0
-        sa = SymArray(np.array([(RF.constant(1.0 / 3.0) * q) / q], dtype=object),
-                      program=prog)
-        [Y] = prog.emit_stmt(IdentityOp(), [sa], [OutSpec("Y", (1,))], bulk=False)
-        prog.add_output("Y", Y.cells)
-        return prog
-
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        folded = partial_eval_numeric(_prog(), mode="exact", time_budget=0.0)
-    assert len(folded.statements) == 1, "expired budget must leave the stmt unresolved"
+        folded = partial_eval_numeric(_budget_program(), mode="exact", work_budget=1)
+    assert len(folded.statements) == 1, "spent budget must leave the stmt unresolved"
     assert not [w for w in rec if issubclass(w.category, NonExactFoldWarning)]
 
-    # (3) hybrid: the unresolved statement goes to the LOUD probe fallback, and the
-    # warning carries the time-budget reason.
-    with pytest.warns(NonExactFoldWarning, match="time budget"):
-        folded = partial_eval_numeric(_prog(), mode="hybrid", time_budget=0.0)
+    # (3) hybrid: the unresolved statement goes to the LOUD probe fallback, and the warning
+    # carries the work-budget reason (with the spend, so the fix is legible from the message).
+    with pytest.warns(NonExactFoldWarning, match=r"work budget exhausted \(\d+/1 units\)"):
+        folded = partial_eval_numeric(_budget_program(), mode="hybrid", work_budget=1)
     assert len(folded.statements) == 0                  # probe-frozen (invariant)
+
+
+def test_the_budget_is_deterministic_under_a_lying_clock() -> None:
+    """THE regression this budget exists for: what folds must not depend on the machine.
+
+    The old budget was wall-clock seconds, so the SAME program on the SAME input certified
+    exactly on a quiet box and probe-backed on a loaded one — measured 6874 / 6895 / 7726
+    frozen statements across three runs of one leg.  A certificate recorded the load average.
+
+    Rather than try to reproduce load (which no test can do reliably — and a test that needs a
+    busy machine to fail is exactly the instrument that let this hide), this drives the clock
+    itself: `time.monotonic` is monkeypatched to leap wildly, which under the old design would
+    have truncated the pass at an arbitrary point.  The verdict must not move at all.
+
+    Scope, stated precisely because it is the residual risk: this pins the WORK budget, with
+    the wall-clock backstop disabled.  The backstop is the one remaining way a clock can move
+    a verdict — kept deliberately, sized generously, and LOUD when it fires (see
+    `test_the_wall_clock_backstop_is_loud_when_it_fires`).  So: a run that never trips it is
+    fully reproducible, and a run that trips it says so rather than quietly certifying less."""
+    import math
+
+    import polyarray.exact_fold as EF
+    from polyarray.exact_fold import exact_partial_eval
+
+    def _verdict():
+        st = exact_partial_eval(_budget_program(), work_budget=0, wall_backstop=math.inf)
+        return st.folded, st.refuted, dict(st.unresolved), st.spent
+
+    baseline = _verdict()
+    assert baseline[0], "precondition: this program folds exactly under a full budget"
+
+    # A clock that jumps by an hour on every read, and one frozen solid. Neither may matter.
+    for name, clock in (("leaping", _leaping_clock(3600.0)), ("frozen", lambda: 1.0)):
+        orig = EF.time.monotonic
+        try:
+            EF.time.monotonic = clock
+            assert _verdict() == baseline, f"a {name} clock changed the exact-lane verdict"
+        finally:
+            EF.time.monotonic = orig
+
+    # And the spend itself is reproducible run to run — the property the certificate rests on.
+    assert _verdict()[3] == baseline[3]
+
+
+def _leaping_clock(step: float):
+    """A monotonic clock that jumps ``step`` seconds every time it is read."""
+    state = {"t": 0.0}
+
+    def clock() -> float:
+        state["t"] += step
+        return state["t"]
+    return clock
+
+
+def test_the_wall_clock_backstop_is_loud_when_it_fires() -> None:
+    """The backstop may still exist, but it may never be SILENT.
+
+    If it fires, the result is machine-dependent again — the one thing the work budget is for.
+    So it is not folded into the ordinary degrade path: it warns in its own category, and it
+    does so even in ``mode="exact"``, the mode whose entire purpose is refusing inexact folds."""
+    from polyarray.simplify import NonDeterministicFoldWarning
+
+    # A legacy `time_budget=0` now sizes the BACKSTOP, so it expires on the first charge —
+    # which also pins the compatibility contract: the old keyword still bounds the call.
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        partial_eval_numeric(_budget_program(), mode="exact", work_budget=0, time_budget=0.0)
+    assert [w for w in rec if issubclass(w.category, NonDeterministicFoldWarning)], \
+        "the backstop fired and said nothing"
+    assert [w for w in rec if issubclass(w.category, DeprecationWarning)], \
+        "time_budget changed meaning and did not say so"
+
+    # It is a NonExactFoldWarning subclass, so existing provenance consumers (pointwise's
+    # certificate cache decides the `exact` bit by walking this hierarchy) need no change.
+    assert issubclass(NonDeterministicFoldWarning, NonExactFoldWarning)
 
 
 def test_oversized_symbolic_op_is_rejected_before_it_runs() -> None:
@@ -291,12 +368,12 @@ def test_oversized_symbolic_op_is_rejected_before_it_runs() -> None:
     prog.add_output("Y", Y.cells)
 
     # A cap BELOW this operand's mass ⇒ unresolved with the size reason (not executed).
-    state = exact_partial_eval(prog, time_budget=60.0, max_sym_mass=2)
+    state = exact_partial_eval(prog, work_budget=0, max_sym_mass=2)
     assert 0 in state.unresolved
     assert "too large" in state.unresolved[0]
     assert not state.folded and not state.refuted
     # The production cap admits it (an ordinary small cell), and it is exactly refuted.
-    state = exact_partial_eval(prog, time_budget=60.0, max_sym_mass=_MAX_SYM_MASS)
+    state = exact_partial_eval(prog, work_budget=0, max_sym_mass=_MAX_SYM_MASS)
     assert state.refuted == {0} and not state.unresolved
 
     # hybrid: a size-rejected but genuinely INVARIANT statement (``(x+1)⁶/(x+1)⁶ ≡ 1``,
@@ -405,14 +482,14 @@ def test_vmap_batch_cap_bounds_the_work_before_it_starts() -> None:
     import polyarray.exact_fold as EF
 
     prog = _vmap_inv_chain_program(batch=4)
-    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    st = EF.exact_partial_eval(prog, work_budget=0)
     assert st.folded == {0}, st.unresolved                  # under the cap: descends
 
     prog = _vmap_inv_chain_program(batch=4)
-    st = EF.exact_partial_eval(prog, time_budget=30.0, max_sym_mass=EF._MAX_SYM_MASS)
+    st = EF.exact_partial_eval(prog, work_budget=0, max_sym_mass=EF._MAX_SYM_MASS)
     saved, EF._MAX_VMAP_BATCH = EF._MAX_VMAP_BATCH, 2
     try:
-        st = EF.exact_partial_eval(_vmap_inv_chain_program(batch=4), time_budget=30.0)
+        st = EF.exact_partial_eval(_vmap_inv_chain_program(batch=4), work_budget=0)
     finally:
         EF._MAX_VMAP_BATCH = saved
     assert 0 in st.unresolved and "batch 4" in st.unresolved[0], st.unresolved
@@ -455,7 +532,7 @@ def test_project_embed_axislen_twins_are_exact() -> None:
     prog.add_output("back", back.cells)
     prog.add_output("n", n.cells)
     import polyarray.exact_fold as EF
-    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    st = EF.exact_partial_eval(prog, work_budget=0)
     assert st.folded == {2}, (st.folded, st.unresolved)     # AxisLen is CONSTANT (=3)
     assert st.refuted == {0, 1}, (st.refuted, st.unresolved)  # embed/project vary with v
     v = np.array([0.3, -1.25])
@@ -476,7 +553,7 @@ def test_assert_twin_passes_the_value_through_and_still_checks() -> None:
         AssertOp("square_full_rank", "guard"), [prog.input("A")],
         [OutSpec("X", (2, 2))], bulk=False)
     prog.add_output("X", x.cells)
-    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    st = EF.exact_partial_eval(prog, work_budget=0)
     assert st.refuted == {0} and not st.unresolved          # value threaded, not opaque
 
     bad = Program("assert_bad", inputs=[SymInput("A", (2, 2), _prov("A"))])
@@ -486,7 +563,7 @@ def test_assert_twin_passes_the_value_through_and_still_checks() -> None:
     [y] = bad.emit_stmt(
         AssertOp("square_full_rank", "guard"), [sing], [OutSpec("Y", (2, 2))], bulk=False)
     bad.add_output("Y", y.cells)
-    st = EF.exact_partial_eval(bad, time_budget=30.0)
+    st = EF.exact_partial_eval(bad, work_budget=0)
     assert 0 in st.unresolved, st                            # decidable failure ⇒ opaque
 
 
@@ -511,7 +588,7 @@ def test_kron_twins_are_exact_and_certify_a_constant_wedge() -> None:
     prog.emit_stmt(KronFreeOp(0, 0), [Const(A), Const(B)], [OutSpec("kf", (4, 4))], bulk=False)
 
     import polyarray.exact_fold as EF
-    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    st = EF.exact_partial_eval(prog, work_budget=0)
     assert st.folded == {0, 1}, (st.folded, st.unresolved)   # constant in, constant out
     assert not st.unresolved, st.unresolved                  # and NOT opaque
 
@@ -529,7 +606,7 @@ def test_kron_twin_threads_symbolic_cells_rather_than_going_opaque() -> None:
                    [OutSpec("k", (4, 4))], bulk=False)
 
     import polyarray.exact_fold as EF
-    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    st = EF.exact_partial_eval(prog, work_budget=0)
     assert 1 not in st.unresolved, st.unresolved             # executed, not opaque
     assert 1 in st.refuted, (st.refuted, st.folded)          # and PROVABLY non-constant
 
@@ -545,7 +622,7 @@ def test_kron_twin_backs_off_on_a_shape_it_cannot_honour() -> None:
                    [OutSpec("k", (4,))], bulk=False)
 
     import polyarray.exact_fold as EF
-    st = EF.exact_partial_eval(prog, time_budget=30.0)
+    st = EF.exact_partial_eval(prog, work_budget=0)
     # UNRESOLVED, never a wrong-shaped fold.  The reason text is deliberately not pinned: the
     # declared-OutSpec check may fire before the twin's own ndim guard, and either way the
     # statement lands in `unresolved` (⇒ the warned probe fallback), which is the contract.
@@ -578,7 +655,7 @@ def test_switch_with_equal_branches_folds_through_a_symbolic_scrutinee():
     which would have put an unfoldable node ahead of every σ-carrying expression and degraded the
     FEEC lanes back to probe fallback — trading away the `QrOp` removal, not adding to it."""
     from polyarray.exact_fold import exact_partial_eval
-    st = exact_partial_eval(_switch_program(equal=True), time_budget=10.0)
+    st = exact_partial_eval(_switch_program(equal=True), work_budget=0)
     assert sorted(st.folded) == [0], f"equal branches must fold; got {st.unresolved}"
     assert not st.unresolved
 
@@ -588,7 +665,7 @@ def test_switch_with_differing_branches_is_unresolved_not_guessed():
     pick one. The reason names the switch, so the hybrid-mode warning localizes it instead of
     blaming the generic unresolved-operand path."""
     from polyarray.exact_fold import exact_partial_eval
-    st = exact_partial_eval(_switch_program(equal=False), time_budget=10.0)
+    st = exact_partial_eval(_switch_program(equal=False), work_budget=0)
     assert not st.folded
     assert len(st.unresolved) == 1
     assert "SwitchOp" in next(iter(st.unresolved.values()))
@@ -629,9 +706,97 @@ def test_switch_with_a_constant_scrutinee_selects_the_right_branch():
 
         _ef._sym_apply = spy
         try:
-            st = exact_partial_eval(prog, time_budget=10.0)
+            st = exact_partial_eval(prog, work_budget=0)
         finally:
             _ef._sym_apply = orig
         assert seen == [expect], f"scrutinee={k}: selected {seen}, expected [{expect!r}]"
         assert sorted(st.refuted) == [0], f"scrutinee={k}: expected a refutation, got {st.unresolved}"
         assert not st.unresolved
+
+
+# --------------------------------------------------------------------------------------------
+# Ops that ARE field arithmetic / slices / shape reads — twins that extend the certificate.
+#
+# Each test asserts the twin AGREES WITH THE REAL OP on concrete data — not merely that
+# something folded.  `partial_eval_numeric` certifies that a value is CONSTANT, never that it
+# is RIGHT: a wrong-but-constant twin would certify 100% and be invisible to a fold-rate check.
+# So every twin here is pinned against `fn(...)` run on the same inputs.
+# --------------------------------------------------------------------------------------------
+
+def _agrees_with_the_real_op(fn, *arrays, out_shape) -> None:
+    """Run ``fn`` symbolically through the exact lane and numerically, and require equality."""
+    import polyarray.exact_fold as EF
+    from polyarray.ir import Const
+
+    prog = Program("twin", inputs=[SymInput("x", (1,), _prov("x"))])
+    # A symbolic operand the op does not read (it reads the Const operands) keeps the statement
+    # on the SYMBOLIC path — otherwise `_exec_stmt` would run the real op numerically and the
+    # twin would never be exercised at all.
+    consts = [Const(a) for a in arrays]
+    [y] = prog.emit_stmt(fn, consts, [OutSpec("Y", out_shape)], bulk=False)
+    prog.add_output("Y", y.cells)
+    st = EF.exact_partial_eval(prog, work_budget=0)
+    assert not st.unresolved, f"{type(fn).__name__} twin went opaque: {st.unresolved}"
+    np.testing.assert_allclose(np.asarray(prog.run({"x": np.array([1.0])})["Y"], dtype=float),
+                               np.asarray(fn(*arrays), dtype=float), atol=0.0)
+
+
+def test_compose_via_std_twin_is_the_exact_solve() -> None:
+    """`ComposeViaStdOp` is literally ``solve(R_to, R_from)`` — the same exact Gauss
+    elimination the `SolveOp` arm already used.  It was the sharpest of the listed gaps
+    because the twin it needed was already in the module."""
+    from polyarray.ir import ComposeViaStdOp
+    R_to = np.array([[2.0, 1.0], [0.0, 4.0]])
+    R_from = np.array([[1.0, 0.0], [0.5, 2.0]])
+    _agrees_with_the_real_op(ComposeViaStdOp(), R_to, R_from, out_shape=(2, 2))
+
+
+def test_block_assembly_twins_agree_with_the_real_ops() -> None:
+    """Block assembly is structure + field arithmetic — the argument that earned `KronOp` its
+    twin, since `BlockRepeatOp` IS ``kron(eye(n), A)``."""
+    from polyarray.ir import BlockDiagOp, BlockRepeatOp
+    A = np.array([[1.0, 2.0], [3.0, 4.0]])
+    B = np.array([[5.0]])
+    _agrees_with_the_real_op(BlockDiagOp(), A, B, out_shape=(3, 3))
+    _agrees_with_the_real_op(BlockRepeatOp(3), A, out_shape=(6, 6))
+
+
+def test_col_slice_twins_agree_and_bail_on_a_non_constant_rank() -> None:
+    """A column slice is exact once ``rank`` is a build-time constant — and a rank that is
+    NOT constant must leave the statement unresolved rather than pick a width."""
+    import polyarray.exact_fold as EF
+    from polyarray.ir import Const, FirstColsOp, LastColsOp
+    A = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    _agrees_with_the_real_op(FirstColsOp(), A, np.asarray(2), out_shape=(2, 2))
+    _agrees_with_the_real_op(LastColsOp(), A, np.asarray(2), out_shape=(2, 1))
+
+    # A symbolic rank: unresolved, with a reason that names the cause.
+    prog = Program("badrank", inputs=[SymInput("r", (), _prov("r"))])
+    [y] = prog.emit_stmt(FirstColsOp(), [Const(A), prog.input("r")],
+                         [OutSpec("Y", (2, 2))], bulk=False)
+    prog.add_output("Y", y.cells)
+    st = EF.exact_partial_eval(prog, work_budget=0)
+    assert 0 in st.unresolved and "build-time constant" in st.unresolved[0]
+
+
+def test_structural_shape_reads_are_exact_under_a_symbolic_operand() -> None:
+    """The shape-read family reads ``.shape`` and nothing else, so it is exact even when the
+    operand is fully symbolic — the same argument that makes the `AxisLenOp` arm sound.
+
+    This is the sharpest of the four groups: these ops CANNOT read a cell, so there is no
+    version of them that depends on the symbolic values at all."""
+    import polyarray.exact_fold as EF
+    from polyarray.ir import DynEyeOp, SumDimOp
+
+    prog = Program("shapes", inputs=[SymInput("A", (4, 3), _prov("A"))])
+    [eye] = prog.emit_stmt(DynEyeOp(1), [prog.input("A")], [OutSpec("E", (3, 3))], bulk=False)
+    [n] = prog.emit_stmt(SumDimOp(0), [prog.input("A"), prog.input("A")],
+                         [OutSpec("n", ())], bulk=False)
+    prog.add_output("E", eye.cells)
+    prog.add_output("n", n.cells)
+    st = EF.exact_partial_eval(prog, work_budget=0)
+    assert st.folded == {0, 1}, (st.folded, st.refuted, st.unresolved)
+    assert not st.unresolved
+    out = prog.run({"A": np.zeros((4, 3))})
+    np.testing.assert_allclose(np.asarray(out["E"], dtype=float), np.eye(3), atol=0.0)
+    assert float(np.asarray(out["n"])) == 8.0            # 4 + 4

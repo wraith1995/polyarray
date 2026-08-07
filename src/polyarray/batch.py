@@ -35,7 +35,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .ir import Const, InputRef, IntAtomRef, OutputRef, Program, RationalRef, SymArrayRef, is_dynamic
+from .ir import (Const, InputRef, IntAtomRef, OutputRef, Program, RationalRef, SymArrayRef,
+                 _cached_einsum, is_dynamic)
 from .rational import RationalFunction
 
 __all__ = ["batched_run", "BatchUnsupported"]
@@ -66,12 +67,26 @@ def _apply(fn: Any, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, boo
     def A(i: int) -> np.ndarray:
         return np.asarray(vals[i], dtype=float)
 
+    def _shift(ax):
+        """An axis index as seen from a BATCHED operand: one extra leading axis.
+
+        Negative indices already count from the end and so need no shift — getting that wrong
+        would silently transpose the wrong pair rather than fail."""
+        if isinstance(ax, (tuple, list)):
+            return type(ax)(_shift(a) for a in ax)
+        return ax if ax < 0 else ax + 1
+
     if name == "EinsumStmtOp":
+        # Through the shared path cache rather than `np.einsum(..., optimize=…)` directly: the
+        # contraction ORDER is unchanged (the cache replays the path numpy would have planned),
+        # so results are bit-identical — it only stops re-planning on every batched call, which
+        # this lane makes once per Stmt per batch.
+        ops = tuple(A(i) for i in range(len(vals)))
         if not anyb:
-            return np.einsum(fn.spec, *(A(i) for i in range(len(vals))), optimize=fn.optimize), False
+            return _cached_einsum(fn.spec, ops, fn.optimize), False
         lhs, rhs = fn.spec.split("->")
         bspec = ",".join("..." + t for t in lhs.split(",")) + "->..." + rhs   # ellipsis-broadcast batch
-        return np.einsum(bspec, *(A(i) for i in range(len(vals))), optimize=fn.optimize), True
+        return _cached_einsum(bspec, ops, fn.optimize), True
     if name in ("AssertOp", "IdentityOp"):                   # runtime check / capture-freeze → passthrough
         return vals[0], bflags[0]
     if name == "ScaleOp":
@@ -106,22 +121,59 @@ def _apply(fn: Any, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, boo
         rank = int(vals[1])
         sl = slice(None, rank) if name == "FirstColsOp" else slice(rank, None)
         return (A(0)[:, :, sl], True) if bflags[0] else (A(0)[:, sl], False)
-    if name == "ProjectOp":                                  # Pᵀ @ v(raveled); P const, v batched
+    if name == "ProjectOp":                                  # Pᵀ @ v(raveled)
         P, v = A(0), A(1)
-        if bflags[0]:
-            raise BatchUnsupported("ProjectOp: batched projector P")
+        if bflags[0]:                                        # batched projector: one P per element
+            vb = v.reshape(v.shape[0], -1) if bflags[1] else v.reshape(1, -1)
+            return _cached_einsum("bij,bi->bj", (P, np.broadcast_to(vb, (P.shape[0],) + vb.shape[1:])),
+                                  True), True
         if bflags[1]:
-            return np.einsum("ij,bi->bj", P, v.reshape(v.shape[0], -1)), True
+            return _cached_einsum("ij,bi->bj", (P, v.reshape(v.shape[0], -1)), True), True
         return P.T @ v.reshape(-1), False
     if name == "EmbedOp":                                    # P @ vsub, reshaped to fn.shape
         P, v = A(0), A(1)
-        if bflags[0]:
-            raise BatchUnsupported("EmbedOp: batched projector P")
+        if bflags[0]:                                        # batched projector: one P per element
+            vb = v if bflags[1] else np.broadcast_to(v, (P.shape[0],) + v.shape)
+            out = _cached_einsum("bij,bj->bi", (P, vb), True)
+            return (out.reshape((out.shape[0],) + tuple(fn.shape)) if fn.shape else out), True
         if bflags[1]:
-            out = np.einsum("ij,bj->bi", P, v)
+            out = _cached_einsum("ij,bj->bi", (P, v), True)
             return (out.reshape((out.shape[0],) + tuple(fn.shape)) if fn.shape else out), True
         out = P @ v
         return (out.reshape(fn.shape) if fn.shape else out), False
+    # --- pure SHAPE ops: the unbatched op with its axes shifted past the batch axis ---------
+    # A batched operand carries one extra LEADING axis, so each of these is the unbatched op
+    # re-expressed one axis over. They had no rule at all, so any program containing one fell
+    # back to the per-element loop entirely — correct, and slow in a way nothing reports.
+    #
+    # Each rule below mirrors its op's ACTUAL body, which is not always what the name suggests:
+    # `TransposeOp` is a FULL-REVERSE transpose (`A.T`), not a last-two-axes swap, and
+    # `ConcatOp` / `ColStackOp` FLATTEN each operand first. Writing the obvious-looking rule
+    # instead would produce wrong numbers on ndim > 2 rather than a loud failure — and a wrong
+    # batch rule is worse than none, because the fallback it replaces is correct.
+    if name == "TransposeOp":
+        if not bflags[0]:
+            return A(0).T, False
+        x = A(0)                                             # (B, *s) — reverse the NON-batch axes
+        return x.transpose((0, *range(x.ndim - 1, 0, -1))), True
+    if name == "MoveaxisOp":
+        if not bflags[0]:
+            return np.moveaxis(A(0), fn.source, fn.destination), False
+        return np.moveaxis(A(0), _shift(fn.source), _shift(fn.destination)), True
+    if name == "ConcatOp":                                   # flatten each, then concatenate
+        if anyb and not all(bflags):
+            raise BatchUnsupported("ConcatOp: mixed batched/unbatched operands")
+        if not anyb:
+            return np.concatenate([A(i).reshape(-1) for i in range(len(vals))]), False
+        b = A(0).shape[0]
+        return np.concatenate([A(i).reshape(b, -1) for i in range(len(vals))], axis=1), True
+    if name == "ColStackOp":                                 # flatten each, stack AS COLUMNS
+        if anyb and not all(bflags):
+            raise BatchUnsupported("ColStackOp: mixed batched/unbatched operands")
+        if not anyb:
+            return np.stack([A(i).reshape(-1) for i in range(len(vals))], axis=1), False
+        b = A(0).shape[0]
+        return np.stack([A(i).reshape(b, -1) for i in range(len(vals))], axis=2), True
     if not anyb:                                             # unbatched operands → run the op as-is
         return np.asarray(fn(*vals)), False
     raise BatchUnsupported(f"no batch rule for op {name!r}")
