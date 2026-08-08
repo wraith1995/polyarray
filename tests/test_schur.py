@@ -98,3 +98,79 @@ def test_general_split_pivots_singular_midpoint_block():
         inv = symbolic_inverse(SymArray(M), mask=mask)
         got = np.asarray(inv.cells, dtype=float)
         assert np.allclose(got @ M, np.eye(8), atol=1e-10), f"mask_dense={mask is not None}"
+
+
+def _sparse_block_lower(name):
+    """A 6×6 program-carrying ``[[A, 0], [C, D]]`` with A, D DIAGONAL and C carrying 2 nonzeros per row.
+
+    The structural truth of its inverse is ``[[A⁻¹, 0], [−D⁻¹·C·A⁻¹, D⁻¹]]`` — and with A, D diagonal the
+    product has C's OWN pattern, so 3 + 6 + 3 = 12 nonzeros, never 3 + 9 + 3 = 15."""
+    from polyarray import Program, Provenance, SymInput
+    prog = Program(name, inputs=[SymInput("v", (12,), Provenance("vertex", "v", (), "v"))])
+    v = prog.input("v")
+    zero = RF.constant(0.0)
+    cells = np.empty((6, 6), dtype=object)
+    cells[:] = zero
+    for i in range(6):
+        cells[i, i] = v.cells[i] + RF.constant(8.0)          # diagonally dominant A and D
+    c_cols = {3: (0, 1), 4: (0, 2), 5: (1, 2)}               # 2 nonzeros per row of C
+    for i, cols in c_cols.items():
+        for j in cols:
+            cells[i, j] = v.cells[6 + i - 3 + 3 * (j % 2)] + RF.constant(1.0)
+    return SymArray(cells, program=prog)
+
+
+def test_schur_combine_keeps_the_products_structural_zeros():
+    """The Schur combine's ``−D⁻¹·C·A⁻¹`` must come back with C's SPARSITY, not dense.
+
+    That product is DEFERRED to a numeric matmul Stmt whose outputs are fresh atoms — NAMES for a
+    pending computation — so without the factor masks threaded through ``_deferred_matmul`` every
+    entry reads as nonzero and the inverse silently loses exactly the sparsity the split was chosen
+    for.  Measured on the plate elements as one spurious nonzero per row (morley's symbolic ``P(T)``
+    15 against a numeric truth of 12).  Both halves are asserted: the STRUCTURE, and that the
+    structure is not bought with a wrong value."""
+    from polyarray.schur import _approx_zero
+    M = _sparse_block_lower("schur_sparse6")
+    inv = symbolic_inverse(M)
+    cells = np.asarray(inv.cells)
+    nnz = sum(not _approx_zero(cells[idx]) for idx in np.ndindex(cells.shape))
+    assert nnz == 12, f"expected the 12-nonzero structure of [[A⁻¹,0],[−D⁻¹CA⁻¹,D⁻¹]], got {nnz}"
+    rng = np.sqrt(np.arange(2, 14, dtype=float)) + 0.17
+    Mn = np.asarray(M.evaluate({"v": rng}), float)
+    got = np.asarray(inv.evaluate({"v": rng}), float)
+    assert np.allclose(got @ Mn, np.eye(6), atol=1e-9)
+
+
+def _dense_block(name, n):
+    """A program-carrying DENSE ``n×n`` symbolic block — no structural zero anywhere, so ``_invert``
+    exhausts both splits and falls through to ``_base_inverse``."""
+    prog = Program(name, inputs=[SymInput("v", (n * n,), Provenance("vertex", "v", (), "v"))])
+    v = prog.input("v")
+    cells = np.empty((n, n), dtype=object)
+    for i in range(n):
+        for j in range(n):
+            cells[i, j] = v.cells[i * n + j] + RF.constant(float(4 * n) if i == j else 1.0)
+    return SymArray(cells, program=prog)
+
+
+@pytest.mark.parametrize("n,defers", [(2, False), (3, False), (4, True)])
+def test_small_dense_blocks_invert_inline_large_ones_defer(n, defers):
+    """``_DEFER_INVERSE = 4``: a dense symbolic block of 2 or 3 is inverted EXACTLY (closed-form
+    ``cofactor_inverse``, cells stay ``RationalFunction``s), 4 and above defer to a numeric ``InvOp``.
+
+    Why the boundary sits there: a deferred inverse's output cells are FRESH ATOMS, opaque to the exact
+    fold and to ``_approx_zero``, so a ``P(T)`` built over one is not closed-form. ≤3×3 buys the whole
+    thing back for a bounded degree rise (measured on the plate elements: every ``InvOp`` gone, 3/6/6 →
+    0, monomial mass +11%/+48%/+34%, sparsity and wall time unchanged). Both halves are asserted — the
+    MECHANISM (did an ``InvOp`` get emitted?) and that it still inverts."""
+    from polyarray import InvOp
+    M = _dense_block(f"dense{n}", n)
+    inv = symbolic_inverse(M)
+    emitted = [st for st in M.program.statements if isinstance(st.fn, InvOp)]
+    assert bool(emitted) is defers, f"{n}×{n}: InvOp emitted={bool(emitted)}, expected {defers}"
+    if not defers:                                   # inline ⇒ exact rational cells, nothing opaque
+        assert all(isinstance(c, RF) for c in np.asarray(inv.cells).reshape(-1))
+    rng = np.sqrt(np.arange(2, 2 + n * n, dtype=float)) + 0.23
+    Mn = np.asarray(M.evaluate({"v": rng}), float)
+    got = np.asarray(inv.evaluate({"v": rng}), float)
+    assert np.allclose(got @ Mn, np.eye(n), atol=1e-9)
