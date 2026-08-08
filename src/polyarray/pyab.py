@@ -50,6 +50,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import os
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -731,7 +732,12 @@ def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
             index[n] = len(index)
         return f"@{index[n]}"
 
+    budget = [_FP_MAX_NODES]
+
     def ser(node: Any) -> None:
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise _FpTooLarge(_FP_MAX_NODES)
         if node is None or isinstance(node, (bool, int, float, str, bytes)):
             out.append(repr(node))
             return
@@ -777,16 +783,40 @@ def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
     try:
         ser(params)
         ser(body)
-    except (_FpRefuse, RecursionError):
+    except (_FpRefuse, RecursionError) as exc:
         # RecursionError: `ser` walks the same tree codegen already recurses on (measured max
         # depth 16 vs a 1000 limit), but a fingerprint must never be the thing that kills a
         # compile that would otherwise succeed — refuse and emit the def uninterned.
+        if isinstance(exc, _FpTooLarge):
+            # SIZE is the other axis of that same rule, and it is the one that actually bit: a
+            # helper too big to walk is announced, because an uninterned def is a real (if small)
+            # cost and a body this size is usually a symptom upstream, not a fact of life.
+            warnings.warn(
+                f"pyab: helper body exceeds the {_FP_MAX_NODES} node fingerprint budget — emitting "
+                "it UNINTERNED (correct, but duplicate helpers are no longer deduplicated). A body "
+                "this large usually means a symbolic operand was threaded into a value kernel "
+                "without being grounded first.", stacklevel=2)
         return None
     return hashlib.sha256("|".join(out).encode()).hexdigest()
 
 
+#: Node budget for :func:`_helper_fingerprint`'s structural walk.
+#:
+#: A fingerprint exists ONLY to intern a helper, so — exactly as with the ``RecursionError`` guard
+#: above — it must never be the thing that makes a compile fail or hang. That guard bounds DEPTH;
+#: this bounds SIZE, which is the axis that actually bit. Measured: Bell's world-reduced value
+#: kernel produced a body whose walk ran 11 min at 6.2 GB before a timeout killed the whole pytest
+#: process, while every other element's helper fingerprints in milliseconds. Refusing costs a
+#: duplicate helper; not refusing costs the build.
+_FP_MAX_NODES = 2_000_000
+
+
 class _FpRefuse(Exception):
     """A helper body with no stable structural serialization — skip interning."""
+
+
+class _FpTooLarge(_FpRefuse):
+    """A helper body too large to fingerprint within :data:`_FP_MAX_NODES` — skip interning."""
 
 
 # ---------------------------------------------------------------------------
