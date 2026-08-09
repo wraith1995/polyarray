@@ -50,13 +50,13 @@ def test_target_carrying_a_feed_generator_is_not_constant():
     assert pa.is_structurally_constant(p, v) is False
 
 
-def test_a_constant_cell_reads_none_of_its_rings_generators():
+def test_a_constant_cell_reads_none_of_its_rings_generators() -> None:
     """Total degree zero ⇒ the SAME value under every binding ⇒ NO atom.
 
     ``RationalFunction.gens`` lists the ring's generators, not the ones the value varies
     with; a cancellation such as ``(x + 3) - x`` keeps ``x`` in the ring while being a
     constant.  Counting that ``x`` makes a provable build-time constant read as
-    feed-dependent — the defect this pins.  The exact-zero cell is the same statement with
+    feed-dependent, which is what this pins.  The exact-zero cell is the same statement with
     ``_total_degree``'s ``-1`` spelling for the zero polynomial, so ``is_constant()`` alone
     would miss it.
     """
@@ -72,12 +72,14 @@ def test_a_constant_cell_reads_none_of_its_rings_generators():
     assert _symarray_atoms(SymArray(np.array([[live]], dtype=object), program=p)) == {"vx"}
 
 
-def test_constant_cells_over_a_feed_ring_are_structurally_constant():
-    """The plate-lane defect: a DOF-body entry operand whose cells are build-time constants
-    (three exact zeros and one ``-1e-15`` residue) but whose RING was built around a
-    ``vertex`` feed.  Its cone is empty and its value is identical under every binding, so
-    it is a build-time constant; before the ``_symarray_atoms`` fix the ring's ``vertex``
-    generator made the proof decline, and the entry snap therefore never ran."""
+def test_constant_cells_over_a_feed_ring_are_structurally_constant() -> None:
+    """An operand whose cells are build-time constants (three exact zeros and one ``-1e-15``
+    residue) but whose RING is built around a ``vertex`` feed.
+
+    Its cone is empty and its value is identical under every binding, so it IS a build-time
+    constant.  Counting the ring's ``vertex`` generator as a dependency makes the proof
+    decline, and every consumer gated on it — an entry snap, an affine-invariance test —
+    then never runs."""
     p = Program("feedring", inputs=[SymInput("v", (2, 2),
                                              Provenance(kind="vertex", origin="v", index=(), label="v"))])
     x = next(iter(_symarray_atoms(p.input_arrays["v"])))

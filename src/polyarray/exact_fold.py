@@ -633,7 +633,20 @@ def _is_exact_zero(val: Any) -> bool:
 
     Exact, never a tolerance: a float cell must be ``0.0`` and a
     :class:`~polyarray.rational.RationalFunction` cell must have a zero numerator
-    (:func:`_fe_is_zero`).  An empty operand is not a zero (there is nothing to be zero)."""
+    (:func:`_fe_is_zero`).
+
+    Parameters
+    ----------
+    val
+        A resolved operand value.  ``Any`` because an operand is whatever the lane resolved it to —
+        an ndarray of floats, an ndarray of cells, or the ``_OPAQUE`` sentinel.
+
+    Returns
+    -------
+    bool
+        ``True`` only when every entry is an exact zero.  An empty operand is not a zero (there is
+        nothing to be zero), and ``_OPAQUE`` is never a zero.
+    """
     if val is _OPAQUE:
         return False
     arr = np.asarray(val)
@@ -658,6 +671,18 @@ def _zero_absorbing(fn: StmtFn) -> bool:
     term.  It is emphatically NOT a blanket "zeros pass through opaque ops" — ``QrOp(0)`` is a
     degenerate factorization, not zero, and every algebraic/order op below says so.
 
+    Parameters
+    ----------
+    fn
+        A builtin op.  The caller establishes ``is_builtin_op(fn)`` first.
+
+    Returns
+    -------
+    bool
+        ``True`` for the multilinear ops only.
+
+    Notes
+    -----
     EXHAUSTIVE over :data:`~polyarray.ir.StmtFn` (``assert_never``): a new op must state which side
     it is on, because answering ``True`` wrongly would fabricate a zero.
     """
@@ -724,6 +749,19 @@ def _tolerates_opaque_operand(fn: Any) -> bool:
       the result, so the unresolved factor cannot matter.  The caller checks the zero actually
       exists before executing.
 
+    Parameters
+    ----------
+    fn
+        A ``Stmt.fn``.  ``Any`` because that field is half-open: a sub-``Program``, a vmap closure,
+        a front-end op or a plain callable are all valid, and only the builtin half has a type.
+
+    Returns
+    -------
+    bool
+        ``True`` when one of the two arguments applies.
+
+    Notes
+    -----
     ⚠ The two are NOT interchangeable, and the caller must not treat them as one permission: the
     liveness cases never permit inventing a value for the unresolved operand (see the guard on the
     zero short-circuit in :func:`_exec_stmt`).
@@ -738,11 +776,25 @@ def _tolerates_opaque_operand(fn: Any) -> bool:
 
 
 def _ref_shape(ref: Any, program: Program) -> tuple[int, ...] | None:
-    """The STATIC shape one Stmt input ref will carry, without resolving its value — or ``None``
-    when it cannot be read off (a dynamic axis, an indexed ref, a runtime-bound integer).
+    """The STATIC shape one Stmt input ref will carry, without resolving its value.
 
     Only needed for an operand the zero-absorbing rule annihilates: the twin still has to be
-    handed an array of the right shape to produce a correctly-shaped zero."""
+    handed an array of the right shape to produce a correctly-shaped zero.
+
+    Parameters
+    ----------
+    ref
+        A Stmt input ref.  ``Any`` to match :func:`_resolve_ref`, which this mirrors: the ref
+        vocabulary is open at the edges (an unrecognised ref simply has no static shape).
+    program
+        The program the ref reads from.
+
+    Returns
+    -------
+    tuple[int, ...] or None
+        The shape, or ``None`` when it cannot be read off — a dynamic axis, an indexed ref, a
+        runtime-bound integer.
+    """
     def _static(shape: Any) -> tuple[int, ...] | None:
         shp = tuple(shape)
         return None if is_dynamic(shp) else tuple(int(d) for d in shp)
@@ -1224,9 +1276,9 @@ def _exec_stmt(
         # ⚠ The guard must NOT be `is_builtin_op` alone. `CallOp` IS a builtin op, and
         # `_tolerates_opaque_operand` admits `CallOp(Program)` for a completely different reason —
         # the LIVENESS argument, decided by executing the body. Fabricating a zero there claims a
-        # value for an ADDITIVE body: a `CallOp` over `u + v` with `u = 0` and `v` unresolved
-        # certified `0` where the true value is `v`. Tolerating an unresolved operand and inventing
-        # a value for it are two different permissions.
+        # value for an ADDITIVE body: a `CallOp` over `u + v` with `u = 0` and `v` unresolved would
+        # certify `0` where the true value is `v`. Tolerating an unresolved operand and inventing a
+        # value for it are two different permissions.
         #
         # Substituting a zero array of the unresolved operand's DECLARED shape lets the existing
         # rational twin compute both the value and its shape — no separate zero-shaped result to

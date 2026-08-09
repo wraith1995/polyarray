@@ -2745,21 +2745,33 @@ def freeze_array_bulk(
     :meth:`Program.run` time the whole tensor is evaluated in one
     pass.
 
-    Numeric / no-program / float-dtype arrays pass through unchanged.
-    Budget-zero (``budget.freeze`` False) disables freezing — the cells stay
-    symbolic (retained) rather than being captured as fresh atoms.
+    Parameters
+    ----------
+    arr
+        The tensor to freeze, as a raw ndarray or as a :class:`SymArray`.
+    program
+        The program the freeze Stmt is emitted into.  ``None`` passes ``arr`` through unchanged,
+        as does a budget-zero program (``budget.freeze`` False) — then the cells stay symbolic
+        (retained) rather than being captured as fresh atoms.
+    name
+        Output name of the emitted Stmt.
 
-    CARRIER-PRESERVING.  A :class:`SymArray` in gives a ``SymArray``
-    back (riding ``program``); a raw ndarray in gives cells back, as
-    before.  So a caller that already threads a ``SymArray`` never has
-    to unwrap ``.cells`` to freeze it — that unwrap drops the owning
-    ``Program`` and is exactly what the ``SYM-CELLS-UNWRAP`` rule
-    forbids in the consumer repos.  A ``SymArray`` riding a
-    *different* program is REFUSED rather than silently re-homed:
-    its cells may name that program's Stmt outputs, and relabelling
-    them onto ``program`` strands the Stmts that produce them (the
-    "generator has no binding" failure).  Use :meth:`Program.graft`
-    first, which brings those Stmts along.
+    Returns
+    -------
+    np.ndarray or SymArray
+        CARRIER-PRESERVING: a :class:`SymArray` in gives a ``SymArray`` back (riding
+        ``program``); a raw ndarray in gives cells back.  So a caller that already threads a
+        ``SymArray`` never has to unwrap ``.cells`` to freeze it — that unwrap drops the owning
+        ``Program`` and is exactly what the ``SYM-CELLS-UNWRAP`` rule forbids in the consumer
+        repos.  Numeric / no-program / float-dtype arrays pass through unchanged.
+
+    Raises
+    ------
+    ValueError
+        When ``arr`` is a ``SymArray`` riding a *different* program.  Such an array is REFUSED
+        rather than silently re-homed: its cells may name that program's Stmt outputs, and
+        relabelling them onto ``program`` strands the Stmts that produce them (the "generator has
+        no binding" failure).  Use :meth:`Program.graft` first, which brings those Stmts along.
     """
     if program is None or not program.budget.freeze:
         return arr
