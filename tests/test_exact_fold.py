@@ -15,6 +15,7 @@ WARNS wherever a certificate is issued non-exactly.  These tests pin:
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -714,6 +715,131 @@ def test_switch_with_a_constant_scrutinee_selects_the_right_branch():
         assert not st.unresolved
 
 
+# --- tolerating an UNRESOLVED operand: liveness vs multilinearity -----------------------------
+# Two different permissions, and `_tolerates_opaque_operand` grants them for two different reasons.
+# These pin that they stay apart: a body may be DESCENDED INTO with an unresolved operand, but a
+# value for that operand may only ever be INVENTED (zero) for a multilinear op.
+
+
+class _NonNormalizable:
+    """A plain callable — no exact twin, so the exact lane leaves it unresolved."""
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        return np.asarray(x, dtype=float) * 3.0 + 1.0
+
+
+def _call_with_zero_and_opaque(
+    fn_of_body: Callable[[Program], object], body: Program,
+) -> tuple[Program, int]:
+    """An outer program whose LAST statement applies ``fn_of_body(body)`` to an exactly-zero
+    constant and an UNRESOLVED value.
+
+    Parameters
+    ----------
+    fn_of_body
+        Wraps ``body`` into the ``Stmt.fn`` to apply (a ``CallOp``, a vmap closure, …).
+    body
+        The sub-program the statement calls.
+
+    Returns
+    -------
+    tuple[Program, int]
+        The outer program and the index of that statement.
+    """
+    from polyarray.ir import Const
+
+    outer = Program("outer", inputs=[SymInput("x", (1,), _prov("x"))])
+    [Y] = outer.emit_stmt(_NonNormalizable(), [outer.input("x")],
+                          [OutSpec("Y", (1,))], bulk=False)
+    [Z] = outer.emit_stmt(fn_of_body(body), [Const(np.zeros((1,))), Y],
+                          [OutSpec("Z", (1,))], bulk=False)
+    outer.add_output("Z", Z.cells)
+    return outer, 1
+
+
+def _add_body(name: str = "addbody") -> Program:
+    """``W(u, v) = u + v`` — READS both inputs, and is NOT multilinear in them."""
+    body = Program(name, inputs=[SymInput("u", (1,), _prov("u")), SymInput("v", (1,), _prov("v"))])
+    body.add_output("W", (body.input("u") + body.input("v")).cells)
+    return body
+
+
+def _dead_v_body(name: str = "deadbody") -> Program:
+    """``W(u, v) = u + u`` — ``v`` is DECLARED but never read."""
+    body = Program(name, inputs=[SymInput("u", (1,), _prov("u")), SymInput("v", (1,), _prov("v"))])
+    body.add_output("W", (body.input("u") + body.input("u")).cells)
+    return body
+
+
+def test_zero_operand_never_invents_a_value_for_a_sub_program() -> None:
+    """A `CallOp(Program)` tolerates an unresolved operand for LIVENESS — never for a zero.
+
+    `CallOp` IS a builtin op, so a zero short-circuit guarded by `is_builtin_op` alone fires here and
+    fabricates the unresolved operand as zero: `u + v` with `u = 0` and `v` unresolved would certify
+    `0` where the true value is `v`. The guard must be MULTILINEARITY (`_zero_absorbing`)."""
+    from polyarray.ir import CallOp
+    from polyarray.exact_fold import exact_partial_eval
+
+    prog, idx = _call_with_zero_and_opaque(lambda b: CallOp(fn=b), _add_body())
+    st = exact_partial_eval(prog, work_budget=0)
+    assert idx in st.unresolved, f"an ADDITIVE body was resolved without its second operand: {st}"
+    # ... and the value it would have claimed is demonstrably wrong.
+    assert float(np.asarray(prog.run({"x": np.array([2.0])})["Z"], float)[0]) == 7.0
+
+
+def test_sub_program_still_resolves_when_the_unresolved_operand_is_dead() -> None:
+    """The liveness permission itself is intact: a body that never reads the unresolved input
+    resolves, and to the RIGHT value."""
+    from polyarray.ir import CallOp
+    from polyarray.exact_fold import exact_partial_eval
+
+    prog, idx = _call_with_zero_and_opaque(lambda b: CallOp(fn=b), _dead_v_body())
+    st = exact_partial_eval(prog, work_budget=0)
+    assert idx not in st.unresolved, f"a DEAD operand should not block the body: {st.unresolved}"
+
+
+def _vmap_of(body: Program) -> object:
+    """``body`` wrapped as a batched ``CallOp`` over a vmap closure, batching both operands."""
+    from polyarray.ir import CallOp, vmap
+    return CallOp(fn=vmap(body, in_axes=(0, 0), out_axes=0))
+
+
+def _batched_call(body: Program) -> tuple[Program, int]:
+    """Like :func:`_call_with_zero_and_opaque` but BATCHED: the vmap closure is applied to a
+    ``(2, 1)`` zero constant and a ``(2, 1)`` unresolved value."""
+    from polyarray.ir import Const
+
+    outer = Program("outer_vmap", inputs=[SymInput("x", (2, 1), _prov("x"))])
+    [Y] = outer.emit_stmt(_NonNormalizable(), [outer.input("x")],
+                          [OutSpec("Y", (2, 1))], bulk=False)
+    [Z] = outer.emit_stmt(_vmap_of(body), [Const(np.zeros((2, 1))), Y],
+                          [OutSpec("Z", (2, 1))], bulk=False)
+    outer.add_output("Z", Z.cells)
+    return outer, 1
+
+
+def test_vmap_closure_descends_when_the_unresolved_operand_is_dead() -> None:
+    """The liveness argument reaches INSIDE a vmap closure: the unresolved operand is handed to
+    every slice unresolved, and a body that never reads it still resolves.
+
+    A `CallOp` over a vmap closure is where a derivative-DOF lane's programs stall, so refusing
+    them leaves a hundred statements an element unresolved on the probe lane."""
+    from polyarray.exact_fold import exact_partial_eval
+
+    prog, idx = _batched_call(_dead_v_body())
+    st = exact_partial_eval(prog, work_budget=0)
+    assert idx not in st.unresolved, f"a DEAD vmap input should not block the closure: {st.unresolved}"
+
+
+def test_vmap_closure_refuses_a_live_unresolved_operand_even_beside_a_zero() -> None:
+    """...and says nothing about a body it cannot execute. The descent asserts NO property of the
+    body — in particular not multilinearity — so an additive body beside an exactly-zero operand
+    stays unresolved rather than collapsing to zero."""
+    from polyarray.exact_fold import exact_partial_eval
+
+    prog, idx = _batched_call(_add_body())
+    st = exact_partial_eval(prog, work_budget=0)
+    assert idx in st.unresolved, f"a LIVE vmap input must keep the closure unresolved: {st}"
 # --------------------------------------------------------------------------------------------
 # Ops that ARE field arithmetic / slices / shape reads — twins that extend the certificate.
 #
