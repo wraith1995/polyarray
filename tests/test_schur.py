@@ -197,3 +197,48 @@ def test_small_dense_blocks_invert_inline_large_ones_defer(n: int, defers: bool)
     Mn = np.asarray(M.evaluate({"v": rng}), float)
     got = np.asarray(inv.evaluate({"v": rng}), float)
     assert np.allclose(got @ Mn, np.eye(n), atol=1e-9)
+
+
+def _atoms_that_are_secretly_the_identity() -> SymArray:
+    """A 2×2 whose cells are Stmt-output ATOMS and whose VALUE is the identity.
+
+    ``solve(A, A) ≡ I`` for any nonsingular ``A``, so the statement's outputs are constants —
+    but the cells naming them carry no arithmetic at all, which is the situation
+    :func:`~polyarray.schur._exactly_folded_cells` exists for.
+
+    Returns
+    -------
+    SymArray
+        The 2×2 of fresh atoms, riding a program with one ``vertex`` feed input.
+    """
+    from polyarray import OutSpec, SolveOp
+    prog = Program("solve_self", inputs=[SymInput("v", (4,), Provenance("vertex", "v", (), "v"))])
+    v = prog.input("v")
+    cells = np.empty((2, 2), dtype=object)
+    for i in range(2):
+        for j in range(2):
+            cells[i, j] = v.cells[2 * i + j] + RF.constant(5.0 if i == j else 1.0)
+    A = SymArray(cells, program=prog)
+    [out] = prog.emit_stmt(SolveOp(), [A, A], [OutSpec("I", (2, 2))], bulk=False)
+    return out
+
+
+def test_the_sound_mask_reads_through_stmt_atoms_to_the_constants_behind_them() -> None:
+    """The sound mask must fold the program before it reads the cells, or it sees only names.
+
+    A lowered matrix's cells are typically ``1.0·<atom>`` — a NAME for a pending Stmt — about which
+    ``_approx_zero`` can say nothing, so every entry reads as nonzero and no split ever happens.
+    :func:`~polyarray.schur.sound_sparsity_mask` runs the exact lane first, which certifies
+    ``solve(A, A) = I`` and turns the off-diagonal names into exact zeros.
+
+    This asserts the MECHANISM, not just a number: the raw cells are dense (4/4) and only the folded
+    mask is sparse (2/4), so the test goes red the moment the fold stops running — which is exactly
+    what a signature break behind ``_exactly_folded_cells``'s ``except Exception`` looks like."""
+    from polyarray import sound_sparsity_mask
+    from polyarray.schur import _syntactic_mask
+    I = _atoms_that_are_secretly_the_identity()
+    raw = _syntactic_mask(np.asarray(I.cells))
+    assert raw.sum() == 4, "the unfolded cells are opaque atoms — nothing there to prove zero"
+    mask = sound_sparsity_mask(I)
+    assert mask.tolist() == [[True, False], [False, True]], (
+        f"the exact lane certifies solve(A, A) = I; the mask should see it: {mask}")

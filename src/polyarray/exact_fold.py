@@ -35,16 +35,25 @@ CELL as a rational function of the feed atoms — so an entry whose statement-le
 pieces vary but whose composition cancels (the motivating case) still certifies,
 without any statement being frozen.
 
-**Bounded cost — TWO knobs, both required.** ``time_budget`` (seconds) is checked
-BETWEEN operations, and ``max_sym_mass`` (:data:`_MAX_SYM_MASS`) caps the monomial mass
-of ONE symbolic op's operands BEFORE it runs.  The time box alone is not enough: a
-single ``np.einsum`` / Gauss pass over object-dtype cells runs to completion inside one
-deadline interval, so a degree-5 element could spend an hour in one uninterrupted
-op while nominally under a 10 s budget.  Rejected-by-size and timed-out statements both
-degrade to *unresolved* ⇒ the (loud) probe fallback — never a hang, never a guess.
+**Bounded cost — TWO knobs, both required.** ``work_budget`` (:class:`_Meter` work units,
+charged BETWEEN operations) bounds the pass as a whole, and ``max_sym_mass``
+(:data:`_MAX_SYM_MASS`) caps the monomial mass of ONE symbolic op's operands BEFORE it runs.
+The global budget alone is not enough: a single ``np.einsum`` / Gauss pass over object-dtype
+cells runs to completion once started, so a degree-5 element could spend an hour inside one
+uninterrupted op while nominally under budget.  Rejected-by-size and out-of-budget statements
+both degrade to *unresolved* ⇒ the (loud) probe fallback — never a hang, never a guess.
+
+**The budget is DETERMINISTIC — that is the point.**  It used to be wall-clock seconds, which
+made the certificate a property of the machine rather than of the mathematics: the same program
+certified exactly on a quiet box and probe-backed on a loaded one.  Work units are a function
+of the program alone, so a certificate means the same thing everywhere.  A generous wall-clock
+*backstop* survives only to catch a mis-calibrated cost model, and it is loud when it fires
+(:attr:`ExactState.hit_wall_clock`) precisely because it reintroduces machine dependence.
 """
 from __future__ import annotations
 
+import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, assert_never
@@ -132,8 +141,8 @@ _MAX_DEPTH = 32
 # WORK CAP for ONE exact symbolic op: the total monomial mass (numerator + denominator
 # terms, summed over every symbolic cell) its operands may carry.  The time budget alone
 # cannot bound the exact lane, because a single ``np.einsum`` / Gauss elimination over
-# object-dtype ``RationalFunction`` cells runs to completion INSIDE one deadline
-# interval — a degree-5, 18-DOF symbolic Vandermonde stalled the lowering gate for
+# object-dtype ``RationalFunction`` cells runs to completion once STARTED, inside a single
+# budget check — a degree-5, 18-DOF symbolic Vandermonde stalled the lowering gate for
 # >55 min in one such einsum.  An op whose operands exceed the cap is
 # declared *unresolved* up front (⇒ the warned probe fallback), so the exact lane's cost
 # per statement is bounded BEFORE the expensive work starts, not merely interrupted
@@ -148,12 +157,150 @@ _MAX_SYM_MASS = 4096
 # total symbolic work stays inside the same box), but each slice also pays the body's fixed
 # per-statement overhead, and one slice's flint arithmetic cannot be interrupted.  So the batch
 # itself is bounded BEFORE the loop starts (the stall lesson: an uninterruptible op
-# ignores a deadline).  Over the cap ⇒ *unresolved* ⇒ the warned probe fallback.
+# ignores any budget).  Over the cap ⇒ *unresolved* ⇒ the warned probe fallback.
 _MAX_VMAP_BATCH = 512
 
+# GLOBAL WORK BUDGET for one exact pass, in *work units* — a deterministic function of the
+# program, never of the machine.  One unit is roughly one monomial touched: a statement costs
+# `_STMT_COST` plus the monomial mass of the operands it actually processes.  See `_Meter`.
+#
+# WHY NOT SECONDS.  This budget used to be `time_budget`, wall-clock seconds off
+# `time.monotonic()`.  That made the CERTIFICATE a property of the machine: the same program on
+# the same input certified exactly on a quiet box and probe-backed on a loaded one — measured
+# 6874 / 6895 / 7726 frozen statements across three runs of ONE leg.  Since a certificate is
+# persisted and selects a whole compilation lane downstream, "this element certifies exactly"
+# was recording the load average as much as the mathematics.  Work units are reproducible: the
+# same program spends the same number, on any box, under any load, in any order.
+#
+# SIZED FROM MEASUREMENT, not guessed.  Calibration over the symbolic P(T) legs (TRI/TET,
+# r = 1..4, k = 1,2) gives a strikingly stable ~128 000 work units per second (123 k–158 k
+# across every leg), so the old nominal 10 s ceiling was worth ~1.3 M units on a quiet box.
+# This is ~3x that, which is the "no leg certifies less than it used to" margin the budget was
+# chosen for — and it is ~800x the heaviest single pass any current leg actually spends
+# (P⁻₃Λ¹(TET), 5 046 units), so today nothing comes close to the ceiling.
+#
+# It still BOUNDS a pathological program: ~31 s of exact-lane work, after which the statement
+# degrades to the warned probe fallback exactly as an over-mass one does.  Re-derive it by
+# running the symbolic P(T) legs with the budget unbounded (``POLYARRAY_EXACT_WORK_BUDGET=0``)
+# and reading `ExactState.spent` — if the cost model or the lowering changes, that measurement
+# is the thing to repeat, not this constant to adjust by feel.
+_DEFAULT_WORK_BUDGET = 4_000_000
 
-class _Timeout(Exception):
-    """Internal: the exact pass ran out of its time budget."""
+_WORK_BUDGET_ENV = "POLYARRAY_EXACT_WORK_BUDGET"
+
+# The fixed price of ADMITTING one statement (or one vmap slice) to the exact lane, before any
+# of its mass is counted: operand resolution, shape checks, the env writes.  A program of many
+# tiny statements must still exhaust a budget, or "deterministic" would only bound the heavy
+# ones.  Small relative to a real symbolic op, which measures in the hundreds-to-thousands.
+_STMT_COST = 16
+
+# The gcd (`RationalFunction.clean`) is superlinear in the operand mass and is the single most
+# expensive step in `_constant_value`, so it is charged a multiple of the mass rather than the
+# mass itself.  The factor need not model flint exactly — it only has to keep the budget from
+# being dominated by cheap work while a handful of enormous gcds run uncounted.
+_GCD_COST_FACTOR = 4
+
+# Early-exit cap for the per-Gauss-column mass measurement.  `_sym_mass` stops accumulating once
+# it passes its cap, so measuring a blown-up row costs O(cap) rather than O(row); the cap only
+# has to be large enough that an ordinary row is measured exactly.
+_GAUSS_ROW_MASS_CAP = 1 << 16
+
+# LOUD WALL-CLOCK BACKSTOP.  The work budget decides the RESULT; the clock only guards against a
+# mis-calibrated cost model on a pathological program, and it is deliberately generous.  If it
+# ever fires the result IS machine-dependent again, so it is never silent: the statement's reason
+# says so, `ExactState.hit_wall_clock` is set, and `simplify` raises `NonDeterministicFoldWarning`.
+# A test asserts it does not fire on any calibration leg.
+#
+# Seconds.  At the API, `wall_backstop=None` means "this default" and `math.inf` means "no
+# backstop" — `None` deliberately does NOT mean "disabled", because a caller who passes nothing
+# should get the guard, and only someone who writes `inf` should be able to remove it.
+_WALL_BACKSTOP_SECONDS = 900.0
+
+
+def _wall_deadline(wall_backstop: float | None) -> float | None:
+    """The monotonic instant the backstop fires, or ``None`` when there is none.
+
+    ``wall_backstop=None`` ⇒ the module default; ``math.inf`` ⇒ no backstop at all."""
+    seconds = _WALL_BACKSTOP_SECONDS if wall_backstop is None else float(wall_backstop)
+    return None if math.isinf(seconds) else time.monotonic() + seconds
+
+
+class _Exhausted(Exception):
+    """Internal: the exact pass ran out of its budget.
+
+    ``wall`` distinguishes the two exits — ``False`` is the ordinary deterministic work budget,
+    ``True`` is the backstop firing, which is a MEASUREMENT BUG (the cost model under-counted
+    this program) and is reported loudly rather than folded into the normal degrade path."""
+
+    def __init__(self, wall: bool = False) -> None:
+        super().__init__("wall-clock backstop" if wall else "work budget")
+        self.wall = wall
+
+
+@dataclass
+class _Meter:
+    """Deterministic work accounting for ONE exact pass.
+
+    The unit is a monomial touched.  `charge` is called where the old code read the clock — at
+    each statement, each exact evaluation/gcd, each Gauss column, each vmap slice, each folded
+    cell — so the granularity of the bound is unchanged; only its currency is.  As before, one
+    already-started flint operation can still overrun: the budget bounds the work *started*,
+    which is why `_MAX_SYM_MASS` (per-op, checked BEFORE the op runs) remains the other half of
+    the cost story and is not replaced by this.
+
+    `limit <= 0` means unbounded (used by the calibration harness to measure a full pass)."""
+
+    limit: int
+    wall_deadline: float | None = None
+    spent: int = 0
+    hit_wall_clock: bool = False
+
+    def charge(self, units: int) -> None:
+        """Spend ``units`` of work; raise :class:`_Exhausted` when the budget is gone."""
+        self.spent += int(units)
+        self.check()
+
+    def check(self) -> None:
+        """Raise :class:`_Exhausted` if the budget is spent, or the backstop has fired."""
+        if 0 < self.limit < self.spent:
+            raise _Exhausted(wall=False)
+        if self.wall_deadline is not None and time.monotonic() > self.wall_deadline:
+            self.hit_wall_clock = True
+            raise _Exhausted(wall=True)
+
+    @property
+    def remaining(self) -> int:
+        """Work units left — also the natural early-exit cap for a `_sym_mass` measurement."""
+        return _MAX_SYM_MASS if self.limit <= 0 else max(0, self.limit - self.spent)
+
+
+def _exhausted_note(exc: _Exhausted, meter: _Meter) -> str:
+    """The ``unresolved`` reason for a budget exit — and the two exits read differently.
+
+    The ordinary one names the budget and what was spent, so the fix ("raise it") is legible
+    from the warning alone.  The backstop one SHOUTS, because it means the result depends on
+    the machine again and the cost model needs fixing, not the budget."""
+    if exc.wall:
+        return (f"WALL-CLOCK BACKSTOP fired after {meter.spent} work units — this result is "
+                f"NOT reproducible; the work cost model under-counted this program")
+    return f"work budget exhausted ({meter.spent}/{meter.limit} units)"
+
+
+def _resolve_work_budget(work_budget: int | None) -> int:
+    """The work budget for this pass: explicit argument, else the env knob, else the default.
+
+    The env knob is what makes the budget KEYABLE by pointwise's verdict cache — a certificate
+    produced under a different budget must not be served for this one (see
+    ``table_cache._VERDICT_ENV_KNOBS``)."""
+    if work_budget is not None:
+        return int(work_budget)
+    raw = os.environ.get(_WORK_BUDGET_ENV)
+    if raw is None:
+        return _DEFAULT_WORK_BUDGET
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_WORK_BUDGET
 
 
 class _Reason:
@@ -192,7 +339,13 @@ class ExactState:
     ``folded``    — statement indices folded exactly (every output entry constant);
     ``refuted``   — statement indices whose outputs are PROVABLY non-constant
                     (excluded from any probe fallback);
-    ``unresolved``— statement index → short reason (opaque op name, "time budget", …).
+    ``unresolved``— statement index → short reason (opaque op name, "work budget", …);
+    ``spent`` / ``limit`` — work units consumed and allowed.  ``spent`` is a DETERMINISTIC
+                    function of the program: two runs of the same pass spend the same amount,
+                    which is what makes the certificate reproducible and is worth asserting
+                    directly in a test;
+    ``hit_wall_clock`` — the loud backstop fired, so this result is NOT reproducible and the
+                    cost model under-counted this program.  Never expected; `simplify` warns.
     """
 
     known: dict[str, Any] = field(default_factory=dict)
@@ -201,6 +354,9 @@ class ExactState:
     folded: set[int] = field(default_factory=set)
     refuted: set[int] = field(default_factory=set)
     unresolved: dict[int, str] = field(default_factory=dict)
+    spent: int = 0
+    limit: int = 0
+    hit_wall_clock: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -261,17 +417,18 @@ def _sym_mass(values: Any, cap: int) -> int:
     return total
 
 
-def _check_deadline(deadline: float | None) -> None:
-    """Raise :class:`_Timeout` when ``deadline`` (monotonic seconds) has passed.
+def _charge(meter: _Meter | None, units: int) -> None:
+    """Spend ``units`` on ``meter`` when there is one (``None`` = an unbudgeted call).
 
-    The time-box granularity is PER OPERATION: the check runs before each exact
-    evaluation / gcd, so one already-started flint operation can still overrun —
-    accepted; the budget bounds the number of such operations started."""
-    if deadline is not None and time.monotonic() > deadline:
-        raise _Timeout()
+    The granularity is PER OPERATION: the charge lands before each exact evaluation / gcd /
+    Gauss column / vmap slice, so one already-started flint operation can still overrun —
+    accepted; the budget bounds the work *started*, exactly as the wall-clock check it
+    replaces did.  What changed is the currency, not the granularity."""
+    if meter is not None:
+        meter.charge(units)
 
 
-def _constant_value(rf: RationalFunction, deadline: float | None = None) -> float | None:
+def _constant_value(rf: RationalFunction, meter: _Meter | None = None) -> float | None:
     """The exact float value of ``rf`` when it is IDENTICALLY constant, else ``None``.
 
     Constancy is decided by the exact rational normal form: gcd-cancel (flint exact
@@ -282,28 +439,31 @@ def _constant_value(rf: RationalFunction, deadline: float | None = None) -> floa
     ``(1/3)·p/p``); two exactly-different values prove non-constancy, while equal
     values are only a hint — the ``clean`` normal form still decides.
 
-    DEADLINE-AWARE: every expensive step (each exact evaluation, the gcd) is
-    preceded by a ``deadline`` check that raises :class:`_Timeout` — a pathological
-    cell (an enormous uncancelled quintic — the degree-5 regime) must degrade to
-    *unresolved* (⇒ the warned probe fallback), never hang the gate."""
+    BUDGET-AWARE: every expensive step (each exact evaluation, the gcd) is CHARGED to the
+    meter, which raises :class:`_Exhausted` when the budget is gone — a pathological cell (an
+    enormous uncancelled quintic — the degree-5 regime) must degrade to *unresolved* (⇒ the
+    warned probe fallback), never hang the gate.  The charge is this cell's own monomial mass,
+    because that is what both the evaluation and the gcd scale with."""
     if rf.is_zero():
         return 0.0                           # exact structural zero (num ≡ 0)
     if not rf.gens:
         return float(rf.eval({}))
     if rf.is_constant():
         return float(rf.eval({g: 0.0 for g in rf.gens}))
+    mass = _rf_mass(rf)
     try:
-        _check_deadline(deadline)
+        _charge(meter, mass)
         e0 = _exact_eval_at(rf, 0)
-        _check_deadline(deadline)
+        _charge(meter, mass)
         e1 = _exact_eval_at(rf, 1)
         if e0 != e1:                         # exact inequality ⇒ provably non-constant
             return None
-    except _Timeout:
+    except _Exhausted:
         raise
     except Exception:  # noqa: BLE001 — singular point etc.: the normal form decides
         pass
-    _check_deadline(deadline)
+    # The gcd is the expensive one and superlinear in the mass, so it is charged the heaviest.
+    _charge(meter, _GCD_COST_FACTOR * mass)
     cleaned = rf.clean()
     if cleaned.is_zero():
         return 0.0
@@ -312,14 +472,14 @@ def _constant_value(rf: RationalFunction, deadline: float | None = None) -> floa
     return None
 
 
-def _cell_constant(cell: Any, deadline: float | None = None) -> float | None:
+def _cell_constant(cell: Any, meter: _Meter | None = None) -> float | None:
     """Exact constant value of one cell (float / RF), else ``None``.
 
-    Raises :class:`_Timeout` (via :func:`_constant_value`) on deadline expiry."""
+    Raises :class:`_Exhausted` (via :func:`_constant_value`) when the budget is gone."""
     if isinstance(cell, (int, float, np.integer, np.floating)):
         return float(cell)
     if isinstance(cell, RationalFunction):
-        return _constant_value(cell, deadline)
+        return _constant_value(cell, meter)
     return None
 
 
@@ -434,7 +594,7 @@ def _fe_is_zero(x: Any) -> bool:
     return x.is_zero() if isinstance(x, RationalFunction) else float(x) == 0.0
 
 
-def _exact_inv(a: np.ndarray, deadline: float | None = None) -> np.ndarray:
+def _exact_inv(a: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
     """Exact Gauss–Jordan inverse over the rational-function field.
 
     Pivots are chosen exactly (structurally non-zero — a non-zero rational function
@@ -452,7 +612,10 @@ def _exact_inv(a: np.ndarray, deadline: float | None = None) -> np.ndarray:
     for i in range(n):
         m[i, n + i] = 1.0
     for col in range(n):
-        _check_deadline(deadline)   # per-column: Gauss over RF cells can be slow
+        # Per-column, charged by the PIVOT ROW's actual mass: Gauss over RF cells is slow in
+        # proportion to the fill-in it has already produced, which a fixed per-column price
+        # would miss entirely (the operand cap bounds what ENTERS the op, not what it grows to).
+        _charge(meter, _sym_mass(list(m[col]), _GAUSS_ROW_MASS_CAP))
         piv = None
         for row in range(col, n):
             if not _fe_is_zero(m[row, col]):
@@ -478,7 +641,7 @@ def _exact_inv(a: np.ndarray, deadline: float | None = None) -> np.ndarray:
     return m[:, n:]
 
 
-def _exact_det(a: np.ndarray, deadline: float | None = None) -> Any:
+def _exact_det(a: np.ndarray, meter: _Meter | None = None) -> Any:
     """Exact determinant by fraction-free-ish Gauss elimination over the field."""
     a = np.asarray(a, dtype=object).copy()
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
@@ -486,7 +649,7 @@ def _exact_det(a: np.ndarray, deadline: float | None = None) -> Any:
     n = a.shape[0]
     det: Any = 1.0
     for col in range(n):
-        _check_deadline(deadline)
+        _charge(meter, _sym_mass(list(a[col]), _GAUSS_ROW_MASS_CAP))   # see `_exact_inv`
         piv = next((r for r in range(col, n) if not _fe_is_zero(a[r, col])), None)
         if piv is None:
             return 0.0
@@ -504,15 +667,15 @@ def _exact_det(a: np.ndarray, deadline: float | None = None) -> Any:
     return det
 
 
-def _exact_solve(a: np.ndarray, b: np.ndarray, deadline: float | None = None) -> np.ndarray:
+def _exact_solve(a: np.ndarray, b: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
     b = np.asarray(b, dtype=object)
-    inv = _exact_inv(a, deadline)
+    inv = _exact_inv(a, meter)
     if b.ndim == 1:
         return np.einsum("ij,j->i", inv, b, optimize=False)
     return np.einsum("ij,j...->i...", inv, b, optimize=False)
 
 
-def _exact_pinv(a: np.ndarray, deadline: float | None = None) -> np.ndarray:
+def _exact_pinv(a: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
     """The GENERIC (full-rank) pseudo-inverse over the rational-function field.
 
     ``A⁺ = (AᵀA)⁻¹Aᵀ`` for a tall/square ``A``, ``Aᵀ(AAᵀ)⁻¹`` for a wide one — the
@@ -533,12 +696,12 @@ def _exact_pinv(a: np.ndarray, deadline: float | None = None) -> np.ndarray:
     n, k = a.shape
     if n >= k:                                        # tall/square: (AᵀA)⁻¹Aᵀ
         gram = np.einsum("ik,il->kl", a, a, optimize=False)
-        return _exact_solve(gram, a.T, deadline)
+        return _exact_solve(gram, a.T, meter)
     gram = np.einsum("ik,jk->ij", a, a, optimize=False)   # wide: Aᵀ(AAᵀ)⁻¹
-    return np.einsum("ik,ij->kj", a, _exact_inv(gram, deadline), optimize=False)
+    return np.einsum("ik,ij->kj", a, _exact_inv(gram, meter), optimize=False)
 
 
-def _exact_assert(fn: AssertOp, args: list[Any], deadline: float | None) -> list[Any]:
+def _exact_assert(fn: AssertOp, args: list[Any], meter: _Meter | None) -> list[Any]:
     """The passthrough twin of :class:`~polyarray.AssertOp` over symbolic operands.
 
     ``AssertOp`` VALUE-wise returns its first input unchanged; the predicate is a guard.  This
@@ -568,8 +731,8 @@ def _exact_assert(fn: AssertOp, args: list[Any], deadline: float | None) -> list
         if x.shape != other.shape:
             raise AssertionError(f"{fn.msg} [shape_eq] {x.shape} != {other.shape}")
     elif fn.kind == "rank_eq":
-        a, b = _cell_constant(np.asarray(args[1])[()], deadline), \
-            _cell_constant(np.asarray(args[2])[()], deadline)
+        a, b = _cell_constant(np.asarray(args[1])[()], meter), \
+            _cell_constant(np.asarray(args[2])[()], meter)
         if a is None or b is None:
             raise ValueError("exact AssertOp(rank_eq): non-constant rank operand")
         if int(a) != int(b):
@@ -584,7 +747,7 @@ def _exact_assert(fn: AssertOp, args: list[Any], deadline: float | None) -> list
                 # raises ⇒ OPAQUE, the safe direction (less folding, never a false pass).
                 if not _fe_is_zero(xo[idx] - xo[idx[::-1]]):
                     raise AssertionError(f"{fn.msg} [spd] matrix not symmetric at {idx}")
-        det = _exact_det(x, deadline)
+        det = _exact_det(x, meter)
         if _fe_is_zero(det):
             raise AssertionError(f"{fn.msg} [{fn.kind}] structurally singular")
     elif fn.kind == "in_span":
@@ -620,6 +783,35 @@ def _opaque_name(fn: Any) -> str:
     if hasattr(fn, "_vmap_body"):
         return f"vmap closure ({name})"
     return name
+
+
+def _const_int(val: Any) -> int | None:
+    """``val`` as a build-time constant int, else ``None``.
+
+    Several ops carry an integer operand — a rank, a block count — that SIZES the result
+    rather than contributing to it.  Such an operand is not something to approximate: if it
+    has not resolved to a constant the statement is genuinely unresolved, so the twins bail
+    rather than pick a value."""
+    num = _as_numeric(val)
+    if num is None or num.size != 1:
+        return None
+    return int(num.reshape(-1)[0])
+
+
+def _exact_block_repeat(a: np.ndarray, count: int, reason: _Reason) -> list[Any] | None:
+    """``n`` block-diagonal copies of ``a`` over exact cells — the shared body of the static
+    (:class:`BlockRepeatOp`) and runtime-counted (:class:`DynBlockRepeatOp`) twins."""
+    if a.ndim != 2:
+        reason.note("BlockRepeat: non-matrix operand")
+        return None
+    if count < 0:
+        reason.note(f"BlockRepeat: negative block count {count}")
+        return None
+    rows, cols = a.shape
+    out = np.full((count * rows, count * cols), 0.0, dtype=object)
+    for i in range(count):
+        out[i * rows:(i + 1) * rows, i * cols:(i + 1) * cols] = a
+    return [out]
 
 
 def _opaque(fn: Any, reason: _Reason) -> list[Any] | None:
@@ -823,7 +1015,7 @@ def _ref_shape(ref: Any, program: Program) -> tuple[int, ...] | None:
 
 
 def _sym_apply(
-    fn: Any, args: list[Any], deadline: float, depth: int, reason: _Reason,
+    fn: Any, args: list[Any], meter: _Meter, depth: int, reason: _Reason,
     max_sym_mass: int,
 ) -> list[Any] | None:
     """Execute one op over exact symbolic operands; ``None`` = opaque (no guess).
@@ -834,19 +1026,19 @@ def _sym_apply(
     is dispatched by :func:`_sym_apply_builtin`, exhaustively.
     """
     if isinstance(fn, Program):
-        return _run_program(fn, args, deadline, depth + 1, reason, max_sym_mass)
+        return _run_program(fn, args, meter, depth + 1, reason, max_sym_mass)
     if isinstance(fn, CallOp) and isinstance(fn.fn, Program):
-        return _run_program(fn.fn, args, deadline, depth + 1, reason, max_sym_mass)
+        return _run_program(fn.fn, args, meter, depth + 1, reason, max_sym_mass)
     closure = _vmap_closure(fn)
     if closure is not None:
-        return _run_vmap(closure, args, deadline, depth, reason, max_sym_mass)
+        return _run_vmap(closure, args, meter, depth, reason, max_sym_mass)
     if is_builtin_op(fn):
-        return _sym_apply_builtin(fn, args, deadline, reason)
+        return _sym_apply_builtin(fn, args, meter, reason)
     return _opaque(fn, reason)                 # front-end op / plain callable / hookless vmap
 
 
 def _sym_apply_builtin(
-    fn: StmtFn, args: list[Any], deadline: float, reason: _Reason,
+    fn: StmtFn, args: list[Any], meter: _Meter, reason: _Reason,
 ) -> list[Any] | None:
     """The EXACT twin of one polyarray-owned op; ``None`` = opaque (no guess).
 
@@ -888,15 +1080,15 @@ def _sym_apply_builtin(
       case ColStackOp():
         return [np.stack([_obj(c).reshape(-1) for c in args], axis=1)]
       case InvOp():
-        return [_exact_inv(args[0], deadline)]
+        return [_exact_inv(args[0], meter)]
       case InvTransposeOp():
-        return [_exact_inv(args[0], deadline).T]
+        return [_exact_inv(args[0], meter).T]
       case SolveOp():
-        return [_exact_solve(args[0], args[1], deadline)]
+        return [_exact_solve(args[0], args[1], meter)]
       case DetOp():
-        return [np.asarray(_exact_det(args[0], deadline), dtype=object)]
+        return [np.asarray(_exact_det(args[0], meter), dtype=object)]
       case PinvOp():
-        return [_exact_pinv(args[0], deadline)]
+        return [_exact_pinv(args[0], meter)]
       case ProjectOp():
         # ``Pᵀ @ v.reshape(-1)`` — the grassmann-origin drop-complement matvec.  Pure field
         # arithmetic (no float coercion, unlike ``ProjectOp.__call__``'s numeric contract), so
@@ -986,7 +1178,7 @@ def _sym_apply_builtin(
         # is exact (and constant) even when the operand is fully symbolic.
         return [np.asarray(float(np.asarray(args[0]).shape[fn.axis]))]
       case AssertOp():
-        return _exact_assert(fn, args, deadline)
+        return _exact_assert(fn, args, meter)
 
       # --- deliberately opaque: NOT a rational function of the operands ------------
       #
@@ -1025,34 +1217,75 @@ def _sym_apply_builtin(
       case ConstOp() | EyeOp():
         return _opaque(fn, reason)
 
-      # --- NOT YET IMPLEMENTED: real capability gaps, not opacity ------------------
+      # --- exact twins for the ops that ARE field arithmetic / slices / shape reads -----
       #
-      # Each op below IS expressible over ℚ(atoms) — it is pure field arithmetic, a pure
-      # slice, or a read of static SHAPE data — so a twin would extend the certificate.
-      # None exists yet.  Writing one changes what folds (hence numerics downstream), so
-      # they are listed, not silently grouped with the algebraic ops above.  Ranked by the
-      # evidence in `polyarray/CLAUDE.md`'s ledger, `ComposeViaStdOp` is the sharpest: it
-      # is literally `solve(R_to, R_from)`, and `_exact_solve` — the twin it needs — is
-      # already in this module, used by the `SolveOp` arm above.
+      # Each op below is expressible over ℚ(atoms) — pure field arithmetic, a pure slice, or
+      # a read of static SHAPE data — so each twin EXTENDS the certificate: statements that
+      # previously degraded to the (warned) probe lane now certify exactly.  That changes what
+      # folds and hence downstream numerics at roundoff, which is why each landed with its own
+      # value A/B rather than as one sweep.
       case ComposeViaStdOp():
-        # `solve(R_to, R_from)` — the SAME exact Gauss elimination as the `SolveOp` arm.
-        return _opaque(fn, reason)
-      case BlockDiagOp() | BlockRepeatOp() | DynBlockRepeatOp():
-        # Block assembly / `kron(eye(n), A)`.  Pure structure + field arithmetic, the same
-        # argument that earned `KronOp` its twin (`BlockRepeatOp` IS a Kronecker product).
-        # `DynBlockRepeatOp` additionally needs its runtime count to resolve to a constant.
-        return _opaque(fn, reason)
-      case FirstColsOp() | LastColsOp():
-        # `A[:, :int(rank)]` / `A[:, int(rank):]` — a pure SLICE, exact over RF cells
-        # whenever the `rank` operand resolves to a build-time constant.
-        return _opaque(fn, reason)
+        # `solve(R_to, R_from)` — the SAME exact Gauss elimination the `SolveOp` arm uses, on
+        # the same `_exact_solve`.  This was the sharpest of the listed gaps precisely because
+        # the twin it needed was already sitting in this module.
+        return [_exact_solve(_obj(args[0]), _obj(args[1]), meter)]
+      case BlockDiagOp():
+        # Block-diagonal assembly: pure STRUCTURE — every entry is either an operand cell or
+        # an exact zero.  Mirrors `BlockDiagOp.__call__` shape-for-shape, in object dtype so
+        # the exact cells survive instead of being coerced to float.
+        mats = [_obj(a) for a in args]
+        if any(m.ndim != 2 for m in mats):
+            reason.note("BlockDiagOp: non-matrix operand")
+            return None
+        out = np.full((sum(m.shape[0] for m in mats), sum(m.shape[1] for m in mats)),
+                      0.0, dtype=object)
+        r = c = 0
+        for m in mats:
+            out[r:r + m.shape[0], c:c + m.shape[1]] = m
+            r += m.shape[0]
+            c += m.shape[1]
+        return [out]
+      case BlockRepeatOp():
+        # `kron(eye(n), A)` with a STATIC count — the same argument that earned `KronOp` its
+        # twin: a Kronecker product against an identity is structure plus field arithmetic.
+        return _exact_block_repeat(_obj(args[0]), fn.n, reason)
+      case DynBlockRepeatOp():
+        # As `BlockRepeatOp`, but the count is an operand: it must resolve to a build-time
+        # constant.  A block count is an integer — guessing one is not a rounding decision.
+        count = _const_int(args[1])
+        if count is None:
+            reason.note("DynBlockRepeatOp: block count is not a build-time constant")
+            return None
+        return _exact_block_repeat(_obj(args[0]), count, reason)
+      case FirstColsOp():
+        # `A[:, :int(rank)]` — a pure SLICE, exact over RF cells once `rank` is constant.
+        rank = _const_int(args[1])
+        if rank is None:
+            reason.note("FirstColsOp: rank operand is not a build-time constant")
+            return None
+        return [np.asarray(args[0])[:, :rank]]
+      case LastColsOp():
+        rank = _const_int(args[1])
+        if rank is None:
+            reason.note("LastColsOp: rank operand is not a build-time constant")
+            return None
+        return [np.asarray(args[0])[:, rank:]]
       case DynEyeOp() | DynZerosOp() | DynEyeTensorOp() | ProdShapeOp() | SumShapeOp() \
-              | SumDimOp() | ProdDimOp() | ScaleAxisDimOp() | MulAxisDimOp():
+              | SumDimOp() | ProdDimOp() | ScaleAxisDimOp():
         # STRUCTURAL reads: the result is a function of the operands' static SHAPES, not of
-        # their cells, so it is an exact constant even under a fully symbolic operand —
-        # exactly the argument that makes the `AxisLenOp` arm above sound.  (`MulAxisDimOp`
-        # additionally needs its runtime count operand to resolve.)
-        return _opaque(fn, reason)
+        # their cells, so it is an exact constant even under a FULLY SYMBOLIC operand — the
+        # same argument that makes the `AxisLenOp` arm above sound.  Each of these ops touches
+        # `.shape` and nothing else, so running the real op is exact by construction; it
+        # cannot read a cell, symbolic or otherwise.
+        return [np.asarray(fn(*[np.asarray(a) for a in args]))]
+      case MulAxisDimOp():
+        # The same structural argument, except the runtime COUNT operand is a value, not a
+        # shape — so it must resolve to a build-time constant before the read is exact.
+        count = _const_int(args[0])
+        if count is None:
+            reason.note("MulAxisDimOp: runtime count operand is not a build-time constant")
+            return None
+        return [np.asarray(count * int(np.asarray(args[1]).shape[fn.axis]))]
 
       case _ as unreachable:
         assert_never(unreachable)
@@ -1075,7 +1308,7 @@ def _vmap_closure(fn: Any) -> tuple[Program, tuple, tuple] | None:
 
 
 def _run_vmap(
-    closure: tuple[Program, tuple, tuple], args: list[Any], deadline: float, depth: int,
+    closure: tuple[Program, tuple, tuple], args: list[Any], meter: _Meter, depth: int,
     reason: _Reason, max_sym_mass: int,
 ) -> list[Any] | None:
     """Exact descent INTO a vmap closure — the batched twin of :func:`_run_program`.
@@ -1085,10 +1318,10 @@ def _run_vmap(
     values, so the certificate no longer stops at the closure boundary.
 
     COST IS BOUNDED BEFORE THE LOOP STARTS (the stall rule — an uninterruptible flint op
-    ignores a deadline): the batched operands' total monomial mass must fit ``max_sym_mass``
+    ignores any budget): the batched operands' total monomial mass must fit ``max_sym_mass``
     (it is the SUM over the slices, so the whole descent stays inside the one box the caller
     budgeted for this statement), AND the batch size must fit :data:`_MAX_VMAP_BATCH` (each
-    slice pays the body's fixed per-statement overhead).  The deadline is additionally checked
+    slice pays the body's fixed per-statement overhead).  The budget is additionally charged
     INSIDE the loop, once per slice.  Every rejection degrades to *unresolved* ⇒ the warned
     probe fallback — never a hang, never a guess.
 
@@ -1132,7 +1365,7 @@ def _run_vmap(
         return None
     per_slice: list[list[Any]] = []
     for i in range(batch):
-        _check_deadline(deadline)
+        _charge(meter, _STMT_COST)            # each slice pays the body's fixed admission price
         sliced: list[Any] = []
         for arr, ax in zip(arrs, norm):
             if ax is None:
@@ -1141,7 +1374,7 @@ def _run_vmap(
             idx: list[Any] = [slice(None)] * arr.ndim
             idx[ax] = i
             sliced.append(arr[tuple(idx)])
-        outs = _run_program(body, sliced, deadline, depth + 1, reason, max_sym_mass)
+        outs = _run_program(body, sliced, meter, depth + 1, reason, max_sym_mass)
         if outs is None:
             return None                       # one opaque slice poisons the batch — no guess
         per_slice.append(outs)
@@ -1191,7 +1424,7 @@ def _bind_body_inputs(body: Program, args: list[Any], env: _Env) -> bool:
 
 
 def _run_program(
-    body: Program, args: list[Any], deadline: float, depth: int, reason: _Reason,
+    body: Program, args: list[Any], meter: _Meter, depth: int, reason: _Reason,
     max_sym_mass: int,
 ) -> list[Any] | None:
     """Recursively execute a sub-program over exact values; ``None`` = opaque."""
@@ -1203,7 +1436,7 @@ def _run_program(
         reason.note("sub-program input binding mismatch (bulk/dynamic input or shape)")
         return None
     for i, stmt in enumerate(body.statements):
-        if not _exec_stmt(body, i, stmt, env, deadline, depth, reason, max_sym_mass):
+        if not _exec_stmt(body, i, stmt, env, meter, depth, reason, max_sym_mass):
             # KEEP GOING.  This used to `return None` ("one opaque stmt poisons the body"), which
             # made the lane refuse on the PRESENCE of an un-normalizable op rather than on the
             # RESULT depending on it.  A statement we cannot execute simply leaves its outputs
@@ -1232,12 +1465,11 @@ def _run_program(
 
 
 def _exec_stmt(
-    program: Program, i: int, stmt: Stmt, env: _Env, deadline: float, depth: int,
+    program: Program, i: int, stmt: Stmt, env: _Env, meter: _Meter, depth: int,
     reason: _Reason, max_sym_mass: int,
 ) -> bool:
     """Execute one statement into ``env``; False when opaque/unresolvable."""
-    if time.monotonic() > deadline:
-        raise _Timeout()
+    _charge(meter, _STMT_COST)
     if stmt.fn is None or isinstance(stmt.fn, WhileOp):
         reason.note("WhileOp / fn-less statement (never executed at build time)")
         return False                          # loops are never executed at build time
@@ -1317,9 +1549,13 @@ def _exec_stmt(
                     f"operands too large for exact execution ({type(stmt.fn).__name__}: "
                     f"monomial mass > {max_sym_mass})")
                 return False
+            # The operand mass is the work this op is about to do, and it has ALREADY been
+            # measured for the cap — so charging it is free.  This is the dominant term of the
+            # whole budget: it is what the wall clock was really measuring.
+            _charge(meter, mass)
         try:
-            outs = _sym_apply(stmt.fn, args, deadline, depth, reason, max_sym_mass)
-        except _Timeout:
+            outs = _sym_apply(stmt.fn, args, meter, depth, reason, max_sym_mass)
+        except _Exhausted:
             raise
         except Exception as exc:  # noqa: BLE001 — symbolic twin failed ⇒ opaque, never a guess
             reason.note(f"symbolic {type(stmt.fn).__name__} failed ({type(exc).__name__})")
@@ -1354,40 +1590,50 @@ def _exec_stmt(
 # ---------------------------------------------------------------------------
 
 def exact_partial_eval(
-    program: Program, *, time_budget: float, max_sym_mass: int = _MAX_SYM_MASS,
+    program: Program, *, work_budget: int | None = None, max_sym_mass: int = _MAX_SYM_MASS,
+    wall_backstop: float | None = None,
 ) -> ExactState:
     """One exact pass over ``program``: fold / refute / leave-unresolved each Stmt.
 
-    Cost is bounded by BOTH knobs: ``time_budget`` (seconds, checked between
-    operations) and ``max_sym_mass`` (:data:`_MAX_SYM_MASS` — the monomial mass one
-    symbolic op's operands may carry, checked BEFORE the op runs, because a single
+    Cost is bounded by BOTH knobs: ``work_budget`` (deterministic work units, charged between
+    operations — see :class:`_Meter`) and ``max_sym_mass`` (:data:`_MAX_SYM_MASS` — the monomial
+    mass one symbolic op's operands may carry, checked BEFORE the op runs, because a single
     object-dtype einsum / Gauss pass cannot be interrupted mid-flight).
+
+    The budget is a function of the PROGRAM, not of the machine: the same program spends the
+    same units under any load, so the resulting certificate is reproducible.  ``wall_backstop``
+    is a generous seconds cap that only guards a mis-calibrated cost model; when it fires the
+    result IS machine-dependent, so it is recorded on :attr:`ExactState.hit_wall_clock` and
+    `simplify` turns it into a loud ``NonDeterministicFoldWarning``.  ``None`` disables it.
 
     Never raises on op content — every failure mode degrades to ``unresolved``
     (which ``mode="hybrid"`` hands to the loud probe fallback)."""
     from .simplify import _record_known
 
-    deadline = time.monotonic() + float(time_budget)
-    state = ExactState()
+    limit = _resolve_work_budget(work_budget)
+    meter = _Meter(limit=limit,
+                   wall_deadline=_wall_deadline(wall_backstop))
+    state = ExactState(limit=limit)
     env = _Env()
     reason = _Reason()                         # per-call holder (threaded explicitly)
     for i, stmt in enumerate(program.statements):
         reason.value = None                    # fresh slate per top-level statement
         try:
-            ok = _exec_stmt(program, i, stmt, env, deadline, 0, reason, max_sym_mass)
-        except _Timeout:
+            ok = _exec_stmt(program, i, stmt, env, meter, 0, reason, max_sym_mass)
+        except _Exhausted as exc:
+            note = _exhausted_note(exc, meter)
             for j in range(i, len(program.statements)):
-                state.unresolved[j] = "time budget exhausted"
+                state.unresolved[j] = note
             break
         if not ok:
             fallback = type(stmt.fn).__name__ if stmt.fn is not None else "no fn"
             state.unresolved[i] = reason.take(fallback)
             continue
         # Classify: all-constant ⇒ fold; any provably non-constant cell ⇒ refute.
-        # DEADLINE-AWARE (the classification is where a pathological cell's exact
-        # evaluation/gcd bill lands — the degree-5 regime): expiry degrades this and
+        # BUDGET-AWARE (the classification is where a pathological cell's exact
+        # evaluation/gcd bill lands — the degree-5 regime): exhaustion degrades this and
         # every remaining statement to *unresolved* (⇒ the warned probe fallback),
-        # exactly like a timeout in the execution loop above.
+        # exactly like exhaustion in the execution loop above.
         const_outs: list[np.ndarray] = []
         verdict = "fold"
         try:
@@ -1400,7 +1646,7 @@ def exact_partial_eval(
                 vals = np.empty(arr.shape, dtype=float)
                 for idx in (np.ndindex(*arr.shape) if arr.shape else [()]):
                     c = arr[idx] if arr.shape else arr[()]
-                    cv = _cell_constant(c, deadline)
+                    cv = _cell_constant(c, meter)
                     if cv is None:
                         verdict = "refute"
                         break
@@ -1408,9 +1654,10 @@ def exact_partial_eval(
                 if verdict != "fold":
                     break
                 const_outs.append(vals)
-        except _Timeout:
+        except _Exhausted as exc:
+            note = _exhausted_note(exc, meter)
             for j in range(i, len(program.statements)):
-                state.unresolved[j] = "time budget exhausted"
+                state.unresolved[j] = note
             break
         if verdict == "fold":
             # All-or-nothing WITHOUT copying the accumulated bindings per statement (the same
@@ -1453,12 +1700,15 @@ def exact_partial_eval(
                             state.sym[cell.gens[0]] = v
                         else:
                             state.known.setdefault(cell.gens[0], float(v))
+    state.spent = meter.spent
+    state.hit_wall_clock = meter.hit_wall_clock
     return state
 
 
 def exact_fold_cells(
     cells: np.ndarray, state: ExactState, program: Program, *,
-    time_budget: float, max_sym_mass: int = _MAX_SYM_MASS,
+    work_budget: int | None = None, max_sym_mass: int = _MAX_SYM_MASS,
+    wall_backstop: float | None = None,
 ) -> np.ndarray:
     """ENTRY-LEVEL exact fold of an output cell array.
 
@@ -1471,32 +1721,43 @@ def exact_fold_cells(
     cells = np.asarray(cells)
     if cells.dtype.kind == "f":
         return cells
-    deadline = time.monotonic() + float(time_budget)
+    meter = _Meter(limit=_resolve_work_budget(work_budget),
+                   wall_deadline=_wall_deadline(wall_backstop))
     scalar_known = {k: v for k, v in state.known.items()
                     if not isinstance(v, np.ndarray) or v.shape == ()}
     env = _Env(atom={**scalar_known, **state.sym}, bulk=dict(state.sym_bulk))
     out = np.empty(cells.shape, dtype=object)
     flat_in = cells.reshape(-1)
     flat_out = out.reshape(-1)
-    flat_out[:] = flat_in                     # pre-fill: a deadline break must leave no hole
+    flat_out[:] = flat_in                     # pre-fill: a budget break must leave no hole
     changed = False
     for i, c in enumerate(flat_in):
         if not isinstance(c, RationalFunction):
             continue
-        if time.monotonic() > deadline:
-            break
         # WORK CAP on the substitution too: `_resolve_rf` composes the (possibly huge)
         # statement values into this cell, and one `compose_multi` runs uninterrupted.
-        if _rf_mass(c) > max_sym_mass:
+        mass = _rf_mass(c)
+        if mass > max_sym_mass:
             continue
+        try:
+            _charge(meter, mass)               # the substitution this cell is about to pay for
+        except _Exhausted:
+            break                              # (remaining cells stay untouched — pre-filled)
         v = _resolve_rf(c, env, program, max_sym_mass)
         if v is _OPAQUE or not isinstance(v, RationalFunction):
             continue
         try:
-            cv = _constant_value(v, deadline)  # deadline INSIDE the cell too — a single
-        except _Timeout:                       # pathological normal form must not overrun
+            cv = _constant_value(v, meter)     # budget INSIDE the cell too — a single
+        except _Exhausted:                     # pathological normal form must not overrun
             break                              # (remaining cells stay untouched)
         if cv is not None:
             flat_out[i] = cv
             changed = True
+    # ACCUMULATE onto the state: `spent` is the work this certificate cost in total, across
+    # both passes, not just the statement pass.  On the FEEC legs the statement pass refutes
+    # the vertex-dependent pieces and folds nothing — the cancellation completes HERE, per
+    # cell — so a `spent` that omitted this pass would under-report the real cost of the
+    # certificate by most of it.
+    state.spent += meter.spent
+    state.hit_wall_clock = state.hit_wall_clock or meter.hit_wall_clock
     return out if changed else cells
