@@ -118,6 +118,18 @@ def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None =
     # of a program-carrying SymArray, else syntactic simple_zero. A conservative (denser) mask is never
     # wrong, only less aggressive. Leaf inverses / Schur-combine products above
     # SymbolicBudget.schur_{inverse,matmul}_stmt_size defer to numeric Stmts.
+
+def sound_sparsity_mask(matrix: SymArray) -> np.ndarray
+    # The mask `symbolic_inverse` resolves for itself, as a value a caller can hold: a False entry is a
+    # cell PROVED zero (syntactic, or a constant within roundoff after the exact fold), a True entry
+    # claims nothing. For taking the sparsity where it is still visible — e.g. before a Program.graft,
+    # which re-homes cells as fresh atoms and so hides every provable zero.
+
+def mask_zeros(arr: SymArray, mask: np.ndarray) -> SymArray
+    # `arr` with every cell `mask` proves zero replaced by an EXACT zero of the matching lane, riding the
+    # same program. The companion of sound_sparsity_mask: writes a mask BACK INTO the matrix, so every
+    # reader (exact fold, degree walk, codegen, the consumer's own arithmetic) sees the sparsity — rather
+    # than only the one reader a `mask=` argument reaches.
 ```
 
 ## Op vocabulary (the `Stmt.fn` types)
