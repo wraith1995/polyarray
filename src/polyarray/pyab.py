@@ -793,7 +793,7 @@ def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
             # symptom upstream, not a fact of life.
             warnings.warn(
                 f"pyab: helper body exceeds the {_FP_MAX_NODES} node fingerprint budget — emitting "
-                "it UNINTERNED (correct, but duplicate helpers are no longer deduplicated). A body "
+                "it UNINTERNED (correct, but duplicate helpers are not deduplicated). A body "
                 "this large usually means a symbolic operand was threaded into a value kernel "
                 "without being grounded first.", stacklevel=2)
         return None
