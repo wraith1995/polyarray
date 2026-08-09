@@ -1286,15 +1286,42 @@ def symarray_atoms(sa: SymArray) -> set:
 
 
 def _symarray_atoms(sa: SymArray) -> set:
-    """The run-time binding-key atoms a SymArray reads: its bulk name, or its
-    cells' RationalFunction generators (the keys ``SymArray.evaluate`` resolves)."""
+    """The run-time binding-key atoms a SymArray's VALUE depends on.
+
+    Its bulk name, or its cells' RationalFunction generators (the keys ``SymArray.evaluate``
+    resolves).
+
+    Parameters
+    ----------
+    sa
+        The array to read.
+
+    Returns
+    -------
+    set
+        The binding keys the value varies with.  Empty when nothing outside the array is read.
+
+    Notes
+    -----
+    ⚠ ``RationalFunction.gens`` is the generator list of the cell's **ring**, not the set of
+    generators the cell's value actually varies with.  A cell of total degree zero in every
+    generator — ``is_constant()``, or the zero polynomial, for which ``is_constant()`` is
+    ``False`` only because ``_total_degree`` spells the zero polynomial ``-1`` — has the SAME
+    value under every binding, so it reads none of its ring's generators and contributes no
+    atom.  Both tests are exact and structural (a total-degree test on the numerator and
+    denominator), never a sample, so excluding such a cell removes atoms the value PROVABLY
+    does not depend on: strictly more precise, and never a claim of independence that cannot be
+    proved.  Without it, a constant that merely rides on a ring built around a ``vertex`` /
+    ``point`` feed reads as feed-dependent, and every dependency question downstream —
+    :func:`is_structurally_constant` above all — answers conservatively wrong.
+    """
     bulk = getattr(sa, "_bulk", None)
     if bulk is not None:
         return {bulk.name}
     cells = np.asarray(sa._cells, dtype=object)
     atoms: set = set()
     for c in (np.ravel(cells) if cells.shape else [cells[()]]):
-        if isinstance(c, RationalFunction):
+        if isinstance(c, RationalFunction) and not (c.is_constant() or c.is_zero()):
             atoms.update(c.gens)
     return atoms
 
@@ -1383,7 +1410,10 @@ def is_structurally_constant(program: Program, target: SymArray) -> bool:
        both of which are values supplied at run time; and
     2. **no cell generator anywhere in the cone** (nor in ``target`` itself) has a
        provenance ``kind`` other than ``"stmt_out"`` — i.e. no ``vertex`` / ``point`` /
-       ``coeff`` / ``param_dof`` / ``per_point`` (feed) atom is read.
+       ``coeff`` / ``param_dof`` / ``per_point`` (feed) atom is read.  *Read*, not merely
+       named: the generators come from :func:`_symarray_atoms`, which excludes a cell of
+       total degree zero (see its note) — such a cell holds the same value under every
+       binding, so a feed generator sitting in its RING is not a dependency.
 
     **Soundness.**  A cone with no live-input reference and only ``stmt_out`` generators
     depends on nothing outside itself: its leaves are nullary constant ops (``ConstOp`` /

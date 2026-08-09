@@ -9,7 +9,8 @@ delegates to; it decides `pointwise.is_affine_invariant` without any eval/codege
 import numpy as np
 
 import polyarray as pa
-from polyarray.ir import InputRef, Program, Provenance, SymInput
+from polyarray.ir import InputRef, Program, Provenance, SymArray, SymInput
+from polyarray.rational import RationalFunction
 from polyarray.simplify import _symarray_atoms
 
 
@@ -47,3 +48,48 @@ def test_target_carrying_a_feed_generator_is_not_constant():
     atoms = _symarray_atoms(v)
     assert atoms and all(p.env.of(a).kind == "vertex" for a in atoms)  # live feeds, not stmt_out
     assert pa.is_structurally_constant(p, v) is False
+
+
+def test_a_constant_cell_reads_none_of_its_rings_generators() -> None:
+    """Total degree zero ⇒ the SAME value under every binding ⇒ NO atom.
+
+    ``RationalFunction.gens`` lists the ring's generators, not the ones the value varies
+    with; a cancellation such as ``(x + 3) - x`` keeps ``x`` in the ring while being a
+    constant.  Counting that ``x`` makes a provable build-time constant read as
+    feed-dependent, which is what this pins.  The exact-zero cell is the same statement with
+    ``_total_degree``'s ``-1`` spelling for the zero polynomial, so ``is_constant()`` alone
+    would miss it.
+    """
+    x = RationalFunction.atom("vx")
+    const = (x + RationalFunction.constant(3.0)) - x
+    zero = x - x
+    live = x + RationalFunction.constant(1.0)
+    assert const.gens == ("vx",) and const.is_constant()
+    assert zero.gens == ("vx",) and zero.is_zero() and not zero.is_constant()
+
+    p = Program("ring", inputs=[])
+    assert _symarray_atoms(SymArray(np.array([[const, zero]], dtype=object), program=p)) == set()
+    assert _symarray_atoms(SymArray(np.array([[live]], dtype=object), program=p)) == {"vx"}
+
+
+def test_constant_cells_over_a_feed_ring_are_structurally_constant() -> None:
+    """An operand whose cells are build-time constants (three exact zeros and one ``-1e-15``
+    residue) but whose RING is built around a ``vertex`` feed.
+
+    Its cone is empty and its value is identical under every binding, so it IS a build-time
+    constant.  Counting the ring's ``vertex`` generator as a dependency makes the proof
+    decline, and every consumer gated on it — an entry snap, an affine-invariance test —
+    then never runs."""
+    p = Program("feedring", inputs=[SymInput("v", (2, 2),
+                                             Provenance(kind="vertex", origin="v", index=(), label="v"))])
+    x = next(iter(_symarray_atoms(p.input_arrays["v"])))
+    assert p.env.of(x).kind == "vertex"
+    g = RationalFunction.atom(x)
+    const = (g + RationalFunction.constant(-1.0921e-15)) - g
+    zero = g - g
+    target = SymArray(np.array([[const, zero], [zero, zero]], dtype=object), program=p)
+    assert pa.is_structurally_constant(p, target) is True
+
+    # …and a cell that genuinely varies with the same feed is still refused.
+    live = SymArray(np.array([[g, zero], [zero, zero]], dtype=object), program=p)
+    assert pa.is_structurally_constant(p, live) is False

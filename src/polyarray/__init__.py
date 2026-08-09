@@ -102,7 +102,7 @@ from .sparsity import propagate_sparsity, block_zero_mask, SparsityReport
 from .degree import program_degree
 
 # --- Linear algebra ---------------------------------------------------------
-from .schur import symbolic_inverse
+from .schur import mask_zeros, sound_sparsity_mask, symbolic_inverse
 
 # --- Batched execution ------------------------------------------------------
 from .ir import vmap
@@ -207,6 +207,8 @@ __all__ = [
     "block_zero_mask",
     "SparsityReport",
     # linear algebra
+    "mask_zeros",
+    "sound_sparsity_mask",
     "symbolic_inverse",
     # code generation
     "to_numpy_source",
