@@ -379,9 +379,12 @@ def bind_inputs(program, bind) -> Program   # = specialize(bind=...)
 
 def partial_eval_numeric(program: Program, *, probes: int = 3, seed: int = 0,
                          rtol: float = 1e-9, atol: float = 1e-12,
-                         mode: str | None = None, time_budget: float = 10.0) -> Program
+                         mode: str | None = None, work_budget: int | None = None,
+                         max_sym_mass: int | None = None,
+                         time_budget: float | None = None) -> Program
 def partial_eval_numeric_symarray(sa: SymArray, **kw) -> SymArray
 class NonExactFoldWarning(UserWarning)
+class NonDeterministicFoldWarning(NonExactFoldWarning)
     # Fold every Stmt whose outputs are INVARIANT under the symbolic inputs —
     # strictly stronger than the dataflow fold_numeric: collapses e.g. A·inv(A) ≡ I
     # and a metric-free grass_dof whose symbolic Jacobian input provably cancels.
@@ -393,11 +396,26 @@ class NonExactFoldWarning(UserWarning)
     #              rational op set + exact Gauss inv/det/solve + sub-Program descent;
     #              numeric-closed subgraphs run their real ops deterministically).
     #              Non-normalizable (opaque-op) statements are left symbolic; provably
-    #              non-constant ones are REFUTED. Cost is bounded by BOTH `time_budget`
-    #              (seconds, checked between ops) and an operand-size cap checked BEFORE
-    #              each symbolic op (`exact_fold._MAX_SYM_MASS` monomials — one einsum /
-    #              Gauss pass over RF cells cannot be interrupted mid-flight). Oversized
-    #              or timed-out statements degrade to unresolved ⇒ probe fallback.
+    #              non-constant ones are REFUTED. Cost is bounded by BOTH `work_budget`
+    #              (DETERMINISTIC work units, charged between ops) and an operand-size cap
+    #              checked BEFORE each symbolic op (`exact_fold._MAX_SYM_MASS` monomials —
+    #              one einsum / Gauss pass over RF cells cannot be interrupted mid-flight).
+    #              Oversized or out-of-budget statements degrade to unresolved ⇒ probe
+    #              fallback. `work_budget=None` reads POLYARRAY_EXACT_WORK_BUDGET, else
+    #              `exact_fold._DEFAULT_WORK_BUDGET`; `work_budget=0` means unbounded.
+    #
+    #              The budget is WORK, NOT SECONDS — that is the contract. What certifies
+    #              is a function of the program alone, so the same input yields the same
+    #              certificate on any machine under any load. It used to be wall-clock
+    #              seconds, which made a certificate a property of the box: one leg gave
+    #              6874 / 6895 / 7726 frozen statements on three runs. A generous
+    #              wall-clock BACKSTOP survives only to catch a mis-calibrated cost model,
+    #              and raises NonDeterministicFoldWarning when it fires — never silent,
+    #              because it reintroduces exactly that machine dependence.
+    #
+    #              `time_budget=` (seconds) is ACCEPTED for backward compatibility but no
+    #              longer selects certificates: it sizes the backstop, i.e. it still bounds
+    #              how long the call may run. Passing it emits a DeprecationWarning.
     #   "hybrid" — exact first; ONLY unresolved statements fall back to the probe
     #              pass, and every probe freeze raises ONE aggregated
     #              NonExactFoldWarning naming the sites. Exactly-refuted statements

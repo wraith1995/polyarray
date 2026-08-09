@@ -266,9 +266,22 @@ def _approx_zero(cell: object) -> bool:
     return False
 
 
-#: Seconds the mask may spend EXACTLY folding the matrix's program (:func:`_exactly_folded_cells`).
+#: WORK UNITS (:class:`~polyarray.exact_fold._Meter`, roughly one monomial touched — NOT seconds)
+#: the mask may spend EXACTLY folding the matrix's program (:func:`_exactly_folded_cells`).
 #: Bounded like every other use of the exact lane; over budget ⇒ the raw, unfolded cells.
-_MASK_FOLD_BUDGET = 10.0
+#:
+#: The unit matters here for the same reason it matters to the certificate: the mask decides the
+#: block split, hence the sparsity of the inverse this module returns, and a bound in seconds makes
+#: that structure a property of the machine. Work units are a function of the program alone, so the
+#: same matrix yields the same mask everywhere.
+#:
+#: SIZED FROM MEASUREMENT, at ``exact_fold._DEFAULT_WORK_BUDGET`` — this is the same lane, bounded
+#: the same way. The plate mask folds spend 18 912 (morley), 50 832 (hermite), 544 389 (bell) and
+#: 703 663 (argyris) units, so the heaviest runs at ~18% of the ceiling. At the lane's calibrated
+#: ~128 000 units/second the ceiling this replaced (10 seconds) was worth only ~1.28 M units, which
+#: argyris was already spending 55% of: the mask was one loaded box away from silently coarsening,
+#: which is exactly the machine dependence this currency removes.
+_MASK_FOLD_WORK_BUDGET = 4_000_000
 
 
 def _exactly_folded_cells(matrix: SymArray) -> np.ndarray:
@@ -305,11 +318,11 @@ def _exactly_folded_cells(matrix: SymArray) -> np.ndarray:
     program = getattr(matrix, "program", None)
     if program is None or cells.dtype.kind == "f":
         return cells
+    from .exact_fold import exact_fold_cells, exact_partial_eval
     try:
-        from .exact_fold import exact_fold_cells, exact_partial_eval
-        state = exact_partial_eval(program, time_budget=_MASK_FOLD_BUDGET)
+        state = exact_partial_eval(program, work_budget=_MASK_FOLD_WORK_BUDGET)
         return np.asarray(exact_fold_cells(cells, state, program,
-                                           time_budget=_MASK_FOLD_BUDGET))
+                                           work_budget=_MASK_FOLD_WORK_BUDGET))
     except Exception:  # noqa: BLE001 — a failing fold is a non-fold, never a crash
         return cells
 
