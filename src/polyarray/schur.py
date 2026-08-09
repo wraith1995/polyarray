@@ -349,6 +349,24 @@ def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
     return _syntactic_mask(_exactly_folded_cells(matrix))
 
 
+def sound_sparsity_mask(matrix: SymArray) -> np.ndarray:
+    """The SOUND nonzero mask of ``matrix`` — the same one :func:`symbolic_inverse` would resolve for
+    itself, as a value a caller can hold, carry and hand back via its ``mask=`` argument.
+
+    A ``False`` entry is a cell proved zero (syntactically, or a constant within roundoff after the
+    exact fold); a ``True`` entry claims nothing. Conservative by construction: a denser mask makes the
+    block split less aggressive, never wrong.
+
+    WHY A CONSUMER NEEDS THIS. A mask must sometimes be taken at a point where the zeros are still
+    VISIBLE and used at a point where they are not. :meth:`~polyarray.ir.Program.graft` re-homes a
+    matrix by emitting its producing program as one Stmt whose outputs are FRESH ATOMS, one per cell —
+    values preserved, but a provably-zero cell becomes an opaque atom that no later reader can prove
+    zero (measured on a plate element: 42 nnz before the graft, 324/324 after). Grafting preserves
+    values, so a mask proved before it is still a valid mask of the same matrix after; reading it early
+    and passing it forward is how the sparsity survives."""
+    return _resolve_mask(matrix, None)
+
+
 def _all_zero(mask_block: np.ndarray) -> bool:
     return not mask_block.any()
 
