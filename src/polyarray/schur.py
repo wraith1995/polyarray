@@ -101,7 +101,7 @@ def _deferred_matmul(*arrs: SymArray, masks: tuple[np.ndarray, ...] | None = Non
         One boolean nonzero mask per factor, sound in this module's sense (a ``False`` entry marks a
         cell :func:`_approx_zero` proves zero), or ``None`` to carry no mask. When supplied, the boolean
         product mask is carried along the chain and every result cell it certifies zero is written as an
-        EXACT zero (:func:`_mask_zeros`) instead of the Stmt's fresh output atom; a step whose whole mask
+        EXACT zero (:func:`mask_zeros`) instead of the Stmt's fresh output atom; a step whose whole mask
         is zero emits no Stmt at all.
 
     Returns
@@ -150,7 +150,7 @@ def _deferred_matmul(*arrs: SymArray, masks: tuple[np.ndarray, ...] | None = Non
         else:
             result = result.matmul(nxt)
         if nmask is not None:
-            result = _mask_zeros(result, nmask)
+            result = mask_zeros(result, nmask)
         rmask = nmask
     return result
 
@@ -345,7 +345,7 @@ def _result_mask(arr: SymArray) -> np.ndarray:
     return _syntactic_mask(np.asarray(arr.cells))
 
 
-def _mask_zeros(arr: SymArray, mask: np.ndarray) -> SymArray:
+def mask_zeros(arr: SymArray, mask: np.ndarray) -> SymArray:
     """``arr`` with every cell ``mask`` marks zero replaced by an EXACT zero of the matching lane.
 
     The point is downstream VISIBILITY: a proven-zero cell must be a syntactic zero, not a fresh
@@ -356,12 +356,27 @@ def _mask_zeros(arr: SymArray, mask: np.ndarray) -> SymArray:
     arr
         The block to rewrite.
     mask
-        Its boolean nonzero mask. An all-``True`` mask returns ``arr`` unchanged.
+        Its boolean nonzero mask, sound in this module's sense (a ``False`` entry is a cell proved
+        zero — see :func:`sound_sparsity_mask`). An all-``True`` mask returns ``arr`` unchanged.
 
     Returns
     -------
     SymArray
         The block with its proven zeros made syntactic, riding the same program.
+
+    Notes
+    -----
+    The companion of :func:`sound_sparsity_mask`, and the other half of the graft problem it
+    describes: a mask taken where the zeros are still visible can either be CARRIED to the one
+    reader that accepts a ``mask=`` argument, or WRITTEN BACK into the matrix here — after which
+    every reader sees the sparsity, from the exact fold and the degree walk to codegen and to
+    whatever arithmetic the consumer does with the matrix itself. Writing it back is the stronger
+    move for a matrix with more than one consumer.
+
+    It is the same commitment the recursion already makes internally: :func:`_deferred_matmul`
+    writes the product mask's zeros into a deferred matmul's fresh atoms, and ``_schur_combine``
+    sets a whole inverse block to exact zero on the mask's say-so. The mask decides values here as
+    it does there; this only makes the treatment available to a caller.
     """
     if mask.all():
         return arr
