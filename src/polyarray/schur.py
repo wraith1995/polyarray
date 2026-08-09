@@ -56,23 +56,20 @@ BASE = 6
 #
 # ⚠ A DEFERRED INVERSE IS OPAQUE. A Stmt's output cells are FRESH ATOMS — names for a pending numeric
 # computation, carrying no arithmetic — so every `InvOp` the recursion emits is a hole the exact fold
-# cannot see through, and a `P(T)` built over it is only partly closed-form. Deferring is therefore a
-# COST, paid to avoid a worse one (the cofactor determinant's degree growth: det ~ n·d, cofactors
-# ~ (n−1)·d). The threshold is where that trade turns, and it is a MEASURED number, not a guess:
+# cannot see through, and an inverse built over one is only partly closed-form. Deferring is therefore
+# a COST, paid to avoid a worse one (the cofactor determinant's degree growth: det ~ n·d, cofactors
+# ~ (n−1)·d). The threshold is where that trade turns:
 #
-#   ≤ 3×3 is free where it matters. Every non-plate element in the library (FEEC P⁻ᵣΛᵏ / PᵣΛᵏ, Lagrange,
-#   vector Lagrange, bubble, mini) is AFFINE-INVARIANT, so its `C` is structurally the identity, `_invert`
-#   takes the `_is_diagonal` arm and NO base-case inverse is ever reached — the threshold is inert there
-#   (build time, monomial mass, degree and nnz all byte-identical at 2 and at 4, measured over
-#   pminus TRI r≤4 Λ¹, TRI Λ², TET Λ¹/Λ², plambda, Lagrange TRI/TET r=3). The derivative-DOF plate
-#   elements are the ONLY lane that reaches `_base_inverse` at all, and there the recursion bottoms out
-#   at blocks of size ≤ 3 ([2,2,2] hermite; [3,3,3,2,2,2] bell and argyris). Inverting those inline
-#   removes every `InvOp` from `P(T)` (3/6/6 → 0) for a small, bounded symbolic cost: monomial mass
-#   108→120 / 360→534 / 516→690, max cell degree 1→3, wall time UNCHANGED (bell 11.1 s both), and the
-#   sparsity is unchanged at the numeric truth (12/16/42/81).
+#   ≤ 3×3 is free where it matters. A matrix that is structurally diagonal never reaches
+#   `_base_inverse` at all — `_invert` takes the `_is_diagonal` arm — so the threshold is inert for it
+#   at any setting, and build time, monomial mass, degree and nnz are identical at 2 and at 4. The lane
+#   the threshold actually governs is the one whose blocks are still dense when the splits run out, and
+#   there the recursion bottoms out at blocks of size 2 and 3. Inverting those inline leaves NO `InvOp`
+#   in the result, for a small bounded symbolic cost: monomial mass up by roughly a tenth to a half,
+#   max cell degree 1 → 3, wall time and sparsity unchanged.
 #
-# So: 4 = "invert a dense block of 2 or 3 exactly, defer anything larger". Raise it further only with a
-# measurement — the next step up (4×4) is where the cofactor's 24-term determinant starts to bite.
+# So: 4 = "invert a dense block of 2 or 3 exactly, defer anything larger". 4×4 is where the cofactor's
+# 24-term determinant starts to bite, so raising it further wants its own measurement.
 _DEFER_INVERSE = 4   # a base-case inverse this size or larger → numeric InvOp Stmt (≤3×3 stays inline)
 _DEFER_MATMUL = 2    # a Schur-combine product with any dim ≥ this → numeric matmul Stmt
 
@@ -89,22 +86,38 @@ def _defer_thresholds() -> tuple[int, int]:
 
 
 def _deferred_matmul(*arrs: SymArray, masks: tuple[np.ndarray, ...] | None = None) -> SymArray:
-    """Left-to-right product of SymArray blocks. Each 2-factor step emits a numeric matmul Stmt into the
-    carried program when an operand is large (`_DEFER_MATMUL`) — the blocks evaluate numerically at the
-    concrete inputs and the result is fresh atom cells — else inline exact-rational matmul. Float-cell
-    (numeric) operands never defer: `SymArray.matmul` short-circuits them to numpy.
+    """Left-to-right product of ``SymArray`` blocks, deferring the large steps to numeric Stmts.
 
-    ``masks`` — one boolean nonzero mask per factor, sound in this module's sense (a ``False`` entry marks a
-    cell :func:`_approx_zero` proves zero). When supplied, the boolean product mask is carried along the
-    chain and every result cell it certifies zero is written as an EXACT zero (:func:`_mask_zeros`) instead
-    of the Stmt's fresh output atom; a step whose whole mask is zero emits no Stmt at all.
+    Each 2-factor step emits a numeric matmul Stmt into the carried program when an operand is large
+    (`_DEFER_MATMUL`) — the blocks evaluate numerically at the concrete inputs and the result is fresh
+    atom cells — else it is an inline exact-rational matmul. Float-cell (numeric) operands never defer:
+    `SymArray.matmul` short-circuits them to numpy.
 
-    This is what keeps a structural zero VISIBLE across a deferral. A deferred matmul's outputs are fresh
-    atoms — NAMES for a pending computation, carrying no arithmetic — so without the mask the Schur
+    Parameters
+    ----------
+    *arrs
+        The factors, multiplied left to right.
+    masks
+        One boolean nonzero mask per factor, sound in this module's sense (a ``False`` entry marks a
+        cell :func:`_approx_zero` proves zero), or ``None`` to carry no mask. When supplied, the boolean
+        product mask is carried along the chain and every result cell it certifies zero is written as an
+        EXACT zero (:func:`_mask_zeros`) instead of the Stmt's fresh output atom; a step whose whole mask
+        is zero emits no Stmt at all.
+
+    Returns
+    -------
+    SymArray
+        The product, riding the program the operands carry.
+
+    Notes
+    -----
+    The mask is what keeps a structural zero VISIBLE across a deferral. A deferred matmul's outputs are
+    fresh atoms — NAMES for a pending computation, carrying no arithmetic — so without it the Schur
     combine's ``−D⁻¹·C·A⁻¹`` comes back structurally DENSE even when ``C`` is sparse and the two inverses
-    are diagonal, and the inverse loses exactly the sparsity the mask just established (measured: morley's
-    ``P(T)`` 12 → 15, one spurious nonzero per row). Sound because ``(A·B)[i,j] = Σₖ A[i,k]·B[k,j]``: when
-    no ``k`` has both factors nonzero, every term of that sum carries a proven-zero factor."""
+    are diagonal (one spurious nonzero per row), and the inverse loses exactly the sparsity the mask just
+    established. Sound because ``(A·B)[i,j] = Σₖ A[i,k]·B[k,j]``: when no ``k`` has both factors nonzero,
+    every term of that sum carries a proven-zero factor.
+    """
     result = arrs[0]
     rmask = masks[0] if masks is not None else None
     mm_thresh = _defer_thresholds()[0]
@@ -149,8 +162,8 @@ def _base_inverse(arr: SymArray) -> SymArray:
 
     The inline lane is the one to PREFER when it is affordable: `cofactor_inverse` is exact rational
     arithmetic, so the result stays readable to the exact fold and to `_approx_zero`, whereas the Stmt's
-    output cells are fresh atoms the fold cannot enter. `_DEFER_INVERSE` (measured, see its comment) is
-    where "affordable" stops."""
+    output cells are fresh atoms the fold cannot enter. `_DEFER_INVERSE` (see its comment) is where
+    "affordable" stops."""
     n = _dim(arr.shape[0])
     program = arr.program
     if program is not None and not arr.is_numeric and n >= _defer_thresholds()[1]:
@@ -254,27 +267,40 @@ def _approx_zero(cell: object) -> bool:
 
 
 #: Seconds the mask may spend EXACTLY folding the matrix's program (:func:`_exactly_folded_cells`).
-#: Bounded like every other use of the exact lane; over budget ⇒ the raw cells, i.e. today's mask.
+#: Bounded like every other use of the exact lane; over budget ⇒ the raw, unfolded cells.
 _MASK_FOLD_BUDGET = 10.0
 
 
 def _exactly_folded_cells(matrix: SymArray) -> np.ndarray:
-    """``matrix``'s cells with every EXACTLY-CERTIFIED constant substituted in — the input the
-    roundoff-accepting mask (:func:`_approx_zero`) actually needs.
+    """``matrix``'s cells with every EXACTLY-CERTIFIED constant substituted in.
 
-    A cell of a lowered ``C`` is typically ``1.0·<atom>``: a NAME for a pending Stmt, carrying no
-    arithmetic at all. ``_approx_zero`` can say nothing about such a cell, so a structurally-zero
-    DOF residue (nodal duality: ``σ_a(f_b) = 0``) is kept as a nonzero and the block split never
-    happens. The exact lane (:func:`~polyarray.exact_fold.exact_partial_eval` +
+    This is the input the roundoff-accepting mask (:func:`_approx_zero`) actually needs. A cell of
+    a lowered matrix is typically ``1.0·<atom>``: a NAME for a pending Stmt, carrying no arithmetic
+    at all. ``_approx_zero`` can say nothing about such a cell, so a cell whose VALUE is zero is
+    kept as a nonzero and the block split never happens. The exact lane
+    (:func:`~polyarray.exact_fold.exact_partial_eval` +
     :func:`~polyarray.exact_fold.exact_fold_cells`) resolves exactly those names, over ℚ(feed
     atoms), and replaces a cell whose normal form has total degree zero by its exact constant.
 
+    Parameters
+    ----------
+    matrix
+        The matrix whose cells to fold. One with no program, or with float cells, is returned as-is.
+
+    Returns
+    -------
+    np.ndarray
+        The cell array, with every certified-constant cell replaced by its exact constant.
+
+    Notes
+    -----
     SOUND — it is the same rule, better informed. The fold is exact-by-construction (rational
     normal form, no sampling), so a cell it certifies constant IS constant, which is precisely the
     condition ``_approx_zero`` requires before it applies roundoff. A cell the fold cannot resolve
     is returned UNCHANGED, so the mask can only get sparser where a constant was proved, never
     where one was guessed. Any failure (no program, over budget, a raise) falls back to the raw
-    cells — today's behaviour exactly."""
+    cells.
+    """
     cells = np.asarray(matrix.cells)
     program = getattr(matrix, "program", None)
     if program is None or cells.dtype.kind == "f":
@@ -298,21 +324,45 @@ def _syntactic_mask(cells: np.ndarray) -> np.ndarray:
 
 
 def _result_mask(arr: SymArray) -> np.ndarray:
-    """The nonzero mask of a block the recursion has already MATERIALIZED (a diagonal inverse, a component
-    assembly, a Schur combine): read straight off its cells by :func:`_syntactic_mask`.
+    """The nonzero mask of a block the recursion has already MATERIALIZED.
 
-    Sound in the same sense as every other mask here — a ``False`` entry is a cell :func:`_approx_zero`
-    proves zero — and it needs no re-derivation because the recursion writes its structural zeros as EXACT
-    zeros. It is deliberately NOT :func:`_resolve_mask`: this array is an intermediate of the inverse, not
-    the user's matrix, so there is nothing to fold and no probe to run."""
+    A diagonal inverse, a component assembly, a Schur combine: the mask is read straight off its cells
+    by :func:`_syntactic_mask`. Sound in the same sense as every other mask here — a ``False`` entry is
+    a cell :func:`_approx_zero` proves zero — and it needs no re-derivation because the recursion writes
+    its structural zeros as EXACT zeros. It is deliberately NOT :func:`_resolve_mask`: this array is an
+    intermediate of the inverse, not the user's matrix, so there is nothing to fold and no probe to run.
+
+    Parameters
+    ----------
+    arr
+        A block the recursion produced.
+
+    Returns
+    -------
+    np.ndarray
+        The boolean nonzero mask.
+    """
     return _syntactic_mask(np.asarray(arr.cells))
 
 
 def _mask_zeros(arr: SymArray, mask: np.ndarray) -> SymArray:
     """``arr`` with every cell ``mask`` marks zero replaced by an EXACT zero of the matching lane.
 
-    The point is downstream VISIBILITY: a proven-zero cell must be a syntactic zero, not a fresh Stmt-output
-    atom, or the next :func:`_syntactic_mask`/:func:`_approx_zero` reader cannot see it."""
+    The point is downstream VISIBILITY: a proven-zero cell must be a syntactic zero, not a fresh
+    Stmt-output atom, or the next :func:`_syntactic_mask`/:func:`_approx_zero` reader cannot see it.
+
+    Parameters
+    ----------
+    arr
+        The block to rewrite.
+    mask
+        Its boolean nonzero mask. An all-``True`` mask returns ``arr`` unchanged.
+
+    Returns
+    -------
+    SymArray
+        The block with its proven zeros made syntactic, riding the same program.
+    """
     if mask.all():
         return arr
     cells = np.array(arr.cells)
@@ -350,20 +400,33 @@ def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
 
 
 def sound_sparsity_mask(matrix: SymArray) -> np.ndarray:
-    """The SOUND nonzero mask of ``matrix`` — the same one :func:`symbolic_inverse` would resolve for
-    itself, as a value a caller can hold, carry and hand back via its ``mask=`` argument.
+    """The SOUND nonzero mask of ``matrix``, as a value a caller can hold and carry.
 
-    A ``False`` entry is a cell proved zero (syntactically, or a constant within roundoff after the
-    exact fold); a ``True`` entry claims nothing. Conservative by construction: a denser mask makes the
-    block split less aggressive, never wrong.
+    The same mask :func:`symbolic_inverse` resolves for itself, exposed so a caller can hand it back
+    via that function's ``mask=`` argument.
 
+    Parameters
+    ----------
+    matrix
+        The matrix to read.
+
+    Returns
+    -------
+    np.ndarray
+        A boolean mask. A ``False`` entry is a cell proved zero (syntactically, or a constant within
+        roundoff after the exact fold); a ``True`` entry claims nothing. Conservative by construction:
+        a denser mask makes the block split less aggressive, never wrong.
+
+    Notes
+    -----
     WHY A CONSUMER NEEDS THIS. A mask must sometimes be taken at a point where the zeros are still
     VISIBLE and used at a point where they are not. :meth:`~polyarray.ir.Program.graft` re-homes a
     matrix by emitting its producing program as one Stmt whose outputs are FRESH ATOMS, one per cell —
     values preserved, but a provably-zero cell becomes an opaque atom that no later reader can prove
-    zero (measured on a plate element: 42 nnz before the graft, 324/324 after). Grafting preserves
-    values, so a mask proved before it is still a valid mask of the same matrix after; reading it early
-    and passing it forward is how the sparsity survives."""
+    zero, so the mask of an 18×18 derivative-DOF block goes from 42 nonzeros to a dense 324/324.
+    Grafting preserves values, so a mask proved before it is still a valid mask of the same matrix
+    after; reading it early and passing it forward is how the sparsity survives.
+    """
     return _resolve_mask(matrix, None)
 
 
@@ -466,8 +529,8 @@ def _schur_combine(M: SymArray, k: int, mask: np.ndarray) -> SymArray:
 
     Every product is given the masks of its FACTORS (the caller's mask for the ``M`` sub-blocks,
     :func:`_result_mask` for the already-materialized inverses), so the structural zeros survive the
-    deferral — see :func:`_deferred_matmul`. Without that the combine returns a dense block whatever the
-    mask said, and the sparsity the split was chosen for is lost in the result."""
+    deferral — see :func:`_deferred_matmul`. Without them the combine returns a dense block whatever the
+    mask says, and the sparsity the split was chosen for is lost in the result."""
     n = _dim(M.shape[0])
     symbolic = not M.is_numeric
     A, B, C, D = M[:k, :k], M[:k, k:], M[k:, :k], M[k:, k:]

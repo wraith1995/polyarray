@@ -100,11 +100,22 @@ def test_general_split_pivots_singular_midpoint_block():
         assert np.allclose(got @ M, np.eye(8), atol=1e-10), f"mask_dense={mask is not None}"
 
 
-def _sparse_block_lower(name):
+def _sparse_block_lower(name: str) -> SymArray:
     """A 6×6 program-carrying ``[[A, 0], [C, D]]`` with A, D DIAGONAL and C carrying 2 nonzeros per row.
 
     The structural truth of its inverse is ``[[A⁻¹, 0], [−D⁻¹·C·A⁻¹, D⁻¹]]`` — and with A, D diagonal the
-    product has C's OWN pattern, so 3 + 6 + 3 = 12 nonzeros, never 3 + 9 + 3 = 15."""
+    product has C's OWN pattern, so 3 + 6 + 3 = 12 nonzeros, never 3 + 9 + 3 = 15.
+
+    Parameters
+    ----------
+    name
+        Name of the carried program.
+
+    Returns
+    -------
+    SymArray
+        The block-lower-triangular matrix, riding a program with one ``vertex`` feed input.
+    """
     from polyarray import Program, Provenance, SymInput
     prog = Program(name, inputs=[SymInput("v", (12,), Provenance("vertex", "v", (), "v"))])
     v = prog.input("v")
@@ -120,15 +131,14 @@ def _sparse_block_lower(name):
     return SymArray(cells, program=prog)
 
 
-def test_schur_combine_keeps_the_products_structural_zeros():
+def test_schur_combine_keeps_the_products_structural_zeros() -> None:
     """The Schur combine's ``−D⁻¹·C·A⁻¹`` must come back with C's SPARSITY, not dense.
 
     That product is DEFERRED to a numeric matmul Stmt whose outputs are fresh atoms — NAMES for a
     pending computation — so without the factor masks threaded through ``_deferred_matmul`` every
     entry reads as nonzero and the inverse silently loses exactly the sparsity the split was chosen
-    for.  Measured on the plate elements as one spurious nonzero per row (morley's symbolic ``P(T)``
-    15 against a numeric truth of 12).  Both halves are asserted: the STRUCTURE, and that the
-    structure is not bought with a wrong value."""
+    for: one spurious nonzero per row, 15 against a numeric truth of 12 here.  Both halves are
+    asserted: the STRUCTURE, and that the structure is not bought with a wrong value."""
     from polyarray.schur import _approx_zero
     M = _sparse_block_lower("schur_sparse6")
     inv = symbolic_inverse(M)
@@ -141,9 +151,22 @@ def test_schur_combine_keeps_the_products_structural_zeros():
     assert np.allclose(got @ Mn, np.eye(6), atol=1e-9)
 
 
-def _dense_block(name, n):
+def _dense_block(name: str, n: int) -> SymArray:
     """A program-carrying DENSE ``n×n`` symbolic block — no structural zero anywhere, so ``_invert``
-    exhausts both splits and falls through to ``_base_inverse``."""
+    exhausts both splits and falls through to ``_base_inverse``.
+
+    Parameters
+    ----------
+    name
+        Name of the carried program.
+    n
+        The block size.
+
+    Returns
+    -------
+    SymArray
+        The dense block, riding a program with one ``vertex`` feed input.
+    """
     prog = Program(name, inputs=[SymInput("v", (n * n,), Provenance("vertex", "v", (), "v"))])
     v = prog.input("v")
     cells = np.empty((n, n), dtype=object)
@@ -154,15 +177,15 @@ def _dense_block(name, n):
 
 
 @pytest.mark.parametrize("n,defers", [(2, False), (3, False), (4, True)])
-def test_small_dense_blocks_invert_inline_large_ones_defer(n, defers):
+def test_small_dense_blocks_invert_inline_large_ones_defer(n: int, defers: bool) -> None:
     """``_DEFER_INVERSE = 4``: a dense symbolic block of 2 or 3 is inverted EXACTLY (closed-form
     ``cofactor_inverse``, cells stay ``RationalFunction``s), 4 and above defer to a numeric ``InvOp``.
 
     Why the boundary sits there: a deferred inverse's output cells are FRESH ATOMS, opaque to the exact
-    fold and to ``_approx_zero``, so a ``P(T)`` built over one is not closed-form. ≤3×3 buys the whole
-    thing back for a bounded degree rise (measured on the plate elements: every ``InvOp`` gone, 3/6/6 →
-    0, monomial mass +11%/+48%/+34%, sparsity and wall time unchanged). Both halves are asserted — the
-    MECHANISM (did an ``InvOp`` get emitted?) and that it still inverts."""
+    fold and to ``_approx_zero``, so an inverse built over one is not closed-form. ≤3×3 buys the whole
+    thing back for a bounded cost — no ``InvOp`` left at all, monomial mass up by a tenth to a half,
+    sparsity and wall time unchanged. Both halves are asserted — the MECHANISM (did an ``InvOp`` get
+    emitted?) and that it still inverts."""
     from polyarray import InvOp
     M = _dense_block(f"dense{n}", n)
     inv = symbolic_inverse(M)

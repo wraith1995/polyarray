@@ -1229,9 +1229,23 @@ def symarray_atoms(sa: SymArray) -> set:
 
 
 def _symarray_atoms(sa: SymArray) -> set:
-    """The run-time binding-key atoms a SymArray's VALUE depends on: its bulk name, or its
-    cells' RationalFunction generators (the keys ``SymArray.evaluate`` resolves).
+    """The run-time binding-key atoms a SymArray's VALUE depends on.
 
+    Its bulk name, or its cells' RationalFunction generators (the keys ``SymArray.evaluate``
+    resolves).
+
+    Parameters
+    ----------
+    sa
+        The array to read.
+
+    Returns
+    -------
+    set
+        The binding keys the value varies with.  Empty when nothing outside the array is read.
+
+    Notes
+    -----
     ⚠ ``RationalFunction.gens`` is the generator list of the cell's **ring**, not the set of
     generators the cell's value actually varies with.  A cell of total degree zero in every
     generator — ``is_constant()``, or the zero polynomial, for which ``is_constant()`` is
@@ -1239,10 +1253,11 @@ def _symarray_atoms(sa: SymArray) -> set:
     value under every binding, so it reads none of its ring's generators and contributes no
     atom.  Both tests are exact and structural (a total-degree test on the numerator and
     denominator), never a sample, so excluding such a cell removes atoms the value PROVABLY
-    does not depend on: strictly more precise, and never a claim of independence we cannot
-    prove.  Without this, a constant that merely rides on a ring built around a ``vertex`` /
+    does not depend on: strictly more precise, and never a claim of independence that cannot be
+    proved.  Without it, a constant that merely rides on a ring built around a ``vertex`` /
     ``point`` feed reads as feed-dependent, and every dependency question downstream —
-    :func:`is_structurally_constant` above all — answers conservatively wrong."""
+    :func:`is_structurally_constant` above all — answers conservatively wrong.
+    """
     bulk = getattr(sa, "_bulk", None)
     if bulk is not None:
         return {bulk.name}

@@ -788,9 +788,9 @@ def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
         # depth 16 vs a 1000 limit), but a fingerprint must never be the thing that kills a
         # compile that would otherwise succeed — refuse and emit the def uninterned.
         if isinstance(exc, _FpTooLarge):
-            # SIZE is the other axis of that same rule, and it is the one that actually bit: a
-            # helper too big to walk is announced, because an uninterned def is a real (if small)
-            # cost and a body this size is usually a symptom upstream, not a fact of life.
+            # SIZE is the other axis of that same rule. A helper too big to walk is ANNOUNCED,
+            # because an uninterned def is a real (if small) cost and a body this size is usually a
+            # symptom upstream, not a fact of life.
             warnings.warn(
                 f"pyab: helper body exceeds the {_FP_MAX_NODES} node fingerprint budget — emitting "
                 "it UNINTERNED (correct, but duplicate helpers are no longer deduplicated). A body "
@@ -804,10 +804,9 @@ def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
 #:
 #: A fingerprint exists ONLY to intern a helper, so — exactly as with the ``RecursionError`` guard
 #: above — it must never be the thing that makes a compile fail or hang. That guard bounds DEPTH;
-#: this bounds SIZE, which is the axis that actually bit. Measured: Bell's world-reduced value
-#: kernel produced a body whose walk ran 11 min at 6.2 GB before a timeout killed the whole pytest
-#: process, while every other element's helper fingerprints in milliseconds. Refusing costs a
-#: duplicate helper; not refusing costs the build.
+#: this bounds SIZE. A helper whose body fits the budget fingerprints in milliseconds; one an order
+#: of magnitude past it takes minutes and gigabytes, which is a hang, not a slow path. Refusing
+#: costs a duplicate helper; not refusing costs the build.
 _FP_MAX_NODES = 2_000_000
 
 

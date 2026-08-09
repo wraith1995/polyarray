@@ -15,6 +15,7 @@ WARNS wherever a certificate is issued non-exactly.  These tests pin:
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -650,9 +651,24 @@ class _NonNormalizable:
         return np.asarray(x, dtype=float) * 3.0 + 1.0
 
 
-def _call_with_zero_and_opaque(fn_of_body, body: Program) -> tuple[Program, int]:
-    """An outer program whose LAST statement applies ``fn_of_body(body)`` to
-    ``(an exactly-zero constant, an UNRESOLVED value)``. Returns ``(program, stmt_idx)``."""
+def _call_with_zero_and_opaque(
+    fn_of_body: Callable[[Program], object], body: Program,
+) -> tuple[Program, int]:
+    """An outer program whose LAST statement applies ``fn_of_body(body)`` to an exactly-zero
+    constant and an UNRESOLVED value.
+
+    Parameters
+    ----------
+    fn_of_body
+        Wraps ``body`` into the ``Stmt.fn`` to apply (a ``CallOp``, a vmap closure, …).
+    body
+        The sub-program the statement calls.
+
+    Returns
+    -------
+    tuple[Program, int]
+        The outer program and the index of that statement.
+    """
     from polyarray.ir import Const
 
     outer = Program("outer", inputs=[SymInput("x", (1,), _prov("x"))])
@@ -682,8 +698,8 @@ def test_zero_operand_never_invents_a_value_for_a_sub_program() -> None:
     """A `CallOp(Program)` tolerates an unresolved operand for LIVENESS — never for a zero.
 
     `CallOp` IS a builtin op, so a zero short-circuit guarded by `is_builtin_op` alone fires here and
-    fabricates the unresolved operand as zero: `u + v` with `u = 0` and `v` unresolved certified `0`
-    where the true value is `v`. The guard must be MULTILINEARITY (`_zero_absorbing`)."""
+    fabricates the unresolved operand as zero: `u + v` with `u = 0` and `v` unresolved would certify
+    `0` where the true value is `v`. The guard must be MULTILINEARITY (`_zero_absorbing`)."""
     from polyarray.ir import CallOp
     from polyarray.exact_fold import exact_partial_eval
 
@@ -705,7 +721,8 @@ def test_sub_program_still_resolves_when_the_unresolved_operand_is_dead() -> Non
     assert idx not in st.unresolved, f"a DEAD operand should not block the body: {st.unresolved}"
 
 
-def _vmap_of(body: Program):
+def _vmap_of(body: Program) -> object:
+    """``body`` wrapped as a batched ``CallOp`` over a vmap closure, batching both operands."""
     from polyarray.ir import CallOp, vmap
     return CallOp(fn=vmap(body, in_axes=(0, 0), out_axes=0))
 
@@ -728,8 +745,8 @@ def test_vmap_closure_descends_when_the_unresolved_operand_is_dead() -> None:
     """The liveness argument reaches INSIDE a vmap closure: the unresolved operand is handed to
     every slice unresolved, and a body that never reads it still resolves.
 
-    (Measured on the plate elements: bell/argyris stop at exactly these `CallOp`-over-`llam:vmap`
-    statements, and refusing them kept 100 statements per element on the probe lane.)"""
+    A `CallOp` over a vmap closure is where a derivative-DOF lane's programs stall, so refusing
+    them leaves a hundred statements an element unresolved on the probe lane."""
     from polyarray.exact_fold import exact_partial_eval
 
     prog, idx = _batched_call(_dead_v_body())
