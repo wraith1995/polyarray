@@ -2729,11 +2729,11 @@ def runtime_einsum_multi(
 
 
 def freeze_array_bulk(
-    arr: np.ndarray,
+    arr: np.ndarray | SymArray,
     *,
     program: Program | None,
     name: str = "frozen",
-) -> np.ndarray:
+) -> np.ndarray | SymArray:
     """Bulk variant: emit a single :class:`Stmt` for the whole tensor.
 
     Equivalent in run-time semantics to :func:`freeze_array` but
@@ -2748,21 +2748,39 @@ def freeze_array_bulk(
     Numeric / no-program / float-dtype arrays pass through unchanged.
     Budget-zero (``budget.freeze`` False) disables freezing — the cells stay
     symbolic (retained) rather than being captured as fresh atoms.
+
+    CARRIER-PRESERVING.  A :class:`SymArray` in gives a ``SymArray``
+    back (riding ``program``); a raw ndarray in gives cells back, as
+    before.  So a caller that already threads a ``SymArray`` never has
+    to unwrap ``.cells`` to freeze it — that unwrap drops the owning
+    ``Program`` and is exactly what the ``SYM-CELLS-UNWRAP`` rule
+    forbids in the consumer repos.  A ``SymArray`` riding a
+    *different* program is REFUSED rather than silently re-homed:
+    its cells may name that program's Stmt outputs, and relabelling
+    them onto ``program`` strands the Stmts that produce them (the
+    "generator has no binding" failure).  Use :meth:`Program.graft`
+    first, which brings those Stmts along.
     """
     if program is None or not program.budget.freeze:
         return arr
-    arr = np.asarray(arr)
-    if arr.dtype != object:
-        return arr
-    sa = SymArray(arr, program=program)
+    sym_in = isinstance(arr, SymArray)
+    if isinstance(arr, SymArray) and arr.program is not None and arr.program is not program:
+        raise ValueError(
+            "freeze_array_bulk: `arr` rides a different Program — freezing would re-home its "
+            "cells and strand the Stmts producing their generators. Bring it over with "
+            "`program.graft(arr)` first.")
+    cells = np.asarray(arr)
+    if cells.dtype != object:
+        return arr if sym_in else cells
+    sa = SymArray(cells, program=program)
     [intermediate] = program.emit_stmt(
         IdentityOp(),
         [sa],
-        [OutSpec(name, arr.shape)],
+        [OutSpec(name, cells.shape)],
         note=f"freeze_bulk_{name}",
         bulk=False,  # freeze materialises by design — bulk would be churn
     )
-    return np.asarray(intermediate.cells)
+    return intermediate if sym_in else np.asarray(intermediate.cells)
 
 
 def freeze_array(
