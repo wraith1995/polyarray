@@ -510,8 +510,15 @@ keep their target dependency **out of `import polyarray`** (front-end ops are
 supplied by the caller, never imported by polyarray):
 
 - `numpy_source.to_numpy_source(program, func_name="f", op_renderers=None)` —
-  a standalone numpy `.py` source string. Front-end Stmt ops emit via
-  `op_renderers` keyed by op class name.
+  a standalone numpy `.py` source string. The emitted function takes one
+  parameter per program input, one per `IntAtom`, and one per **free feed atom**
+  (a cell generator bound by neither an input nor a statement output — savo's
+  per-cell vertex atoms in a mid-pipeline program are the case; appended last in
+  sorted generator-name order, and threaded into sub-`Program`/`vmap` bodies that
+  are open over them). Front-end Stmt ops emit via a `__numpy_source__(self,
+  args) -> str` hook on the op class — the same shape as pyab's
+  `__pyab_lower__`, discovered without any threading — or via `op_renderers`
+  keyed by op class name, which takes precedence over the hook.
 - `pyab` — lower a `Program` to **PyArrayBackend IR** (torch-compilable).
   Requires `pyarraybackend` (imported lazily); `torch` only when compiling
   through the torch backend. Public surface:

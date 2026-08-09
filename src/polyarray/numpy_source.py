@@ -3,10 +3,10 @@
 A :class:`polyarray.Program` (built e.g. by grassmann's ``G.compile(term)``)
 can be *run* (:meth:`Program.run`) but not serialised to a readable numpy
 module.  :func:`to_numpy_source` walks the program and emits a self-contained
-function — one parameter per program input (named by the input name), each
-statement lowered to the numpy call its typed op models, and the output(s)
-assembled from their :class:`RationalFunction` cells — shaped like
-matrixcalculus.org's output::
+function — one parameter per program input (named by the input name) and one
+per *free feed atom* (see below), each statement lowered to the numpy call its
+typed op models, and the output(s) assembled from their
+:class:`RationalFunction` cells — shaped like matrixcalculus.org's output::
 
     import numpy as np
 
@@ -24,25 +24,44 @@ runtime ``RationalFunction`` evaluator.
 
 The generated module depends on ``numpy`` only.
 
+Free feed atoms become parameters
+---------------------------------
+A cell's :class:`RationalFunction` generators are normally bound either by a
+declared program input or by an earlier statement's output.  A program may also
+be *open* over generators that are neither: a free FEED atom, such as savo's
+per-cell vertex atoms ``V_j_k``, carried symbolically through a mid-pipeline
+program that has not yet declared them.  These are exactly the program's free
+variables, and they render as further **parameters** of the generated function,
+appended after the declared inputs in sorted generator-name order.  A
+sub-:class:`Program` / ``vmap`` body open over such an atom gains the same
+trailing parameters, and every call site passes the enclosing scope's
+expression for them — so the closure is made explicit rather than dangling.
+
 Extending to non-polyarray ops
 ------------------------------
 polyarray's own typed ops (``DetOp``/``EinsumStmtOp``/…) are covered by the
 built-in registry.  Front-ends that lower onto polyarray with their *own* Stmt
-ops (e.g. grassmann's ``_AxisLenOp``) pass an ``op_renderers`` mapping keyed by
-the op class name to :func:`to_numpy_source` — keeping polyarray free of any
-dependency on the front-end.  An op with no renderer raises a clear
-``NotImplementedError`` naming the op.
+ops (e.g. grassmann's ``_AxisLenOp``) either give the op class a
+``__numpy_source__`` hook (below — the canonical route) or pass an
+``op_renderers`` mapping keyed by the op class name to :func:`to_numpy_source`
+— keeping polyarray free of any dependency on the front-end.  An op with
+neither raises a clear ``NotImplementedError`` naming the op.
 
-Plain-callable Stmt fns: the ``__numpy_source__`` emit hook
------------------------------------------------------------
-A ``Stmt.fn`` may also be a *plain Python callable* that is neither an op class,
-a sub-:class:`Program`, nor a ``vmap`` closure (e.g. a producer's
-``lambda *arrs: np.einsum(spec, *arrs)``).  Such a fn emits **iff** it carries a
+The ``__numpy_source__`` emit hook
+----------------------------------
+A ``Stmt.fn`` — an op instance, or a *plain Python callable* that is neither an
+op class, a sub-:class:`Program`, nor a ``vmap`` closure (e.g. a producer's
+``lambda *arrs: np.einsum(spec, *arrs)``) — emits **iff** the built-in registry
+and ``op_renderers`` do not cover it and it carries a
 ``__numpy_source__(args) -> str`` attribute: a callable taking the list of
 already-rendered argument-expression strings (in operand order) and returning a
 single numpy *expression string* (written in terms of ``np`` and those arg
-exprs).  Producers opt a plain-callable Stmt into emission by stamping
-``fn.__numpy_source__``; a plain fn with no such hook still raises the clear
+exprs).  A front-end op defines it as a method on its class (``self`` is the
+op), exactly as it defines ``__pyab_lower__`` for :mod:`polyarray.pyab`;
+producers opt a plain-callable Stmt in by stamping ``fn.__numpy_source__``.
+The hook is consulted LAST, so an explicit ``op_renderers`` entry and the
+built-in vocabulary both take precedence over it and no stray hook can shadow a
+canonical rendering.  A fn with no hook still raises the clear
 ``NotImplementedError``.  This keeps the protocol additive and polyarray free of
 any front-end dependency.
 """
@@ -157,6 +176,10 @@ class _HelperRegistry:
     def __init__(self) -> None:
         self.helpers: dict[int, str] = {}   # id(obj) -> function name
         self.defs: list[list[str]] = []     # ordered list of def line-blocks
+        # function name -> the free feed-atom generator names it takes as TRAILING
+        # parameters, after its positional operands.  Every call site of that helper
+        # appends the enclosing scope's expression for each, in this order.
+        self.free: dict[str, tuple[str, ...]] = {}
         self._counter = 0
 
     def fresh(self, stem: str) -> str:
@@ -181,6 +204,30 @@ def _safe_param_name(name: str) -> str:
     if not sane or not sane[0].isalpha() and sane[0] != "_":
         sane = "_" + sane
     return "p_" + sane if keyword.iskeyword(sane) else sane
+
+
+def _free_param_name(gen: str, used: set[str]) -> str:
+    """Return a readable, unused parameter identifier for the free generator ``gen``.
+
+    Parameters
+    ----------
+    gen
+        The unbound :class:`RationalFunction` generator name (e.g. a vertex atom ``V_0_0``).
+    used
+        Identifiers already taken in the emitted scope.
+
+    Returns
+    -------
+    str
+        An identifier derived from ``gen``, kept clear of the emitter's own underscore-prefixed
+        temporaries (``_t*`` / ``_sub*`` / ``_vmap*`` / ``_g*``) and of ``used``.
+    """
+    name = _safe_param_name(gen)
+    if name.startswith("_"):
+        name = "g" + name
+    while name in used:
+        name += "_"
+    return name
 
 
 def _index_suffix(idx: tuple[int, ...]) -> str:
@@ -214,6 +261,10 @@ class _Emitter:
         self.lines: list[str] = []
         # generator-name -> Python scalar expression producing its value.
         self.genmap: dict[str, str] = {}
+        # FREE feed atoms: generator-name -> the parameter identifier standing for it.
+        # Filled on demand by ``_gen_expr`` when a generator is bound by neither a declared
+        # input nor an earlier statement output; emitted as trailing parameters of this scope.
+        self.free_gens: dict[str, str] = {}
         # bulk binding-name -> Python variable holding the whole tensor.
         self.bulkmap: dict[str, str] = {}
         # (stmt_idx, out_idx) -> Python variable (for OutputRef).
@@ -231,8 +282,11 @@ class _Emitter:
         for stmt_idx, stmt in enumerate(self.prog.statements):
             body.extend(self._emit_stmt(stmt_idx, stmt))
         body.extend(self._emit_outputs())
+        # The free feed atoms discovered while emitting the body join the signature — hence
+        # built here, after it.
+        free = self._free_params()
 
-        sig = f"def {self.func_name}({', '.join(params)}):"
+        sig = f"def {self.func_name}({', '.join(params + free)}):"
         src = ["import numpy as np", ""]
         # Helper defs (sub-Program / vmap bodies) accumulated while emitting
         # the body above; emitted module-level, before the entrypoint.
@@ -240,10 +294,54 @@ class _Emitter:
             src.extend(block)
             src.append("")
         src.append(sig)
-        src.append('    """Generated from polyarray Program '
-                   f'{self.prog.name!r} by to_numpy_source."""')
+        doc = ('    """Generated from polyarray Program '
+               f'{self.prog.name!r} by to_numpy_source.')
+        if free:
+            doc += ("\n\n    Free feed atoms (bound by no input and no statement) are the "
+                    f"trailing parameters: {', '.join(self._free_names())}.\n    ")
+        src.append(doc + '"""')
         src.extend("    " + ln if ln else "" for ln in body)
         return "\n".join(src) + "\n"
+
+    # -- free feed atoms ------------------------------------------------
+
+    def _free_names(self) -> tuple[str, ...]:
+        """The free generator names of this scope, in the emitted parameter order (sorted)."""
+        return tuple(sorted(self.free_gens))
+
+    def _free_params(self) -> list[str]:
+        """The parameter identifiers standing for this scope's free generators, in that order."""
+        return [self.free_gens[g] for g in self._free_names()]
+
+    def _gen_expr(self, gen: str) -> str:
+        """Return the Python expression for generator ``gen``, minting a parameter if it is free.
+
+        Parameters
+        ----------
+        gen
+            A :class:`RationalFunction` generator name.
+
+        Returns
+        -------
+        str
+            The bound expression when an input or an earlier statement output produces ``gen``;
+            otherwise the parameter identifier this scope now takes it as.
+        """
+        bound = self.genmap.get(gen)
+        if bound is not None:
+            return bound
+        existing = self.free_gens.get(gen)
+        if existing is not None:
+            return existing
+        used = set(self.param.values()) | set(self.free_gens.values()) | {"np"}
+        p = _free_param_name(gen, used)
+        self.free_gens[gen] = p
+        return p
+
+    def _call_args(self, helper: str, args: list[str]) -> str:
+        """Render a helper call's argument list: the operands, then its free feed atoms."""
+        extra = [self._gen_expr(g) for g in self.registry.free.get(helper, ())]
+        return ", ".join(args + extra)
 
     # -- nested-program helper emission ---------------------------------
 
@@ -252,7 +350,8 @@ class _Emitter:
 
         Reproduces :meth:`Program._run_stmt`'s sub-Program dispatch: the
         helper takes one positional parameter per body input (in declaration
-        order) and returns the body outputs in insertion order — a bare value
+        order), then one per free feed atom the body turns out to be open over,
+        and returns the body outputs in insertion order — a bare value
         for a single output, else a tuple.  Deduplicated by identity, so a
         shared body is emitted once and recursion terminates.
         """
@@ -264,14 +363,16 @@ class _Emitter:
         self.registry.helpers[key] = name  # reserve before recursing
         sub = _Emitter(prog, name, self.extra_renderers, registry=self.registry)
         self.registry.defs.append(sub._emit_helper_lines())
+        self.registry.free[name] = sub._free_names()
         return name
 
     def _emit_helper_lines(self) -> list[str]:
         """Build this program's lines as a module-level helper def block.
 
         Like :meth:`emit` but: no ``import`` line, parameters are the body
-        inputs only (positional, matching ``_run_stmt``'s operand→input map),
-        and the helper returns the outputs rather than being an entrypoint.
+        inputs (positional, matching ``_run_stmt``'s operand→input map) followed
+        by this body's free feed atoms, and the helper returns the outputs
+        rather than being an entrypoint.
         """
         params = self._collect_helper_params()
         self._bind_inputs()
@@ -279,7 +380,8 @@ class _Emitter:
         for stmt_idx, stmt in enumerate(self.prog.statements):
             body.extend(self._emit_stmt(stmt_idx, stmt))
         body.extend(self._emit_outputs())
-        lines = [f"def {self.func_name}({', '.join(params)}):"]
+        free = self._free_params()
+        lines = [f"def {self.func_name}({', '.join(params + free)}):"]
         lines.append('    """Sub-Program/vmap body '
                      f'{self.prog.name!r} from to_numpy_source."""')
         lines.extend("    " + ln if ln else "" for ln in body)
@@ -408,24 +510,26 @@ class _Emitter:
         # body inputs by position; outputs in insertion order).
         if isinstance(fn, Program):
             helper = self._emit_program_helper(fn)
-            return f"{helper}({', '.join(args)})"
+            return f"{helper}({self._call_args(helper, args)})"
         # A ``vmap(body)`` closure Stmt fn: batch the body over its axes.
         if _vmap_body_of(fn) is not None:
             helper = self._emit_vmap_helper(fn)
-            return f"{helper}({', '.join(args)})"
-        # A plain Python callable Stmt fn (not an op class, Program, or vmap
-        # closure) emits IFF it carries an ``__numpy_source__(args)->str`` hook:
-        # the producer stamps ``fn.__numpy_source__`` with a callable taking the
-        # already-rendered arg-expression strings and returning a numpy
-        # expression string (in terms of ``np`` and those arg exprs). This lets
-        # any front-end opt a plain-callable Stmt into emission without polyarray
-        # importing it. Hookless plain-fn Stmts fall through to the raise below.
+            return f"{helper}({self._call_args(helper, args)})"
+        # Op-carried emit hook (the sanctioned twin of pyab's ``__pyab_lower__``): a front-end
+        # op above polyarray defines ``__numpy_source__(self, args) -> str`` on its class, and a
+        # producer stamps the same attribute on a plain-callable Stmt fn. Either way it takes the
+        # already-rendered arg-expression strings and returns a numpy expression string (in terms
+        # of ``np`` and those arg exprs), so a front end opts into emission without polyarray
+        # importing it. Consulted LAST — after the explicit ``op_renderers`` override, the builtin
+        # vocabulary, and the CallOp/Program/vmap-closure unwraps — so no stray hook can shadow a
+        # canonical rendering. Hookless fns fall through to the raise below.
         hook = getattr(fn, "__numpy_source__", None)
         if callable(hook):
             return hook(args)
         raise NotImplementedError(
             f"to_numpy_source: no renderer for op {type(fn).__name__!r}. "
-            "Pass op_renderers={'"
+            f"Define ``{type(fn).__name__}.__numpy_source__(self, args)`` on the op's class "
+            "(the canonical op-carried hook), or pass op_renderers={'"
             f"{type(fn).__name__}': lambda op, args: ...}} to emit it."
         )
 
@@ -436,6 +540,9 @@ class _Emitter:
         (``in_axes[i] != None``) is sliced along its normalised axis at index
         ``i``; ``None`` operands are broadcast unchanged; the body runs once
         per slice and outputs are ``np.stack``-ed along ``out_axes``.
+
+        Free feed atoms the body is open over are forwarded: they become trailing
+        parameters of this helper too, passed unbatched to every per-slice call.
         """
         key = id(fn)
         existing = self.registry.helpers.get(key)
@@ -461,8 +568,11 @@ class _Emitter:
         n_in = len(body.inputs)
         n_out = len(body.outputs)
         params = [f"a{i}" for i in range(n_in)]
+        atoms = self.registry.free.get(body_helper, ())
+        atom_params = [f"_ga{i}" for i in range(len(atoms))]
+        self.registry.free[name] = atoms
         L = "    "
-        block: list[str] = [f"def {name}({', '.join(params)}):"]
+        block: list[str] = [f"def {name}({', '.join(params + atom_params)}):"]
         block.append(L + '"""vmap('
                      f'{body.name!r}) batched body from to_numpy_source."""')
         block.append(L + f"_arrs = [np.asarray(a) for a in ({', '.join(params)}"
@@ -487,7 +597,8 @@ class _Emitter:
         block.append(L + "            _idx = [slice(None)] * _a.ndim")
         block.append(L + "            _idx[_ax] = _i")
         block.append(L + "            _sv.append(_a[tuple(_idx)])")
-        block.append(L + f"    _per.append({body_helper}(*_sv))")
+        fwd = "".join(", " + p for p in atom_params)
+        block.append(L + f"    _per.append({body_helper}(*_sv{fwd}))")
         if n_out == 1:
             block.append(L + f"return np.stack(_per, axis={out_axes[0]!r})")
         else:
@@ -503,7 +614,10 @@ class _Emitter:
         """Emit a MULTI-var nested vmap (the antisymmetrizer's k-bound-var ``LLam`` lowering) as a
         helper: loop the cartesian product of the ``n_vars`` basis-index axes, run the per-slice
         body, stack into ``(*var_sizes, *cod)``, then move the var axes AFTER the cod axes — exactly
-        mirroring grassmann's ``_nested_vmap`` runtime closure."""
+        mirroring grassmann's ``_nested_vmap`` runtime closure.
+
+        As in :meth:`_emit_vmap_helper`, free feed atoms the body is open over are forwarded as
+        trailing parameters, passed unbatched to every per-slice call."""
         key = id(fn)
         existing = self.registry.helpers.get(key)
         if existing is not None:
@@ -514,8 +628,11 @@ class _Emitter:
         name = self.registry.fresh("vmapnest")
         self.registry.helpers[key] = name
         params = [f"a{i}" for i in range(n_vars + n_free)]
+        atoms = self.registry.free.get(body_helper, ())
+        atom_params = [f"_ga{i}" for i in range(len(atoms))]
+        self.registry.free[name] = atoms
         L = "    "
-        b = [f"def {name}({', '.join(params)}):"]
+        b = [f"def {name}({', '.join(params + atom_params)}):"]
         b.append(L + f'"""nested vmap({body.name!r}) — {n_vars} bound vars — from to_numpy_source."""')
         b.append(L + "import itertools as _it")
         b.append(L + f"_eyes = [np.asarray(a) for a in ({', '.join(params[:n_vars])},)]")
@@ -526,7 +643,8 @@ class _Emitter:
         b.append(L + "_grid = {}")
         b.append(L + "for _c in _it.product(*[range(s) for s in _sizes]):")
         b.append(L + "    _sv = [_eyes[_v][_c[_v]] for _v in range(len(_eyes))] + _free")
-        b.append(L + f"    _grid[_c] = np.asarray({body_helper}(*_sv))")
+        fwd = "".join(", " + p for p in atom_params)
+        b.append(L + f"    _grid[_c] = np.asarray({body_helper}(*_sv{fwd}))")
         b.append(L + "_cod = next(iter(_grid.values())).shape")
         b.append(L + "_full = np.empty(tuple(_sizes) + _cod, dtype=float)")
         b.append(L + "for _c, _r in _grid.items(): _full[_c] = _r")
@@ -562,14 +680,9 @@ class _Emitter:
 
     def _rf_expr(self, rf: RationalFunction) -> str:
         names = _ring_names(rf._ring)
-        var_exprs: list[str] = []
-        for n in names:
-            if n not in self.genmap:
-                raise KeyError(
-                    f"to_numpy_source: generator {n!r} has no binding "
-                    "(is it produced before it is consumed?)"
-                )
-            var_exprs.append("(" + self.genmap[n] + ")")
+        # A generator bound by no input and no earlier statement output is a FREE feed atom;
+        # ``_gen_expr`` makes it a parameter of this scope rather than a dead end.
+        var_exprs = ["(" + self._gen_expr(n) + ")" for n in names]
         num = _poly_to_pyexpr(rf.num, names, var_exprs)
         if rf.den == rf._ring.one:
             return num
@@ -894,15 +1007,19 @@ def to_numpy_source(
 
     The returned string defines ``import numpy as np`` and a function
     ``func_name`` taking one positional parameter per program input (named by
-    the input name) plus one per declared ``IntAtom``, computing every Stmt in
+    the input name), one per declared ``IntAtom``, and one per FREE feed atom
+    (a cell generator bound by neither an input nor a statement output —
+    appended last, in sorted generator-name order), computing every Stmt in
     order, and returning the program output(s) — a single array when there is
     one output, else a tuple in declaration order.  ``exec``-ing the string and
-    calling the function reproduces ``program.run(values)`` for the same inputs.
+    calling the function reproduces ``program.run(values)`` for the same inputs
+    — plus, for an open program, a value per free feed atom.
 
     ``op_renderers`` maps an op *class name* to a renderer
     ``(op, arg_exprs) -> python_expression_str`` so that front-ends with their
     own Stmt ops (e.g. grassmann's ``_AxisLenOp``) can be emitted without
-    polyarray depending on them.  An op with neither a built-in nor a supplied
-    renderer raises :class:`NotImplementedError` naming the op.
+    polyarray depending on them; it takes precedence over the op's own
+    ``__numpy_source__`` hook.  An op with no built-in renderer, no supplied
+    renderer and no hook raises :class:`NotImplementedError` naming the op.
     """
     return _Emitter(program, func_name, op_renderers).emit()
