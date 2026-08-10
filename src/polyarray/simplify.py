@@ -53,6 +53,7 @@ from .ir import (
     StmtOp,
     SymArray,
     SymArrayRef,
+    VmapClosure,
     WhileOp,
     is_dynamic,
 )
@@ -618,6 +619,7 @@ def _fold_vmap_body(
     if info is None or depth >= _MAX_DESCENT_DEPTH:
         return fn, None
     closure, rewrap = info
+    assert isinstance(closure, VmapClosure)
     body = closure._vmap_body
     if id(body) in seen:
         return fn, None  # cycle guard

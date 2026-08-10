@@ -1,28 +1,31 @@
 # mypy after the docs/typing sweep
 
 Replacing `Any` with real types removed the silencer mypy had been running
-under, so the error count moved from 52 to 1422. The two populations are very
-different and should be read separately.
+under. The count moved 52 → 1422, then back down as the causes were fixed:
 
-**1282 errors — union fan-out over 28 source lines.** Every one is
-`union-attr`: a site that dispatches on `type(fn).__name__` and then reads an
-op-specific attribute (`fn.spec`, `fn._vmap_body`, `fn._nested_n_vars`). `StmtOp`
-is a 56-member union, and mypy reports one error per member per access, so 28
-lines produce 1282 messages. Nothing here is a new defect; the annotation is
-accurate and the code is unchanged.
+| after | errors | what changed |
+|---|---|---|
+| the sweep | 1422 | `Any` no longer hides anything |
+| `batch.py` dispatch by `isinstance` | 580 | twelve name-dispatch lines, each fanning out over a 56-member union |
+| `VmapClosure` / `NestedVmapClosure` protocols | 168 | four `getattr`-probed closures, narrowed once instead |
 
-These sites are also the string-typed dispatch the workspace rules forbid
-(`fem/CLAUDE.md` rule 3). Converting them to `isinstance` would both satisfy
-mypy and satisfy the rule — but `batch.py`'s dispatch table deliberately covers
-some *front-end* op names that this layer must not import, so the conversion is
-not mechanical and is left for the maintainer to direct. The sites:
+The 168 that remain are genuine type findings, not fan-out: an `npt.ArrayLike`
+passed where an `np.ndarray` is required, a `Program | None` dereferenced
+without a guard, a `Callable` slot assigned something narrower. None is a known
+live bug — each is a place where the code relies on an invariant its signature
+does not state — but each is worth reading.
 
-    python -m mypy 2>&1 | grep union-attr | cut -d: -f1,2 | sort -u
+    python -m mypy 2>&1 | grep -oE '\[[a-z-]+\]$' | sort | uniq -c | sort -rn
 
-**140 errors — genuine type findings.** Real looseness the `Any` annotations
-were hiding: `Program | None` dereferenced without a guard, `int | DimAtom`
-passed to `int()`, `Mapping[str, float]` fed a value that may be an ndarray.
-None is known to be a live bug — each is a place where the code relies on an
-invariant the signature does not state — but each is worth reading.
+## What the dispatch conversion was
 
-    python -m mypy 2>&1 | grep error | grep -v union-attr
+`batch._apply` compared `type(fn).__name__` against strings — the string-typed
+dispatch `fem/CLAUDE.md` rule 3 forbids, and the reason seven rules once sat
+dead for a year while `batched_run` silently fell back to the per-element loop.
+
+Converting to `isinstance` is behaviour-preserving here, verified rather than
+assumed: every dispatched name is one of polyarray's own ops, and no class in
+grassmann, chartlib, pointwise, savo or oracle shares one of those names. It is
+also strictly safer — a front end that later defines its own `ScaleOp` is no
+longer mistaken for the builtin, and a misspelled class is now an ImportError
+rather than a rule that never fires.
