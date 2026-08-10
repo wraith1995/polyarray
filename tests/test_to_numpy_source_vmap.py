@@ -21,9 +21,11 @@ from polyarray.ir import (
     Program,
     Provenance,
     SolveOp,
+    SymArray,
     SymInput,
     vmap,
 )
+from polyarray.rational import RationalFunction
 
 
 def _prov(label: str) -> Provenance:
@@ -255,3 +257,81 @@ def test_op_only_program_regression():
     rng = np.random.default_rng(5)
     values = {"A": _nonsingular(rng, (n, n))}
     _roundtrip(prog, values)
+
+
+# ---------------------------------------------------------------------------
+# 5. free feed atoms: a generator bound by no input and no statement output.
+# ---------------------------------------------------------------------------
+
+def test_free_feed_atom_becomes_a_trailing_parameter():
+    """An open program (a free vertex-style atom in its cells) renders as a function of it.
+
+    The mid-pipeline programs savo hands the observability dump carry per-cell vertex atoms
+    ``V_j_k`` that no input declares yet; they are the program's free variables, so the emitted
+    function takes them as parameters after the declared inputs, sorted by generator name.
+    ``Program.run`` binds the same atoms from an undeclared ``values`` entry, which is what makes
+    the two comparable.
+    """
+    prog = Program("open", inputs=[SymInput("A", (2, 2), _prov("A"))])
+    a = prog.input_arrays["A"].cells
+    cells = np.empty((2, 2), dtype=object)
+    cells[0, 0] = a[0, 0] + RationalFunction.atom("Vf_1")
+    cells[0, 1] = a[0, 1]
+    cells[1, 0] = a[1, 0]
+    cells[1, 1] = a[1, 1] + RationalFunction.atom("Vf_0")
+    (d,) = prog.emit_stmt(
+        DetOp(), [SymArray(cells, program=prog)], [OutSpec("d", ())], bulk=True
+    )
+    prog.add_output("result", d)
+
+    rng = np.random.default_rng(6)
+    A = rng.standard_normal((2, 2)) + 3.0 * np.eye(2)
+    v = rng.standard_normal(2)
+    src = pa.to_numpy_source(prog)
+    # Sorted generator-name order — Vf_0 before Vf_1, whatever order the cells mention them in.
+    assert "def f(A, Vf_0, Vf_1):" in src
+    ns: dict = {}
+    exec(compile(src, "<generated>", "exec"), ns)
+    got = ns["f"](A, v[0], v[1])
+    want = prog.run({"A": A, "Vf": v})["result"]
+    np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(got), np.linalg.det(A + np.diag(v[::-1])), rtol=1e-9, atol=1e-12
+    )
+
+
+def test_free_feed_atom_threads_through_a_vmap_body():
+    """A ``vmap`` body open over a free atom gains the same trailing parameter, passed at the call.
+
+    Without the threading the body's ``def`` would grow a parameter its call site never supplies.
+    The body is not runnable through ``Program.run`` (``_invoke`` maps operands to body inputs by
+    position and knows nothing of a free atom), so the reference here is the arithmetic itself.
+    """
+    n, M = 2, 3
+    body = Program("scale_body", inputs=[SymInput("x", (n,), _prov("x"))])
+    xc = body.input_arrays["x"].cells
+    out = np.empty((n,), dtype=object)
+    out[0] = xc[0] * RationalFunction.atom("Vf_0")
+    out[1] = xc[1] * RationalFunction.atom("Vf_1")
+    body.add_output("result", SymArray(out, program=body))
+
+    prog = Program("vmap_open", inputs=[SymInput("X", (M, n), _prov("X"))])
+    (o,) = prog.emit_stmt(
+        vmap(body, in_axes=(0,), out_axes=0),
+        [prog.input("X")],
+        [OutSpec("result", (M, n))],
+        bulk=True,
+    )
+    prog.add_output("result", o)
+
+    src = pa.to_numpy_source(prog)
+    assert "def f(X, Vf_0, Vf_1):" in src
+    assert "def _sub0(x, Vf_0, Vf_1):" in src
+    assert "_sub0(*_sv, _ga0, _ga1)" in src
+
+    rng = np.random.default_rng(7)
+    X = rng.standard_normal((M, n))
+    v = rng.standard_normal(n)
+    ns: dict = {}
+    exec(compile(src, "<generated>", "exec"), ns)
+    np.testing.assert_allclose(ns["f"](X, v[0], v[1]), X * v, rtol=1e-9, atol=1e-12)

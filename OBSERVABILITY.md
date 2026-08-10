@@ -114,6 +114,12 @@ The lowering stages hand their own directory to pyab (`CompileTrace.dump_dir_for
 `pyab.compile_torch(dump_dir=)`), so the symbolic snapshot and the code generated from it sit
 side by side. **One directory listing is the whole compile.**
 
+`program.py` is rendered with no `op_renderers` threading, so a front-end op appears there iff it
+carries a `__numpy_source__` hook (grassmann `_QrSignConventionOp`, chartlib `QrSignFixOp`, …); one
+that does not is written as a `# to_numpy_source failed:` note rather than breaking the compile.
+A mid-pipeline stage is usually *open* over savo's per-cell vertex atoms `V_j_k` — no input declares
+them yet — so they render as the trailing parameters of the emitted function.
+
 `detail.txt` is whatever the instrumented call site chose to describe. savo's `represent-matches`
 writes, per enumerated match: the IPTEM and host entity, each argument's binding and the grassmann
 **value basis** the body was represented consuming (`FieldInput.basis`), every geometry quantity

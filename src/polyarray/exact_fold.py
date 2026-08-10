@@ -115,6 +115,7 @@ from .ir import (
     SolveOp,
     SqrtOp,
     SqrtSpdOp,
+    DimAtom,
     Ref,
     Stmt,
     StmtFn,
@@ -541,6 +542,11 @@ class _Env:
     atom: dict[str, ExactCell] = field(default_factory=dict)
     bulk: dict[str, np.ndarray] = field(default_factory=dict)
     outs: dict[tuple[int, int], ExactValue] = field(default_factory=dict)
+    #: Atoms KNOWN to be unresolvable — a sub-program input bound to an OPAQUE operand
+    #: (:func:`_bind_body_inputs`).  Explicit rather than "absent from ``atom``", because an
+    #: absent generator is otherwise read as a FEED atom and left live, which would hand back a
+    #: value symbolically depending on an operand we never resolved.
+    opaque: set[str] = field(default_factory=set)
 
 
 def _resolve_rf(
@@ -558,6 +564,8 @@ def _resolve_rf(
     sub: dict[str, RationalFunction] = {}
     mass = _rf_mass(rf)
     for g in rf.gens:
+        if g in env.opaque:
+            return _OPAQUE                    # a body input bound to an unresolved operand
         if g in env.atom:
             v = env.atom[g]
             if isinstance(v, RationalFunction):
@@ -867,6 +875,202 @@ def _opaque(fn: StmtOp, reason: _Reason) -> None:
     return None
 
 
+def _is_exact_zero(val: ExactValue) -> bool:
+    """Report whether ``val`` is the exact zero array, every entry a syntactic zero of its own kind.
+
+    Exact, never a tolerance: a float cell must be ``0.0`` and a
+    :class:`~polyarray.rational.RationalFunction` cell must have a zero numerator
+    (:func:`_fe_is_zero`).
+
+    Parameters
+    ----------
+    val
+        A resolved operand value.  ``Any`` because an operand is whatever the lane resolved it to —
+        an ndarray of floats, an ndarray of cells, or the ``_OPAQUE`` sentinel.
+
+    Returns
+    -------
+    bool
+        ``True`` only when every entry is an exact zero.  An empty operand is not a zero (there is
+        nothing to be zero), and ``_OPAQUE`` is never a zero.
+    """
+    if val is _OPAQUE:
+        return False
+    arr = np.asarray(val)
+    if arr.size == 0:
+        return False
+    if arr.dtype.kind in ("f", "i", "u"):
+        return bool((arr == 0).all())
+    if arr.dtype != object:
+        return False
+    return all(_fe_is_zero(c) if isinstance(c, (RationalFunction, int, float, np.integer,
+                                                np.floating)) else False
+               for c in arr.reshape(-1))
+
+
+def _zero_absorbing(fn: StmtFn) -> bool:
+    """Report whether ``fn`` is multilinear in each operand.
+
+    Multilinearity is what makes one exactly-zero operand force
+    an exactly-zero result, whatever the other operands hold (even unresolved ones)?
+
+    This is the only shape of "reason about an op without all of its inputs" this lane admits, and
+    it is an identity rather than an inference: each output entry of a multilinear op is a sum of
+    products carrying exactly one factor from each operand, so a zero factor annihilates every
+    term.  It is emphatically NOT a blanket "zeros pass through opaque ops" — ``QrOp(0)`` is a
+    degenerate factorization, not zero, and every algebraic/order op below says so.
+
+    Parameters
+    ----------
+    fn
+        A builtin op.  The caller establishes ``is_builtin_op(fn)`` first.
+
+    Returns
+    -------
+    bool
+        ``True`` for the multilinear ops only.
+
+    Notes
+    -----
+    EXHAUSTIVE over :data:`~polyarray.ir.StmtFn` (``assert_never``): a new op must state which side
+    it is on, because answering ``True`` wrongly would fabricate a zero.
+    """
+    match fn:
+      # --- multilinear: one zero operand ⇒ zero result ----------------------------
+      case EinsumStmtOp() | EinsumOp() | TensordotOp() | KronOp() | KronFreeOp() \
+              | ScaleOp() | ScaleByOp() | ProjectOp() | EmbedOp():
+        # Contractions and (Kronecker/elementwise/scalar) products: every output entry is a sum
+        # of products with one factor per operand.  `EinsumOp`'s second factor is BAKED on the op
+        # and `ScaleOp`'s is a literal, which does not change the argument.
+        return True
+
+      # --- NOT multilinear: a zero operand says nothing about the result ----------
+      case AddOp() | ConcatOp() | HStackOp() | ColStackOp() | BlockDiagOp() \
+              | BlockRepeatOp() | DynBlockRepeatOp():
+        # Sums and assemblies: a zero SUMMAND / block leaves the other entries untouched.
+        return False
+      case TransposeOp() | MoveaxisOp() | ReshapeOp() | IdentityOp() | FirstColsOp() \
+              | LastColsOp():
+        # Pure rearrangements. A zero operand does give a zero result, but they are UNARY (a
+        # slice's second operand is a rank, not a factor), so there is never another operand to
+        # be unresolved — admitting them would buy nothing and widen the rule.
+        return False
+      case InvOp() | InvTransposeOp() | SolveOp() | PinvOp() | DetOp() | ComposeViaStdOp():
+        # Division-like: an inverse of zero does not exist, `solve`'s zero RHS gives zero only
+        # when the matrix is non-singular (which is what the solve itself has to establish), and
+        # the exact twins already refuse a singular operand.
+        return False
+      case QrOp() | SvdOp() | GSvdOp() | GSvdFullOp() | SqrtOp() | SqrtSpdOp() \
+              | MetricOrthonormalOp() | SinvFullOp() | AbsOp() | SignOp() | RankOp() \
+              | CompRankOp():
+        # Factorizations, roots and order predicates: ⚠ a factorization OF a zero matrix is
+        # DEGENERATE, not zero (`Q` is an arbitrary orthonormal frame), and these do not take a
+        # second operand to be zero-annihilated by in any case.
+        return False
+      case AxisLenOp() | ConstOp() | EyeOp() | DynEyeOp() | DynZerosOp() | DynEyeTensorOp() \
+              | ProdShapeOp() | SumShapeOp() | SumDimOp() | ProdDimOp() | ScaleAxisDimOp() \
+              | MulAxisDimOp():
+        # STRUCTURAL / nullary: the result is a function of shapes, not of cell values.
+        return False
+      case AssertOp() | SwitchOp() | WhileOp() | CallOp():
+        # Guards and control flow: not arithmetic at all (`SwitchOp` has its own twin, which
+        # already reasons from the branches without the scrutinee).
+        return False
+
+      case _ as unreachable:
+        assert_never(unreachable)
+
+
+def _tolerates_opaque_operand(fn: StmtOp) -> bool:
+    """Report whether this statement may still be executed with an unresolved operand.
+
+    Two arguments, and the open half of ``Stmt.fn`` is handled first (`polyarray/CLAUDE.md`):
+
+    * LIVENESS — a sub-:class:`~polyarray.ir.Program`, or a REBUILDABLE ``vmap`` closure over
+      one (:func:`_vmap_closure`): the operand may simply be DEAD in the body, and that is
+      decided by EXECUTING it (:func:`_bind_body_inputs` marks the unresolved input's atoms
+      unresolvable, so anything reading them goes opaque and only a body whose declared outputs
+      resolve anyway returns a value).  This is the same liveness argument :func:`_run_program`
+      already makes for an opaque STATEMENT inside a body, applied to its inputs.  The vmap case
+      says nothing extra about the body — it is still per-slice :func:`_run_program`, with the
+      unresolved operand handed to EVERY slice unresolved (:func:`_run_vmap`);
+    * MULTILINEARITY — a builtin :func:`_zero_absorbing` op: an exactly-zero factor annihilates
+      the result, so the unresolved factor cannot matter.  The caller checks the zero actually
+      exists before executing.
+
+    Parameters
+    ----------
+    fn
+        A ``Stmt.fn``.  ``Any`` because that field is half-open: a sub-``Program``, a vmap closure,
+        a front-end op or a plain callable are all valid, and only the builtin half has a type.
+
+    Returns
+    -------
+    bool
+        ``True`` when one of the two arguments applies.
+
+    Notes
+    -----
+    ⚠ The two are NOT interchangeable, and the caller must not treat them as one permission: the
+    liveness cases never permit inventing a value for the unresolved operand (see the guard on the
+    zero short-circuit in :func:`_exec_stmt`).
+    """
+    if isinstance(fn, Program):
+        return True
+    if isinstance(fn, CallOp) and isinstance(fn.fn, Program):
+        return True
+    if _vmap_closure(fn) is not None:
+        return True
+    return is_builtin_op(fn) and _zero_absorbing(fn)
+
+
+def _ref_shape(ref: Ref, program: Program) -> tuple[int, ...] | None:
+    """Return the static shape one statement input ref will carry, without resolving its value.
+
+    Only needed for an operand the zero-absorbing rule annihilates: the twin still has to be
+    handed an array of the right shape to produce a correctly-shaped zero.
+
+    Parameters
+    ----------
+    ref
+        A Stmt input ref.  ``Any`` to match :func:`_resolve_ref`, which this mirrors: the ref
+        vocabulary is open at the edges (an unrecognised ref simply has no static shape).
+    program
+        The program the ref reads from.
+
+    Returns
+    -------
+    tuple[int, ...] or None
+        The shape, or ``None`` when it cannot be read off — a dynamic axis, an indexed ref, a
+        runtime-bound integer.
+    """
+    def _static(shape: Sequence[int | DimAtom]) -> tuple[int, ...] | None:
+        shp = tuple(shape)
+        return None if is_dynamic(shp) else tuple(int(d) for d in shp)
+
+    if isinstance(ref, Const):
+        return tuple(np.asarray(ref.value).shape)
+    if isinstance(ref, RationalRef):
+        return ()
+    if isinstance(ref, (InputRef, OutputRef)) and ref.indices:
+        return None                           # an indexed slice: shape depends on the indices
+    if isinstance(ref, InputRef):
+        sa = program.input_arrays.get(ref.name)
+        return None if sa is None else _static(sa.shape)
+    if isinstance(ref, OutputRef):
+        if not (0 <= ref.stmt_idx < len(program.statements)):
+            return None
+        outs = program.statements[ref.stmt_idx].out
+        if not (0 <= ref.out_idx < len(outs)):
+            return None
+        return _static(outs[ref.out_idx].shape)
+    if isinstance(ref, SymArrayRef):
+        if ref._bulk is not None:
+            return _static(ref._bulk.shape)
+        return tuple(np.asarray(ref._cells).shape)
+    return None                               # IntAtomRef / unknown
+
+
 def _sym_apply(
     fn: StmtOp, args: list[ExactValue], meter: _Meter, depth: int, reason: _Reason,
     max_sym_mass: int,
@@ -1163,7 +1367,7 @@ def _run_vmap(
     closure: tuple[Program, tuple, tuple], args: list[Any], meter: _Meter, depth: int,
     reason: _Reason, max_sym_mass: int,
 ) -> list[Any] | None:
-    """Exact descent INTO a vmap closure — the batched twin of :func:`_run_program`.
+    """Descend exactly into a vmap closure, the batched twin of :func:`_run_program`.
 
     Reproduces ``ir.vmap``'s own semantics exactly (slice each batched operand along its
     ``in_axes`` entry, run the body per slice, ``np.stack`` on ``out_axes``), but over exact
@@ -1176,17 +1380,27 @@ def _run_vmap(
     slice pays the body's fixed per-statement overhead).  The budget is additionally charged
     INSIDE the loop, once per slice.  Every rejection degrades to *unresolved* ⇒ the warned
     probe fallback — never a hang, never a guess.
+
+    An UNRESOLVED operand (``_OPAQUE``) is admitted, on LIVENESS only
+    (:func:`_tolerates_opaque_operand`): it cannot be sliced — neither its value nor its batch
+    length is known — so it is handed to EVERY slice unresolved, exactly as it arrived, and
+    :func:`_bind_body_inputs` marks that body input's atoms unresolvable.  Only a body whose
+    declared outputs resolve without them returns a value, which is the proof that the operand was
+    dead.  Nothing about the body is assumed — in particular NOT multilinearity, so a zero in
+    another operand buys nothing here; a body that reads the unresolved input simply stays
+    unresolved.  It also contributes no batch size: at least one RESOLVED batched operand must
+    fix ``batch`` (else the arity check below refuses).
     """
     body, in_axes, out_axes = closure
     if len(args) != len(in_axes) or len(in_axes) != len(body.inputs):
         reason.note(f"vmap closure ({body.name}): operand/in_axes/body-input arity mismatch")
         return None
-    arrs = [np.asarray(a) for a in args]
+    arrs = [a if a is _OPAQUE else np.asarray(a) for a in args]
     norm: list[int | None] = []
     sizes: list[int] = []
     for arr, ax in zip(arrs, in_axes):
-        if ax is None:
-            norm.append(None)
+        if ax is None or arr is _OPAQUE:
+            norm.append(None)                 # pass through whole (an `_OPAQUE` rides unchanged)
             continue
         a = int(ax) if int(ax) >= 0 else arr.ndim + int(ax)
         if not (0 <= a < arr.ndim):
@@ -1243,6 +1457,18 @@ def _bind_body_inputs(body: Program, args: list[Any], env: _Env) -> bool:
         if sa is None or getattr(sa, "_bulk", None) is not None:
             return False                      # bulk / dynamic body input — opaque
         cells = np.asarray(sa.cells)
+        if val is _OPAQUE:
+            # An UNRESOLVED operand: mark this input's atoms unresolvable instead of refusing the
+            # whole body (`_tolerates_opaque_operand`). Everything that reads them goes opaque, so
+            # a body whose declared outputs still resolve has PROVED the operand dead — the same
+            # liveness argument `_run_program` makes for an opaque statement inside the body.
+            for idx in (np.ndindex(*cells.shape) if cells.shape else [()]):
+                cell = cells[idx] if cells.shape else cells[()]
+                if not (isinstance(cell, RationalFunction) and cell.gens):
+                    return False              # a non-atom placeholder cell would be read as a
+                    # VALUE (nothing marks it unresolvable) — refuse rather than use it
+                env.opaque.add(cell.gens[0])
+            continue
         arr = np.asarray(val)
         if tuple(arr.shape) != tuple(cells.shape):
             return False
@@ -1312,15 +1538,47 @@ def _exec_stmt(
     # this did) throws that away and freezes the whole downstream expression. Any opaque BRANCH is
     # still fatal, exactly as before. See the `SwitchOp` twin in `_sym_apply`.
     _is_switch = isinstance(stmt.fn, SwitchOp)
+    # An unresolved operand is NOT automatically fatal (`_tolerates_opaque_operand`): a
+    # sub-Program may not read it, and a MULTILINEAR op with an exactly-zero factor is zero
+    # whatever it holds. Both are decided below, from the operands — never assumed.
+    _tolerant = _tolerates_opaque_operand(stmt.fn)
+    opaque_at: list[int] = []
     for _j, r in enumerate(stmt.in_):
         v = _resolve_ref(r, env, program)
         if v is _OPAQUE:
             if _is_switch and _j == 0:
                 args.append(_OPAQUE)          # decided by the twin, from the branches alone
                 continue
+            if _tolerant:
+                opaque_at.append(_j)
+                args.append(_OPAQUE)
+                continue
             reason.note("operand depends on an unresolved statement / runtime-only ref")
             return False
         args.append(v)
+    if opaque_at and is_builtin_op(stmt.fn) and _zero_absorbing(stmt.fn):
+        # THE ZERO SHORT-CIRCUIT, and it belongs to MULTILINEARITY ALONE. Substituting a zero for an
+        # operand we could not resolve is only ever justified by `_zero_absorbing`: each output entry
+        # is then a sum of products with one factor per operand, so the zero factor annihilates every
+        # term and what the unresolved one holds cannot matter.
+        #
+        # ⚠ The guard must NOT be `is_builtin_op` alone. `CallOp` IS a builtin op, and
+        # `_tolerates_opaque_operand` admits `CallOp(Program)` for a completely different reason —
+        # the LIVENESS argument, decided by executing the body. Fabricating a zero there claims a
+        # value for an ADDITIVE body: a `CallOp` over `u + v` with `u = 0` and `v` unresolved would
+        # certify `0` where the true value is `v`. Tolerating an unresolved operand and inventing a
+        # value for it are two different permissions.
+        #
+        # Substituting a zero array of the unresolved operand's DECLARED shape lets the existing
+        # rational twin compute both the value and its shape — no separate zero-shaped result to
+        # get wrong.
+        zeros_ok = any(_is_exact_zero(a) for j, a in enumerate(args) if j not in set(opaque_at))
+        shapes = [_ref_shape(stmt.in_[j], program) for j in opaque_at] if zeros_ok else []
+        if not zeros_ok or any(s is None for s in shapes):
+            reason.note("operand depends on an unresolved statement / runtime-only ref")
+            return False
+        for j, shp in zip(opaque_at, shapes):
+            args[j] = np.zeros(shp)
     _has_opaque = any(a is _OPAQUE for a in args)
     numeric = [None] * len(args) if _has_opaque else [_as_numeric(a) for a in args]
     outs: list[Any] | None
