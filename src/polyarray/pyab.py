@@ -157,6 +157,9 @@ Placement = Literal["plain", "vmap", "fuse"]
 #: without polyarray importing them, mirroring ``to_numpy_source``'s ``op_renderers``.
 type OpLowering = Callable[[Any, StmtBuilder, list[PyExprs], _Lowerer], list[PyExprs]]
 
+#: What :func:`prepare` reports about the simplifications it applied, keyed by pass name.
+type PrepReport = dict[str, int | str | bool]
+
 
 @dataclass(frozen=True)
 class SmallQrOpts:
@@ -829,12 +832,12 @@ class _Lowerer:
     def __init__(
         self,
         program: Program,
-        input_exprs: Mapping[str, Any],
-        intatom_exprs: Mapping[str, Any],
+        input_exprs: Mapping[str, PyExprs],
+        intatom_exprs: Mapping[str, PyExprs],
         opts: LowerOpts,
         *,
         var_gen: Callable[[str], str] | None = None,
-        defs: list[Any] | None = None,
+        defs: list[PyStmts] | None = None,
         helpers: dict[int, str] | None = None,
         fp_helpers: dict[str, str] | None = None,
     ) -> None:
@@ -904,13 +907,15 @@ class _Lowerer:
 
     # -- driver: emit the program body, bind inputs, return output exprs --
 
-    def run(self) -> list[Any]:
+    def run(self) -> list[PyExprs]:
+        """Lower every statement and return one expression per program output."""
         self._bind_inputs()
         for stmt_idx, stmt in enumerate(self.prog.statements):
             self._emit_stmt(stmt_idx, stmt)
         return self._output_exprs()
 
-    def body_stmts(self) -> tuple[Any, ...]:
+    def body_stmts(self) -> tuple[PyStmts, ...]:
+        """Return the statements emitted so far, without resetting the builder."""
         return self.b.finish(reset=False)
 
     # -- inputs -----------------------------------------------------------
@@ -999,7 +1004,7 @@ class _Lowerer:
     def _render_op(
         self, fn: StmtOp, args: list[PyExprs], out: tuple[SymArray, ...],
         in_refs: Sequence[Ref] = ()
-    ) -> tuple[str, Any]:
+    ) -> tuple[str, PyExprs | list[PyExprs]]:
         c = self.core
         # Front-end ops first (keyed by class name), then the builtin vocabulary.
         renderer = self.extra.get(type(fn).__name__)
@@ -1508,8 +1513,9 @@ class _Lowerer:
 
     # -- outputs ----------------------------------------------------------
 
-    def _output_exprs(self) -> list[Any]:
-        exprs: list[Any] = []
+    def _output_exprs(self) -> list[PyExprs]:
+        """Render one expression per program output."""
+        exprs: list[PyExprs] = []
         for _, sa in self.prog.outputs.items():
             if sa._bulk is not None:
                 exprs.append(self.bulkmap[sa._bulk.name])
@@ -1658,7 +1664,7 @@ def _balanced(core: ModuleType, exprs: list[PyExprs], op: PyExprs) -> PyExprs:
 
 def _emit_householder_qr(
     low: _Lowerer, a_expr: PyExprs, m: int, n: int, mode: str
-) -> tuple[Any, Any]:
+) -> tuple[PyExprs, PyExprs]:
     """Emit unrolled Householder QR of an ``m x n`` (m>=n) matrix.
 
     Returns ``(Q_expr, R_expr)`` — reduced (``m x n`` / ``n x n``) for
@@ -1904,7 +1910,7 @@ def collapse_vmap(program: Program, *, probe_batch: int = 4, seed: int = 12345) 
     return new, collapsed
 
 
-def prepare(program: Program, *, opts: LowerOpts | None = None) -> tuple[Program, dict[str, Any]]:
+def prepare(program: Program, *, opts: LowerOpts | None = None) -> tuple[Program, PrepReport]:
     """Apply backend-prep simplifications; return ``(program, report)``.
 
     Run automatically by :func:`as_function_def` / :func:`lower_program_into` /
@@ -1930,11 +1936,11 @@ def prepare(program: Program, *, opts: LowerOpts | None = None) -> tuple[Program
 def lower_program_into(
     program: Program,
     builder: StmtBuilder,
-    arg_exprs: Sequence[Any],
+    arg_exprs: Sequence[PyExprs],
     *,
-    intatom_exprs: Mapping[str, Any] | None = None,
+    intatom_exprs: Mapping[str, PyExprs] | None = None,
     opts: LowerOpts | None = None,
-) -> tuple[list[Any], list[Any]]:
+) -> tuple[list[PyExprs], list[PyStmts]]:
     """Inline ``program`` into ``builder`` at the current point.
 
     ``arg_exprs`` are the PyAB exprs bound to the program inputs (in
@@ -2038,7 +2044,7 @@ def as_function_def(
     *,
     name: str = "f",
     opts: LowerOpts | None = None,
-) -> tuple[Any, ...]:
+) -> tuple[PyStmts, ...]:
     """Emit ``program`` as PyAB statements: helper ``def``s + one ``def name``.
 
     The returned tuple is ready to hand to a PyAB backend ``compile``.  The
