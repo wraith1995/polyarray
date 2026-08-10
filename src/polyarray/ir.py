@@ -116,7 +116,7 @@ class SymbolEnv:
     """Global identity table for symbolic generators.
 
     Allocates fresh generator names with attached :class:`Provenance`
-    metadata.  Two ``RationalFunction``s with the same generator name
+    metadata.  Two rational functions with the same generator name
     refer to the same algebraic object regardless of which ring they
     were originally constructed in — :class:`SymbolEnv` is what
     enforces that invariant.
@@ -1656,7 +1656,7 @@ class ProdDimOp:
 
 @dataclass(frozen=True)
 class ScaleAxisDimOp:
-    """``n · (mat's ``axis`` length)`` as a 0-d int — static count, runtime per-copy axis."""
+    """Return ``n`` times the length of ``mat``'s axis, as a 0-d int."""
 
     n: int
     axis: int = 0
@@ -1668,7 +1668,7 @@ class ScaleAxisDimOp:
 
 @dataclass(frozen=True)
 class MulAxisDimOp:
-    """``count · (mat's ``axis`` length)`` as a 0-d int — runtime count, runtime axis."""
+    """Return the runtime ``count`` times the length of ``mat``'s axis, as a 0-d int."""
 
     axis: int = 0
 

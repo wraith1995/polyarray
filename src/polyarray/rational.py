@@ -17,7 +17,7 @@ methods that both backends provide.
 
 Cells of the symbolic interpreter's ``SymArray`` are
 ``RationalFunction | float``: numeric cells are plain Python floats,
-generator-bearing cells are ``RationalFunction``s.
+generator-bearing cells are rational functions.
 
 Per the plan:
 

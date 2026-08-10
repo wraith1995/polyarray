@@ -162,7 +162,9 @@ Placement = Literal["plain", "vmap", "fuse"]
 #: An op-lowering hook: ``(op, builder, arg_exprs, lowerer)`` to one expression per op
 #: output.  Keyed by op *class name* so a front end can lower its own statement ops
 #: without polyarray importing them, mirroring ``to_numpy_source``'s ``op_renderers``.
-type OpLowering = Callable[[Any, StmtBuilder, list[PyExprs], _Lowerer], list[PyExprs]]
+#: Spelled loosely at run time because pyab is an optional dependency; the precise
+#: shape is the one written above.
+type OpLowering = Callable[..., list[Any]]
 
 #: What :func:`prepare` reports about the simplifications it applied, keyed by pass name.
 type PrepReport = dict[str, int | str | bool]
