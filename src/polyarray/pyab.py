@@ -1565,11 +1565,77 @@ class _Lowerer:
         # tensor leaves with ``stack`` so the result is a real backend tensor.
         return self._stack_cells(cells)
 
+    def _leaf_access(self, cell: Cell) -> tuple[PyExprs, str, tuple[int, ...]] | None:
+        """If ``cell`` renders to a pure subscript of a tensor ``Var`` — ``X[i0, i1, …]`` with integer
+        indices, or a bare ``X`` — return ``(base_var_expr, base_name, index_ints)``; else ``None``.
+
+        Used by :meth:`_try_view_stack` to recognise a scalar ``stack`` that is really a VIEW of an
+        existing tensor. A bare-atom :class:`RationalFunction` renders (via :meth:`_rf_expr`) to exactly
+        its generator's expression, which for an input/Stmt-output atom is ``genmap[atom] = X[idx]``; a
+        polynomial renders to arithmetic and returns ``None``."""
+        c = self.core
+        if not isinstance(cell, RationalFunction):
+            return None
+        e = self._rf_expr(cell)
+        if isinstance(e, c.Var):
+            return (e, e.name, ())
+        if (isinstance(e, c.AccessExpr) and isinstance(e.base, c.Var)
+                and all(isinstance(i, c.IntLit) for i in e.index)):
+            return (e.base, e.base.name, tuple(int(i.value) for i in e.index))
+        return None
+
+    def _try_view_stack(self, cells: np.ndarray) -> PyExprs | None:
+        """Peephole: emit a VIEW (a slice, or a ``stack`` of whole tensors) instead of a nested ``stack`` of
+        SCALAR leaves when ``cells`` is exactly a natural-order arrangement of existing tensor ``Var``(s).
+
+        The scalar-stack form otherwise realises one buffer PER ELEMENT (under ``vmap`` → one copy loop per
+        cell), which dominates the generated code (e.g. the geometry Jacobian is rebuilt element-by-element).
+        A view is a single op Inductor folds away. Provably semantics-preserving — every element emitted IS
+        the same tensor element. Returns the view expr, or ``None`` to fall back to the scalar stack.
+        Two shapes are recognised (else bail):
+          (1) every cell is the IDENTITY access of ONE base ``X`` (``cell[idx] == X[idx]``) → ``X[:s0, :s1, …]``.
+          (2) 2-D where each COLUMN ``j`` is a whole 1-D base ``X_j`` at indices ``0..m-1`` (symmetrically each
+              ROW) → ``stack([X_0[:m], …], axis=1)`` — the vertex/Jacobian transpose that begins every kernel.
+        """
+        c = self.core
+        cells = np.asarray(cells, dtype=object)
+        if cells.ndim == 0 or cells.size == 0:
+            return None
+        idxs = list(np.ndindex(*cells.shape))
+        acc: dict[tuple[int, ...], tuple[PyExprs, str, tuple[int, ...]]] = {}
+        for i in idxs:
+            a = self._leaf_access(cells[i])
+            if a is None:
+                return None                    # a non-atom leaf ⇒ not a pure view; bail
+            acc[i] = a
+        # (1) identity view of a single base.
+        if len({acc[i][1] for i in idxs}) == 1 and all(acc[i][2] == i for i in idxs):
+            base = acc[idxs[0]][0]
+            return c.AccessExpr(base=base,
+                                index=tuple(c.Slice(stop=c.IntLit(value=int(s))) for s in cells.shape))
+        # (2) 2-D column-/row-homogeneous stack of whole 1-D bases.
+        if cells.ndim == 2:
+            m, n = int(cells.shape[0]), int(cells.shape[1])
+            if all(acc[(i, j)][1] == acc[(0, j)][1] and acc[(i, j)][2] == (i,)
+                   for j in range(n) for i in range(m)):
+                cols = tuple(c.AccessExpr(base=acc[(0, j)][0], index=(c.Slice(stop=c.IntLit(value=m)),))
+                             for j in range(n))
+                return c.StackExpr(arrays=cols, axis=1)
+            if all(acc[(i, j)][1] == acc[(i, 0)][1] and acc[(i, j)][2] == (j,)
+                   for i in range(m) for j in range(n)):
+                rows = tuple(c.AccessExpr(base=acc[(i, 0)][0], index=(c.Slice(stop=c.IntLit(value=n)),))
+                             for i in range(m))
+                return c.StackExpr(arrays=rows, axis=0)
+        return None
+
     def _stack_cells(self, cells: np.ndarray) -> PyExprs:
         c = self.core
         cells = np.asarray(cells, dtype=object)
         if cells.ndim == 0:
             return self._leaf_tensor(cells[()])
+        view = self._try_view_stack(cells)          # peephole: a scalar-stack that is really a tensor view
+        if view is not None:
+            return view
         if cells.ndim == 1:
             leaves = [self._leaf_tensor(cells[i]) for i in range(cells.shape[0])]
             return c.StackExpr(arrays=tuple(leaves), axis=0)
