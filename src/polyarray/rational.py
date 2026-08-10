@@ -56,29 +56,34 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Union
 
 import numpy as np
 import sympy as sp
 
-from .poly_backend import Poly, PolyTypes, Ring
+from .poly_backend import CoeffLike, Poly, PolyTypes, Ring
 from .poly_backend import lift as _lift
 from .poly_backend import make_ring as _make_ring
 
 # --- eager cancellation (opt-in) -------------------------------------------
-# `RationalFunction` accumulates raw num/den in the hot loop (cancel only at a boundary via
-# `clean()`), so a long `*`/`+` chain can grow a large shared gcd (a euclidean-jet cell reached
-# degree 29/28, 70k terms). Within `eager_cancel(k)`, `*`/`+`/`-` results whose denominator degree
-# exceeds `k` are gcd-cancelled immediately, keeping intermediates reduced (the same chain stays ~10
-# terms). Off by default → byte-identical; the low-degree hot loop never trips the threshold.
-_EAGER_CANCEL: contextvars.ContextVar = contextvars.ContextVar("_pa_eager_cancel", default=0)
+# `RationalFunction` accumulates raw num/den in the hot loop, cancelling only at a boundary
+# via `clean()`, so a long `*`/`+` chain can grow a large shared gcd — tens of thousands of
+# terms at degree ~30. Within `eager_cancel(k)`, arithmetic results whose denominator degree
+# exceeds `k` are gcd-cancelled immediately, keeping intermediates small. Off by default, and
+# the low-degree hot loop never trips the threshold, so enabling it changes no value.
+_EAGER_CANCEL: contextvars.ContextVar[int] = contextvars.ContextVar("_pa_eager_cancel", default=0)
 
 
 @contextlib.contextmanager
-def eager_cancel(den_degree_threshold: int = 2):
-    """Within this context, cancel RF arithmetic results whose denominator degree exceeds the
-    threshold (0 restores the default lazy behavior).
+def eager_cancel(den_degree_threshold: int = 2) -> Iterator[None]:
+    """Cancel arithmetic results whose denominator degree exceeds a threshold.
+
+    Parameters
+    ----------
+    den_degree_threshold
+        Denominator total degree above which a ``*``, ``+`` or ``-`` result is gcd-cancelled
+        on the spot. ``0`` restores the default lazy behaviour.
     """
     tok = _EAGER_CANCEL.set(int(den_degree_threshold))
     try:
@@ -88,6 +93,7 @@ def eager_cancel(den_degree_threshold: int = 2):
 
 
 def _maybe_cancel(rf: RationalFunction) -> RationalFunction:
+    """Cancel ``rf`` if an ambient :func:`eager_cancel` threshold says its denominator is heavy."""
     thr = _EAGER_CANCEL.get()
     if thr and isinstance(rf, RationalFunction):
         try:
@@ -99,18 +105,19 @@ def _maybe_cancel(rf: RationalFunction) -> RationalFunction:
 
 NumericLike = Union[int, float, sp.Rational, sp.Integer]
 
+#: Anything that coerces to a :class:`RationalFunction` in arithmetic with one.
+type Operand = RationalFunction | NumericLike | sp.Expr
+
+#: A compiled per-instance evaluator: generator name to value, in; float, out.
+type CompiledEval = Callable[[Mapping[str, float]], float]
+
 
 def _ring_names(ring: Ring) -> tuple[str, ...]:
-    """Return the generator names of ``ring`` as a tuple of ``str``.
-
-    Thin shim around :attr:`Ring.names` retained for the public-ish
-    import in :mod:`chartlib._symbolic.ir` (``from .rational import
-    _ring_names``).
-    """
+    """Return the generator names of ``ring`` as a tuple of ``str``."""
     return ring.names
 
 
-def _coeff_to_float(coeff: Any) -> float:
+def _coeff_to_float(coeff: CoeffLike) -> float:
     """Universal coefficient-to-float coercion.
 
     Used by the eval-codegen and partial-substitution paths to lower a
@@ -152,9 +159,11 @@ def _to_qq(coeff: NumericLike | sp.Expr) -> float:
     raise TypeError(f"cannot coerce {coeff!r} ({type(coeff).__name__}) to float")
 
 
-def _coeff_abs_float(co: Any) -> float:
-    """Best-effort ``|coeff|`` → ``float`` across coefficient backends (Python float / int,
-    flint ``fmpq``, sympy Rational/mpf). Used by the numeric-magnitude sparsity test.
+def _coeff_abs_float(co: CoeffLike) -> float:
+    """Coerce ``|coeff|`` to a float across every coefficient backend.
+
+    Handles Python float and int, flint ``fmpq``, and sympy ``Rational`` / ``mpf``. Used by
+    the numeric-magnitude sparsity test.
     """
     if isinstance(co, float):
         return abs(co)
@@ -308,14 +317,17 @@ class RationalFunction:
 
     @property
     def num(self) -> Poly:
+        """The numerator polynomial."""
         return self._num
 
     @property
     def den(self) -> Poly:
+        """The denominator polynomial."""
         return self._den
 
     @property
     def ring(self) -> Ring:
+        """The polynomial ring both numerator and denominator live in."""
         return self._ring
 
     @property
@@ -343,7 +355,7 @@ class RationalFunction:
         return m
 
     def is_constant(self) -> bool:
-        """True iff both numerator and denominator have total-degree zero."""
+        """Report whether both numerator and denominator have total degree zero."""
         return _total_degree(self._num) == 0 and _total_degree(self._den) == 0
 
     def to_constant(self) -> sp.Rational:
@@ -367,7 +379,7 @@ class RationalFunction:
     # Arithmetic helpers
     # ------------------------------------------------------------------
 
-    def _coerce(self, other: Any) -> RationalFunction:
+    def _coerce(self, other: Operand) -> RationalFunction:
         """Bring ``other`` into a ``RationalFunction`` over the same ring as ``self``."""
         if isinstance(other, RationalFunction):
             if other._ring is self._ring:
@@ -399,7 +411,7 @@ class RationalFunction:
     def __pos__(self) -> RationalFunction:
         return self
 
-    def __add__(self, other: Any) -> RationalFunction:
+    def __add__(self, other: Operand) -> RationalFunction:
         # Short-circuit on either operand being zero — saves the
         # ``_coerce`` / ``_aligned`` / ring-arithmetic cost in the
         # ``Σ ... + ...`` accumulators that drive ``compose_jets`` and
@@ -429,10 +441,10 @@ class RationalFunction:
             return _maybe_cancel(RationalFunction(a._num + b._num, a._den))
         return _maybe_cancel(RationalFunction(a._num * b._den + b._num * a._den, a._den * b._den))
 
-    def __radd__(self, other: Any) -> RationalFunction:
+    def __radd__(self, other: Operand) -> RationalFunction:
         return self.__add__(other)
 
-    def __sub__(self, other: Any) -> RationalFunction:
+    def __sub__(self, other: Operand) -> RationalFunction:
         coerced = self._coerce(other)
         if coerced is NotImplemented:
             return NotImplemented
@@ -441,13 +453,13 @@ class RationalFunction:
             return _maybe_cancel(RationalFunction(a._num - b._num, a._den))
         return _maybe_cancel(RationalFunction(a._num * b._den - b._num * a._den, a._den * b._den))
 
-    def __rsub__(self, other: Any) -> RationalFunction:
+    def __rsub__(self, other: Operand) -> RationalFunction:
         coerced = self._coerce(other)
         if coerced is NotImplemented:
             return NotImplemented
         return coerced.__sub__(self)
 
-    def __mul__(self, other: Any) -> RationalFunction:
+    def __mul__(self, other: Operand) -> RationalFunction:
         # Short-circuit on either operand being zero — same identity
         # as ``a * 0 = 0`` and ``0 * b = 0``; saves the ring
         # multiplication on the carrier polynomials.
@@ -461,10 +473,10 @@ class RationalFunction:
         a, b = self._aligned(coerced)
         return _maybe_cancel(RationalFunction(a._num * b._num, a._den * b._den))
 
-    def __rmul__(self, other: Any) -> RationalFunction:
+    def __rmul__(self, other: Operand) -> RationalFunction:
         return self.__mul__(other)
 
-    def __truediv__(self, other: Any) -> RationalFunction:
+    def __truediv__(self, other: Operand) -> RationalFunction:
         coerced = self._coerce(other)
         if coerced is NotImplemented:
             return NotImplemented
@@ -473,7 +485,7 @@ class RationalFunction:
             raise ZeroDivisionError("division by zero RationalFunction")
         return RationalFunction(a._num * b._den, a._den * b._num)
 
-    def __rtruediv__(self, other: Any) -> RationalFunction:
+    def __rtruediv__(self, other: Operand) -> RationalFunction:
         coerced = self._coerce(other)
         if coerced is NotImplemented:
             return NotImplemented
@@ -496,7 +508,7 @@ class RationalFunction:
     # Equality / hashing
     # ------------------------------------------------------------------
 
-    def __eq__(self, other: Any) -> bool:
+    def __eq__(self, other: object) -> bool:
         if isinstance(other, (int, float, sp.Integer, sp.Rational)):
             other = RationalFunction.constant(other, self._ring)
         if not isinstance(other, RationalFunction):
@@ -506,10 +518,9 @@ class RationalFunction:
         return a._num * b._den == b._num * a._den
 
     def __hash__(self) -> int:
-        # Hash on the canonical-form bytes of num/den after a cancel pass.
-        # We do *not* keep canonical form on every instance (per §1.2.2 we run
-        # cancellation off by default), so hashing pays the cost only when
-        # something actually wants to hash.
+        # Hash the canonical form of num/den after a cancel pass. Instances are not kept
+        # in canonical form — cancellation is off by default — so hashing pays that cost
+        # only when something actually wants to hash.
         cleaned = self.clean()
         return hash((cleaned._num, cleaned._den))
 
@@ -517,7 +528,7 @@ class RationalFunction:
     # Evaluation
     # ------------------------------------------------------------------
 
-    def eval(self, bindings: Mapping[str, Any]) -> Any:
+    def eval(self, bindings: Mapping[str, float]) -> float | RationalFunction:
         """Evaluate ``self`` against a generator-name → value mapping.
 
         Returns a Python ``float`` when every generator of the ring is
@@ -587,17 +598,15 @@ class RationalFunction:
         return fn(bindings)
 
     def eval_numeric_direct(self, bindings: Mapping[str, float]) -> float:
-        """Numeric evaluation at a FULL binding by direct term-summation — NO per-RF Python
-        codegen / ``compile``.
+        """Evaluate at a full binding by direct term summation, with no per-cell codegen.
 
         Returns the same ``float`` as :meth:`eval_numeric_fast` (same terms in the same order,
         same ``_coeff_to_float`` coercion, so bit-identical), but with O(#terms) arithmetic
         instead of building and ``exec``-ing a reusable Python evaluator. That codegen
-        amortizes over MANY evaluations (the vmap build-once path, an RF run at M query
-        points) but is pure waste for a FEW: the 3-point structural-mask probe
-        (:func:`polyarray.schur._structural_mask`) compiled every cell of a degree-5 ``C`` and
-        used it 3× — ~31 s (``_compile_eval``: ``builtins.compile`` + ``_poly_term_strings``)
-        of a high-degree symbolic build, for nothing. Byte-identical ⇒ identical mask.
+        amortizes over many evaluations — the vmap build-once path, a cell run at M query
+        points — but is pure waste for a few, as in the handful of probes
+        :func:`polyarray.schur._structural_mask` takes: compiling every cell of a
+        high-degree matrix to use each evaluator three times costs tens of seconds.
         """
         names = _ring_names(self._ring)
         if not names:
@@ -663,7 +672,7 @@ class RationalFunction:
         # In a 0-generator ring, polynomials are ground constants.
         return _to_python_float(n.LC if not coeff_zero(n) else 0) / _to_python_float(d.LC)
 
-    def _compile_eval(self, names: Sequence[str]):
+    def _compile_eval(self, names: Sequence[str]) -> CompiledEval:
         """Compile a Python evaluator for ``self`` over the named generators.
 
         Generates a closure ``fn(bindings) -> float`` that reads each
@@ -674,12 +683,10 @@ class RationalFunction:
         returned closure runs at native Python arithmetic speed without
         sympy's poly-iteration overhead.
 
-        For the trivial shapes that dominate on Stmt-output atoms and
-        constant cells (single-monomial numerator over ring-one
-        denominator), skip ``compile``/``exec`` entirely and return a
-        direct Python closure — measurably cheaper when each RF is
-        evaluated only a handful of times (e.g. ~1ms saved per atom on
-        the per-test build cost).
+        For the trivial shapes that dominate on statement-output atoms and constant cells —
+        a single-monomial numerator over a ring-one denominator — ``compile``/``exec`` is
+        skipped entirely in favour of a direct Python closure, which is measurably cheaper
+        when each cell is evaluated only a handful of times.
         """
         fast = self._maybe_compile_fast(names)
         if fast is not None:
@@ -689,14 +696,11 @@ class RationalFunction:
         var_names = [_safe_local_name(n) for n in names]
         for name, var in zip(names, var_names):
             src_lines.append(f"    {var} = __b[{name!r}]")
-        # Emit num/den as a series of ``__num += chunk`` statements
-        # rather than one long ``+`` chain.  Long binary chains build a
-        # left-associative AST whose compile depth is O(N) and overrun
-        # CPython's recursion limit on polynomials with hundreds of
-        # terms (Christoffel chains on 3D simplices routinely produce
-        # these).  Chunking caps per-statement AST depth while keeping
-        # each chunk an inlined ``BINARY_OP`` chain — no function-call
-        # overhead per eval.
+        # Emit num/den as a series of ``__num += chunk`` statements rather than one long
+        # ``+`` chain: a long binary chain builds a left-associative AST whose compile depth
+        # is O(N), which overruns CPython's recursion limit on polynomials with hundreds of
+        # terms. Chunking caps per-statement AST depth while keeping each chunk an inlined
+        # ``BINARY_OP`` chain, so there is no per-eval call overhead.
         src_lines.extend(_emit_poly_assign(self._num, var_names, "__num"))
         src_lines.extend(_emit_poly_assign(self._den, var_names, "__den"))
         src_lines.append("    return __num / __den")
@@ -705,16 +709,14 @@ class RationalFunction:
         exec(compile(src, f"<rf_eval:{id(self)}>", "exec"), ns)
         return ns["__rf_eval"]
 
-    def _maybe_compile_fast(self, names: Sequence[str]):
+    def _maybe_compile_fast(self, names: Sequence[str]) -> CompiledEval | None:
         """Return a no-compile closure when ``self`` is structurally trivial.
 
-        Trivial shapes (denominator equals ring-one and numerator is
-        either constant, a pure atom, or a scaled atom) cover the
-        dominant majority of cells produced by :meth:`atom`,
-        :class:`Stmt` outputs, and constant DOF entries.  For these the
-        ``compile`` + ``exec`` round-trip is pure overhead; returning a
-        plain ``lambda`` is ~1ms per RF cheaper at first eval and runs
-        at the same speed afterwards.
+        Trivial shapes — a ring-one denominator over a numerator that is constant, a pure
+        atom, or a scaled atom — cover the dominant majority of cells produced by
+        :meth:`atom`, statement outputs, and constant DOF entries. For those the
+        ``compile`` + ``exec`` round-trip is pure overhead, and a plain closure runs at the
+        same speed once built.
 
         Returns ``None`` if the RF is not in a recognised trivial
         shape; the caller falls through to the general codegen path.
@@ -837,14 +839,14 @@ def _weighted_total_degree(poly: Poly, weights: tuple[int, ...]) -> int:
     return max(sum(w * e for w, e in zip(weights, m)) for m in poly.monoms())
 
 
-def _to_python_float(value: Any) -> float:
-    """Coerce a sympy / mpq / int / Python rational to a Python float.
+def _to_python_float(value: CoeffLike) -> float:
+    """Coerce a sympy, mpq, int or Python rational to a Python float.
 
-    Bareiss elimination produces fraction-free intermediates whose
-    numerators and denominators can overflow ``float`` even when their
-    quotient is a normal-magnitude double.  We split via :class:`Fraction`
-    when present (handles arbitrary-precision integer ratios) and fall
-    back to :mod:`mpmath` for very large magnitudes.
+    Bareiss elimination produces fraction-free intermediates whose numerator and denominator
+    can overflow ``float`` even when their quotient is a normal-magnitude double, so the
+    ratio is split through :class:`fractions.Fraction` where available — it handles
+    arbitrary-precision integer ratios — falling back to :mod:`mpmath` for very large
+    magnitudes.
     """
     if isinstance(value, float):
         return value
@@ -933,7 +935,7 @@ def _poly_term_strings(
     poly: Poly,
     var_names: Sequence[str],
 ) -> list[str]:
-    """Helper shared by :func:`_poly_to_pyexpr` and :func:`_poly_to_sum_pyexpr`."""
+    """Render each non-zero term of ``poly`` as a Python source expression."""
     terms: list[str] = []
     for monom, coeff in poly.terms():
         c = _coeff_to_float(coeff)
@@ -1083,7 +1085,7 @@ def _compose_poly(
 # simple_zero predicate
 # ---------------------------------------------------------------------------
 
-def simple_zero(value: Any) -> bool:
+def simple_zero(value: RationalFunction | Poly | NumericLike) -> bool:
     """Return ``True`` if ``value`` is structurally zero.
 
     Accepts a :class:`RationalFunction`, a backend :class:`Poly`, or a
@@ -1217,7 +1219,7 @@ def cofactor_inverse(matrix: np.ndarray) -> np.ndarray:
     return out
 
 
-def _as_rf(value: Any) -> RationalFunction:
+def _as_rf(value: Operand) -> RationalFunction:
     """Promote ``value`` to a :class:`RationalFunction`."""
     if isinstance(value, RationalFunction):
         return value
