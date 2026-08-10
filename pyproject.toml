@@ -114,16 +114,23 @@ convention = "numpy"
 # numpydoc validation (`numpydoc lint src/polyarray/*.py`): checks that the
 # sections a docstring does declare match the signature.
 [tool.numpydoc_validation]
+# Consistency, not completeness: a docstring need not document every parameter (ruff's
+# D rules already require the docstring itself), but whatever it does declare must
+# match the signature.
 checks = [
     "GL06",  # unknown section name
     "GL07",  # sections out of order
     "GL09",  # deprecation warning misplaced
     "SS03",  # summary lacks a period
-    "PR01",  # parameter documented but not in the signature
-    "PR02",  # unknown parameter documented
-    "PR03",  # parameters out of order
-    "PR08",  # parameter description not capitalised
-    "PR09",  # parameter description lacks a period
+    "PR02",  # a documented parameter that is not in the signature
+    "PR03",  # documented parameters out of signature order
     "RT02",  # return section names a variable where it should give a type
 ]
-exclude = ['\.__init__$', '\.__repr__$', '\.__eq__$']
+# Module docstrings carry free-form prose sections (Sphinx renders them); the section
+# vocabulary above applies to callables and classes only.
+exclude = [
+    '^[A-Za-z_][A-Za-z_0-9]*$',  # the module node itself (an undotted name)
+    '\.__init__$',
+    '\.__repr__$',
+    '\.__eq__$',
+]

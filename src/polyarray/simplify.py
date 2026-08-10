@@ -34,12 +34,14 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from .ir import (
     BulkOut,
     CallOp,
     Cell,
     Const,
+    DimSource,
     DimAtom,
     InputRef,
     IntAtomRef,
@@ -208,7 +210,7 @@ def _numify_constant_cells(cells: np.ndarray) -> np.ndarray:
 
 
 def _fold_symarray(
-    sa: SymArray, known: Mapping[str, Any], program: Program, name: str | None,
+    sa: SymArray, known: Mapping[str, float | np.ndarray], program: Program, name: str | None,
 ) -> SymArray:
     if sa._bulk is not None:
         # A folded bulk producer recorded its whole tensor under the bulk name;
@@ -249,7 +251,7 @@ def _fold_ref(
 
 
 def _seed_bind(
-    prog: Program, bind: Mapping[str, Any],
+    prog: Program, bind: Mapping[str, npt.ArrayLike],
 ) -> tuple[dict[str, float], set[str]]:
     """Seed ``known`` from concrete ``bind`` arrays; return (known, dropped)."""
     known: dict[str, float] = {}
@@ -274,7 +276,7 @@ def _seed_bind(
 
 
 def _resolve_stmt_dims(
-    stmt: Stmt, stmt_idx: int, outs: list[np.ndarray], dim_subst: dict[tuple[object, ...], int],
+    stmt: Stmt, stmt_idx: int, outs: list[np.ndarray], dim_subst: dict[DimSource, int],
 ) -> None:
     """Resolve the ``DimAtom``s a folded statement's concrete outputs size.
 
@@ -302,7 +304,7 @@ def _resolve_stmt_dims(
 
 def _record_known(
     stmt: Stmt, outs: list[np.ndarray], known: dict[str, float | np.ndarray],
-    dim_subst: Mapping[tuple[object, ...], int] | None = None,
+    dim_subst: Mapping[DimSource, int] | None = None,
 ) -> None:
     """Record a folded statement's numeric outputs into ``known``.
 
@@ -349,7 +351,7 @@ def _record_known(
 # ---------------------------------------------------------------------------
 
 def _subst_shape(
-    shape: tuple[Any, ...], dim_subst: Mapping[tuple[Any, ...], int],
+    shape: tuple[Any, ...], dim_subst: Mapping[DimSource, int],
 ) -> tuple[tuple[Any, ...], bool]:
     """Replace every resolved ``DimAtom`` in ``shape`` with its concrete int.
 
@@ -372,7 +374,7 @@ def _subst_shape(
 
 
 def _subst_bulk_symarray(
-    sa: SymArray, dim_subst: Mapping[tuple[Any, ...], int],
+    sa: SymArray, dim_subst: Mapping[DimSource, int],
 ) -> SymArray:
     """Return a fresh SymArray with its bulk shape's resolved dimensions substituted.
 
@@ -390,7 +392,7 @@ def _subst_bulk_symarray(
 
 
 def _subst_ref_dims(
-    ref: Ref, dim_subst: Mapping[tuple[object, ...], int],
+    ref: Ref, dim_subst: Mapping[DimSource, int],
 ) -> Ref:
     """Substitute any resolved dimension in a surviving input ref's bulk handle."""
     if isinstance(ref, SymArrayRef) and ref._bulk is not None:
@@ -403,7 +405,7 @@ def _subst_ref_dims(
 
 
 def _substitute_dims(
-    program: Program, dim_subst: Mapping[tuple[object, ...], int],
+    program: Program, dim_subst: Mapping[DimSource, int],
 ) -> None:
     """Substitute every resolved ``DimAtom`` across ``program``'s remaining shapes, in place.
 
@@ -662,8 +664,8 @@ def _fold_vmap_body(
 def specialize(
     program: Program,
     *,
-    bind: Mapping[str, Any] | None = None,
-    subs: Mapping[str, Any] | None = None,
+    bind: Mapping[str, npt.ArrayLike] | None = None,
+    subs: Mapping[str, SymArray | np.ndarray] | None = None,
     sparsity: bool = False,
     budget: SimplifyBudget | None = None,
 ) -> Program:
@@ -675,14 +677,14 @@ def specialize(
     ----------
     program
         The program to specialize; it is copied, never mutated.
-    subs
-        Replace an input with an expression over other inputs. Applied first: each
-        substituted input's per-cell atoms are rewritten throughout the program via
-        :meth:`RationalFunction.compose`, then the input is dropped.
     bind
         Replace an input with a concrete numeric array. Folds every build-time-numeric
         subcomputation, drops the producing statements, and descends into a
         partially-numeric sub-program or ``CallOp`` body.
+    subs
+        Replace an input with an expression over other inputs. Applied first: each
+        substituted input's per-cell atoms are rewritten throughout the program via
+        :meth:`RationalFunction.compose`, then the input is dropped.
     sparsity
         Accepted for API parity, but a no-op passthrough. Use
         :func:`polyarray.sparsity.propagate_sparsity` directly.
@@ -708,7 +710,7 @@ def specialize(
 
 def _specialize(
     program: Program,
-    bind: Mapping[str, Any],
+    bind: Mapping[str, npt.ArrayLike],
     depth: int,
     seen: frozenset[int],
 ) -> Program:
@@ -720,7 +722,7 @@ def _specialize(
     foldable: set[int] = set()
     # Forward-linked resolution of dynamic dims (δ) created by a folded Stmt:
     # ``source-tuple -> concrete int`` (see _resolve_stmt_dims / _substitute_dims).
-    dim_subst: dict[tuple[Any, ...], int] = {}
+    dim_subst: dict[DimSource, int] = {}
     for i, stmt in enumerate(new.statements):
         if not _simple_stmt(stmt):
             continue
@@ -795,7 +797,7 @@ def fold_numeric(program: Program) -> Program:
     return specialize(program)
 
 
-def bind_inputs(program: Program, bind: Mapping[str, Any]) -> Program:
+def bind_inputs(program: Program, bind: Mapping[str, npt.ArrayLike]) -> Program:
     """Replace inputs with concrete numeric arrays, then fold and drop them."""
     return specialize(program, bind=bind)
 
@@ -1260,7 +1262,7 @@ def _compose_ref(
     return ref  # OutputRef / Const / IntAtomRef / InputRef over a live input
 
 
-def substitute(program: Program, subs: Mapping[str, Any]) -> Program:
+def substitute(program: Program, subs: Mapping[str, SymArray | np.ndarray]) -> Program:
     """Replace inputs with expressions over the program's *other* inputs.
 
     ``subs`` maps an input name to a :class:`SymArray` (per-cell, shape-matched)
