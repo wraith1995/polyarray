@@ -83,3 +83,47 @@ warn_redundant_casts = true
 no_implicit_optional = true
 check_untyped_defs = true
 strict_optional = true
+
+# ---------------------------------------------------------------------------
+# Documentation + annotation gate: `ruff check --select D,ANN src` (see the
+# `lint` Makefile target). Deliberately narrow — this enforces the docstring
+# and typing contract, not general style.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["D", "ANN"]
+ignore = [
+    "D105",   # magic methods: the language fixes their meaning
+    "D107",   # __init__: documented by the class docstring
+    "D203",   # incompatible with D211 (no blank line before a class docstring)
+    "D213",   # summary starts on the first line, not the second
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+# Modules still awaiting the docstring/annotation sweep. This list only shrinks;
+# adding an entry needs a reason.
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "ANN"]
+"setup*.py" = ["D", "ANN"]
+
+# numpydoc validation (`numpydoc lint src/polyarray/*.py`): checks that the
+# sections a docstring does declare match the signature.
+[tool.numpydoc_validation]
+checks = [
+    "GL06",  # unknown section name
+    "GL07",  # sections out of order
+    "GL09",  # deprecation warning misplaced
+    "SS03",  # summary lacks a period
+    "PR01",  # parameter documented but not in the signature
+    "PR02",  # unknown parameter documented
+    "PR03",  # parameters out of order
+    "PR08",  # parameter description not capitalised
+    "PR09",  # parameter description lacks a period
+    "RT02",  # return section names a variable where it should give a type
+]
+exclude = ['\.__init__$', '\.__repr__$', '\.__eq__$']

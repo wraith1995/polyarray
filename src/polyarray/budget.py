@@ -1,6 +1,5 @@
 """`SimplifyBudget` — the post-build control surface for the `simplify` pass.
 
-
 Where ``simplify.specialize`` runs the *unconditional floor* (numeric folding +
 dead-stmt elimination), this module adds
 the **discretionary band**: a frozen :class:`SimplifyBudget` policy and a
@@ -26,7 +25,7 @@ from typing import Literal
 
 import numpy as np
 
-from .ir import IdentityOp, OutSpec, Program, SymArray, _cell_size
+from .ir import Cell, IdentityOp, OutSpec, Program, SymArray, _cell_size
 from .rational import RationalFunction, _total_degree
 
 
@@ -49,12 +48,11 @@ class SimplifyBudget:
       output mass exceeds this, the heaviest cells are greedily collapsed until
       it is under budget (a global complement to the per-cell ceiling).
     * ``expose`` — re-expansion policy (``"never"`` / ``"if_under_budget"`` /
-      ``"always"``).  ``"never"`` (default) does no re-expansion.  The genuine
-      inverse of ``partial_eval`` (re-expanding a deferred *numeric* Stmt back
-      to symbolic) is not implemented in this slice; the other two modes are a
-      **documented best-effort no-op** — they never do anything unsound, they
-      simply do not re-expand.  Denominator extraction below is the implemented
-      "expose more symbols" lever.
+      ``"always"``).  The genuine inverse of ``partial_eval`` — re-expanding a
+      deferred *numeric* Stmt back to symbolic — is not implemented, so all
+      three modes do no re-expansion; the two non-default ones are a
+      best-effort no-op rather than an error.  Denominator extraction below is
+      the implemented "expose more symbols" lever.
     * ``den_degree_max`` — a cell whose *denominator* total degree exceeds this
       is extracted as a fresh **named intermediate** symbol (clean / capture),
       exposing a symbol rather than collapsing to a number.
@@ -64,8 +62,7 @@ class SimplifyBudget:
       parameterization".
     * ``inherit_freeze`` — read the source ``Program.budget`` freeze threshold
       to cap post-processing growth consistently with how the program was built.
-      Reserved for first cut (see :func:`_apply_budget`); it never relaxes
-      exactness.
+      It never relaxes exactness.
     """
 
     # --- collapse side (mass ceilings) ---
@@ -78,14 +75,14 @@ class SimplifyBudget:
     # --- consistency with how it was built ---
     inherit_freeze: bool = True
 
-    # -- presets (end-state correspondence in) ------------------
+    # -- presets ------------------------------------------------------------
 
     @classmethod
     def none(cls) -> SimplifyBudget:
         """All knobs off: numeric fold + DCE only, symbolic structure untouched."""
         return cls()
 
-    # ``legacy`` is a spelling alias for ``none`` (the always-safe core).
+    #: Spelling alias for :meth:`none`, the always-safe core.
     legacy = none
 
     @classmethod
@@ -117,17 +114,26 @@ class SimplifyBudget:
 # ---------------------------------------------------------------------------
 
 def _den_degree(cell: RationalFunction) -> int:
-    """Total degree of the cell's denominator (``-1`` for the zero/constant)."""
+    """Return the total degree of the cell's denominator (``-1`` when constant)."""
     return _total_degree(cell.den)
 
 
 def _captured_atom_gen(cell: RationalFunction) -> str | None:
-    """If ``cell`` is a *bare single-generator atom* (numerator a single
-    degree-1 monomial, denominator a constant), return that generator's name;
-    else ``None``.
+    """Return the generator name if ``cell`` is a bare single-generator atom.
 
-    A bare atom is already as collapsed as a capture could make it, so we never
-    re-collapse one — this is what makes collapse **idempotent**.
+    A bare atom has a single degree-1 monomial over a constant denominator. It is
+    already as collapsed as a capture could make it, so never re-collapsing one is
+    what makes collapse idempotent.
+
+    Parameters
+    ----------
+    cell
+        The cell to inspect.
+
+    Returns
+    -------
+    str or None
+        The generator's name, or ``None`` if ``cell`` is not a bare atom.
     """
     if _total_degree(cell.den) != 0:
         return None
@@ -148,11 +154,12 @@ def _captured_atom_gen(cell: RationalFunction) -> str | None:
 
 
 def _is_captured_atom(cell: RationalFunction, program: Program) -> bool:
-    """True iff ``cell`` is a bare atom over a ``stmt_out`` generator — i.e. an
-    already-captured intermediate.  Re-collapsing it is a no-op, so we skip it
-    (idempotence).  Bare atoms over *model* inputs (vertex/coeff/...) are NOT
-    skipped: those are genuine symbolic cells a collapse should still capture
-    (matching ``partial_eval``)."""
+    """Return whether ``cell`` is a bare atom over a ``stmt_out`` generator.
+
+    Such a cell is an already-captured intermediate, and re-collapsing it is a no-op.
+    Bare atoms over *model* inputs (vertex, coeff, ...) are not captured intermediates:
+    they are genuine symbolic cells a collapse should still capture.
+    """
     gen = _captured_atom_gen(cell)
     if gen is None:
         return False
@@ -163,8 +170,10 @@ def _is_captured_atom(cell: RationalFunction, program: Program) -> bool:
 
 
 def _protected(cell: RationalFunction, program: Program, keep: frozenset[str]) -> bool:
-    """True iff ``cell`` carries a generator whose provenance kind is in
-    ``keep`` — such a cell is never collapsed nor extracted."""
+    """Return whether ``cell`` carries a generator of a provenance kind in ``keep``.
+
+    A protected cell is never collapsed nor extracted.
+    """
     if not keep:
         return False
     for g in cell.gens:
@@ -178,7 +187,7 @@ def _protected(cell: RationalFunction, program: Program, keep: frozenset[str]) -
 
 
 # ---------------------------------------------------------------------------
-# The capture primitive (faithful replica of forward.partial_eval's move)
+# The capture primitive — the same move as forward.partial_eval / freeze_array
 # ---------------------------------------------------------------------------
 
 def _capture(
@@ -191,10 +200,31 @@ def _capture(
     prefix: str,
     note: str,
 ) -> RationalFunction:
-    """Capture ``cell`` as a fresh atom via an ``IdentityOp`` Stmt and return
-    the captured atom RF.  This is exactly the mechanism in
-    ``forward.partial_eval`` / ``freeze_array``: the (heavy) cell is evaluated
-    once at ``run`` time and bound to the small atom downstream."""
+    """Capture ``cell`` as a fresh atom behind an ``IdentityOp`` statement.
+
+    The heavy cell is evaluated once at ``run`` time and the small atom stands for it
+    downstream.
+
+    Parameters
+    ----------
+    out
+        Program the capture statement is appended to.
+    op
+        The shared :class:`~polyarray.ir.IdentityOp` instance.
+    cell
+        The cell to capture.
+    name, idx
+        Output name and flat index the cell came from; they name the fresh atom.
+    prefix
+        Atom-name prefix identifying which budget rule triggered the capture.
+    note
+        Statement note recorded on the emitted capture.
+
+    Returns
+    -------
+    RationalFunction
+        The fresh atom standing for ``cell``.
+    """
     cell_arr = np.empty((), dtype=object)
     cell_arr[()] = cell
     [captured] = out.emit_stmt(
@@ -214,18 +244,28 @@ def _capture(
 def _apply_budget(program: Program, budget: SimplifyBudget) -> Program:
     """Apply ``budget`` as a post-pass to an already numeric-folded program.
 
-    Operates on the program's **output** cells (a numeric-folded floor is
-    assumed to have already run, so any remaining ``RationalFunction`` cell is
-    genuinely symbolic). Per §"The moderation procedure":
+    Operates on the program's **output** cells: the numeric-folded floor is assumed to
+    have already run, so any remaining :class:`RationalFunction` cell is genuinely
+    symbolic. Two passes:
 
-    1. per-cell pass: ``keep_provenance`` protection, ``den_degree_max``
-       intermediate extraction, ``max_cell_mass`` collapse;
-    2. global pass: greedy heaviest-first collapse until ``total_mass``.
+    1. per-cell — ``keep_provenance`` protection, ``den_degree_max`` intermediate
+       extraction, ``max_cell_mass`` collapse;
+    2. global — greedy heaviest-first collapse until ``total_mass``.
 
-    ``inherit_freeze`` is read for first-cut consistency but never relaxes
-    exactness; ``expose != "never"`` is a documented best-effort no-op (see
-    :class:`SimplifyBudget`).  ``program`` is the fresh program ``specialize``
-    built; we append capture Stmts / rebuild output cells on it directly.
+    ``expose != "never"`` is a best-effort no-op (see :class:`SimplifyBudget`).
+
+    Parameters
+    ----------
+    program
+        The fresh program ``specialize`` built; capture statements are appended and
+        output cells rebuilt on it directly.
+    budget
+        The policy to apply.
+
+    Returns
+    -------
+    Program
+        ``program``, moderated in place.
     """
     out = program
     op = IdentityOp()
@@ -275,17 +315,22 @@ def _apply_budget(program: Program, budget: SimplifyBudget) -> Program:
 
 
 def _try_clean(cell: RationalFunction) -> RationalFunction:
-    """Best-effort exact gcd cancellation; returns ``cell`` unchanged on any
-    backend failure (exactness-preserving either way)."""
+    """Attempt exact gcd cancellation, returning ``cell`` unchanged if the backend fails.
+
+    Exactness-preserving either way.
+    """
     try:
         return cell.clean()
     except Exception:
         return cell
 
 
-def _collapsible(cell: object, program: Program, budget: SimplifyBudget) -> bool:
-    """Eligible for global total_mass collapse: a symbolic, non-protected,
-    not-already-captured cell."""
+def _collapsible(cell: Cell, program: Program, budget: SimplifyBudget) -> bool:
+    """Return whether ``cell`` is eligible for global ``total_mass`` collapse.
+
+    Eligible means symbolic, not protected by ``keep_provenance``, and not already a
+    captured intermediate.
+    """
     if not isinstance(cell, RationalFunction):
         return False
     if _is_captured_atom(cell, program):
@@ -296,8 +341,11 @@ def _collapsible(cell: object, program: Program, budget: SimplifyBudget) -> bool
 
 
 def _enforce_total_mass(out: Program, op: IdentityOp, budget: SimplifyBudget) -> None:
-    """Greedily collapse the heaviest eligible output cell until the program's
-    total symbolic output mass is at or under ``budget.total_mass``."""
+    """Collapse the heaviest eligible output cell until total mass is under budget.
+
+    Repeats greedily until the program's total symbolic output mass is at or under
+    ``budget.total_mass``, or no eligible cell remains.
+    """
     assert budget.total_mass is not None
     while True:
         total = 0

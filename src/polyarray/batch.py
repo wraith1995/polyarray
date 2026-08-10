@@ -21,22 +21,22 @@ general.  ``EinsumStmtOp`` batches by rewriting the spec with an ellipsis and pa
 numpy may choose a different contraction ORDER than the unbatched call; ``np.linalg`` likewise takes a
 stacked path rather than a per-matrix one.  Both re-associate floating-point arithmetic.
 
-Measured on a high-degree interpolation residual: in 2D max|Δ| = 0 exactly; in 3D max|Δ| =
-1.0e-13 on values of magnitude ~1.4e2, i.e. ~1 ulp relative — within tolerance. An earlier
-"byte-identical, max|Δ|=0" claim here was measured when most programs silently fell back to the
-per-element loop, so the batched path was barely exercised; do not restore it.
+Measured on a high-degree interpolation residual: 2D agrees exactly; 3D differs by max|Δ| =
+1.0e-13 on values of magnitude ~1.4e2, i.e. ~1 ulp relative. Agreement is therefore to
+rounding, not to the bit — a claim of bit-identity holds only for the exact ops above.
 
 Raises :class:`NotImplementedError` for any op without a batch rule (or a sub-Program / dynamic
 construct it does not handle) so the caller can fall back to the per-element loop.
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
 
 import numpy as np
+import numpy.typing as npt
 
-from .ir import (Const, InputRef, IntAtomRef, OutputRef, Program, RationalRef, SymArrayRef,
-                 _cached_einsum, is_dynamic)
+from .ir import (Const, InputRef, IntAtomRef, OutputRef, Program, RationalRef, Ref, StmtOp,
+                 SymArray, SymArrayRef, _cached_einsum, is_dynamic)
 from .rational import RationalFunction
 
 __all__ = ["batched_run", "BatchUnsupported"]
@@ -47,7 +47,7 @@ class BatchUnsupported(NotImplementedError):
 
 
 def _batched_einsum_spec(spec: str) -> str:
-    """Prepend a fresh batch index to every operand and the output (mirrors ``pyab._batched_einsum_spec``)."""
+    """Prepend a fresh batch index to every operand and the output of ``spec``."""
     lhs, _, rhs = spec.partition("->")
     used = set(spec) - set(",->")
     batch = next((ch for ch in "BNZYXWVUTSRQPOMLKJ" if ch not in used), None)
@@ -57,8 +57,28 @@ def _batched_einsum_spec(spec: str) -> str:
     return f"{ins}->{batch}{rhs.strip()}"
 
 
-def _apply(fn: Any, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, bool]:
-    """Apply op ``fn`` to operands ``ins`` = ``[(value, is_batched), …]``; return ``(value, is_batched)``."""
+def _apply(fn: StmtOp, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, bool]:
+    """Apply op ``fn`` to operands ``[(value, is_batched), …]``, returning ``(value, is_batched)``.
+
+    Parameters
+    ----------
+    fn
+        The statement's op. Dispatch is by class name so that front-end ops need no
+        import here.
+    ins
+        One ``(value, is_batched)`` pair per operand, in operand order.
+
+    Returns
+    -------
+    tuple of (numpy.ndarray, bool)
+        The op's value and whether it carries the leading batch axis.
+
+    Raises
+    ------
+    BatchUnsupported
+        If ``fn`` has no batch rule, or its operands mix batched and unbatched in a way
+        the rule cannot express.
+    """
     name = type(fn).__name__
     vals = [v for v, _ in ins]
     bflags = [b for _, b in ins]
@@ -67,11 +87,12 @@ def _apply(fn: Any, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, boo
     def A(i: int) -> np.ndarray:
         return np.asarray(vals[i], dtype=float)
 
-    def _shift(ax):
-        """An axis index as seen from a BATCHED operand: one extra leading axis.
+    def _shift[T: (int, tuple[int, ...], list[int])](ax: T) -> T:
+        """Re-express an axis index as seen from a batched operand: one extra leading axis.
 
-        Negative indices already count from the end and so need no shift — getting that wrong
-        would silently transpose the wrong pair rather than fail."""
+        Negative indices already count from the end and so need no shift; shifting one
+        would silently transpose the wrong pair of axes rather than fail.
+        """
         if isinstance(ax, (tuple, list)):
             return type(ax)(_shift(a) for a in ax)
         return ax if ax < 0 else ax + 1
@@ -143,14 +164,13 @@ def _apply(fn: Any, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, boo
         return (out.reshape(fn.shape) if fn.shape else out), False
     # --- pure SHAPE ops: the unbatched op with its axes shifted past the batch axis ---------
     # A batched operand carries one extra LEADING axis, so each of these is the unbatched op
-    # re-expressed one axis over. They had no rule at all, so any program containing one fell
-    # back to the per-element loop entirely — correct, and slow in a way nothing reports.
+    # re-expressed one axis over.
     #
-    # Each rule below mirrors its op's ACTUAL body, which is not always what the name suggests:
+    # Each rule mirrors its op's actual body, which is not always what the name suggests:
     # `TransposeOp` is a FULL-REVERSE transpose (`A.T`), not a last-two-axes swap, and
-    # `ConcatOp` / `ColStackOp` FLATTEN each operand first. Writing the obvious-looking rule
-    # instead would produce wrong numbers on ndim > 2 rather than a loud failure — and a wrong
-    # batch rule is worse than none, because the fallback it replaces is correct.
+    # `ConcatOp` / `ColStackOp` FLATTEN each operand first. The obvious-looking rule would
+    # give wrong numbers on ndim > 2 rather than fail — and a wrong batch rule is worse than
+    # no rule, because the per-element fallback it replaces is correct.
     if name == "TransposeOp":
         if not bflags[0]:
             return A(0).T, False
@@ -180,6 +200,7 @@ def _apply(fn: Any, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, boo
 
 
 def _cells_batched(cells: np.ndarray, batched_atoms: set[str]) -> bool:
+    """Return whether any cell of ``cells`` mentions an atom bound to a batched slice."""
     arr = np.asarray(cells)
     for c in (arr.ravel() if arr.shape else [arr[()] if arr.shape == () else cells]):
         if isinstance(c, RationalFunction) and (set(c.gens) & batched_atoms):
@@ -187,8 +208,23 @@ def _cells_batched(cells: np.ndarray, batched_atoms: set[str]) -> bool:
     return False
 
 
-def _eval_cells(cells: np.ndarray, atoms: Mapping[str, Any], B: int | None) -> np.ndarray:
-    """Evaluate an ndarray of RF/float cells. With ``B`` (batched atom bindings) → ``(B, *cells.shape)``."""
+def _eval_cells(cells: np.ndarray, atoms: Mapping[str, np.ndarray], B: int | None) -> np.ndarray:
+    """Evaluate an ndarray of rational/float cells against ``atoms``.
+
+    Parameters
+    ----------
+    cells
+        Array of :class:`~polyarray.rational.RationalFunction` or float cells.
+    atoms
+        Atom name to its ``(B,)`` slice of input values.
+    B
+        Batch length, or ``None`` to evaluate the cells with no atom bindings at all.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``cells.shape`` when ``B`` is ``None``, else ``(B, *cells.shape)``.
+    """
     arr = np.asarray(cells)
     shape = arr.shape
     if B is None:
@@ -204,14 +240,31 @@ def _eval_cells(cells: np.ndarray, atoms: Mapping[str, Any], B: int | None) -> n
     return out
 
 
-def batched_run(program: Program, values: Mapping[str, Any]) -> np.ndarray:
-    """Evaluate ``program`` for a batch: each ``values[name]`` has a leading batch axis ``(B, *decl_shape)``.
-    Returns the ``result`` output as ``(B, *out_shape)``. Byte-identical to looping ``program.run`` per
-    batch element. Raises :class:`BatchUnsupported` on any op/construct without a batch rule."""
+def batched_run(program: Program, values: Mapping[str, npt.ArrayLike]) -> np.ndarray:
+    """Evaluate ``program`` over a whole batch in one pass.
+
+    Parameters
+    ----------
+    program
+        The program to evaluate.
+    values
+        Input name to a ``(B, *decl_shape)`` array carrying the batch on axis 0.
+
+    Returns
+    -------
+    numpy.ndarray
+        The ``result`` output, shaped ``(B, *out_shape)``.
+
+    Raises
+    ------
+    BatchUnsupported
+        If the program holds an op or construct with no batch rule; the caller should
+        fall back to one :meth:`Program.run` per batch element.
+    """
     B: int | None = None
     for inp in program.inputs:
         B = int(np.asarray(values[inp.name]).shape[0]); break
-    atoms: dict[str, Any] = {}                # atom name → (B,) array
+    atoms: dict[str, np.ndarray] = {}         # atom name → (B,) array
     bulk: dict[str, np.ndarray] = {}          # input/output name → (B, *) bulk tensor
     batched_atoms: set[str] = set()
     batched_bulk: set[str] = set()
@@ -231,14 +284,14 @@ def batched_run(program: Program, values: Mapping[str, Any]) -> np.ndarray:
                 atoms[nm] = arr[(slice(None),) + idx]
                 batched_atoms.add(nm)
 
-    def eval_sa(sa: Any) -> tuple[np.ndarray, bool]:
+    def eval_sa(sa: SymArray) -> tuple[np.ndarray, bool]:
         if sa._bulk is not None:
             return bulk[sa._bulk.name], sa._bulk.name in batched_bulk
         if _cells_batched(sa.cells, batched_atoms):
             return _eval_cells(sa.cells, atoms, B), True
         return _eval_cells(sa.cells, atoms, None), False
 
-    def resolve(ref: Any) -> tuple[np.ndarray, bool]:
+    def resolve(ref: Ref) -> tuple[np.ndarray, bool]:
         if isinstance(ref, InputRef):
             if ref.name in bulk:
                 return bulk[ref.name], ref.name in batched_bulk
