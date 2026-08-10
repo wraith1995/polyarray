@@ -118,6 +118,18 @@ def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None =
     # of a program-carrying SymArray, else syntactic simple_zero. A conservative (denser) mask is never
     # wrong, only less aggressive. Leaf inverses / Schur-combine products above
     # SymbolicBudget.schur_{inverse,matmul}_stmt_size defer to numeric Stmts.
+
+def sound_sparsity_mask(matrix: SymArray) -> np.ndarray
+    # The mask `symbolic_inverse` resolves for itself, as a value a caller can hold: a False entry is a
+    # cell PROVED zero (syntactic, or a constant within roundoff after the exact fold), a True entry
+    # claims nothing. For taking the sparsity where it is still visible — e.g. before a Program.graft,
+    # which re-homes cells as fresh atoms and so hides every provable zero.
+
+def mask_zeros(arr: SymArray, mask: np.ndarray) -> SymArray
+    # `arr` with every cell `mask` proves zero replaced by an EXACT zero of the matching lane, riding the
+    # same program. The companion of sound_sparsity_mask: writes a mask BACK INTO the matrix, so every
+    # reader (exact fold, degree walk, codegen, the consumer's own arithmetic) sees the sparsity — rather
+    # than only the one reader a `mask=` argument reaches.
 ```
 
 ## Op vocabulary (the `Stmt.fn` types)
@@ -528,8 +540,15 @@ keep their target dependency **out of `import polyarray`** (front-end ops are
 supplied by the caller, never imported by polyarray):
 
 - `numpy_source.to_numpy_source(program, func_name="f", op_renderers=None)` —
-  a standalone numpy `.py` source string. Front-end Stmt ops emit via
-  `op_renderers` keyed by op class name.
+  a standalone numpy `.py` source string. The emitted function takes one
+  parameter per program input, one per `IntAtom`, and one per **free feed atom**
+  (a cell generator bound by neither an input nor a statement output — savo's
+  per-cell vertex atoms in a mid-pipeline program are the case; appended last in
+  sorted generator-name order, and threaded into sub-`Program`/`vmap` bodies that
+  are open over them). Front-end Stmt ops emit via a `__numpy_source__(self,
+  args) -> str` hook on the op class — the same shape as pyab's
+  `__pyab_lower__`, discovered without any threading — or via `op_renderers`
+  keyed by op class name, which takes precedence over the hook.
 - `pyab` — lower a `Program` to **PyArrayBackend IR** (torch-compilable).
   Requires `pyarraybackend` (imported lazily); `torch` only when compiling
   through the torch backend. Public surface:

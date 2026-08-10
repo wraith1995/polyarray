@@ -249,6 +249,68 @@ def _program_of(obj: Observable) -> Program | None:
     return cur if isinstance(cur, Program) else None
 
 
+#: Name of the output :func:`_program_with_result` declares on its copy for the staged value.
+_RESULT_OUTPUT = "staged_result"
+
+
+def _program_with_result(program: Program, obj: Observable) -> tuple[Program, str]:
+    """``program`` extended with the staged value as a declared OUTPUT, plus a note for the header.
+
+    Parameters
+    ----------
+    program
+        The :class:`~polyarray.ir.Program` the staged value was computed on.
+    obj
+        Whatever the call site staged.  Only a :class:`~polyarray.ir.SymArray` riding ``program``
+        gains an output; anything else (a bare ``Program``, a wrapper) is returned untouched.
+
+    Returns
+    -------
+    tuple
+        ``(program_to_render, note)`` — a COPY carrying the extra output when one was added, else
+        ``program`` itself; ``note`` is a header comment for the rendered file, empty when nothing
+        changed.
+
+    Notes
+    -----
+    A staged ``SymArray`` is usually not a declared output of the program its cells are expressions
+    over — the statements are the sampling/lowering chain, and the value the stage is *about* lives
+    only in the cells the caller holds.  Rendered as-is, the emitted function therefore computes
+    every statement and then ends ``return None``: nothing connects the code to the matrix.
+    Declaring the array as an output makes the rendered function return it.
+
+    ⚠ OBSERVATION-ONLY.  The output is declared on :meth:`~polyarray.ir.Program.copy`, never on the
+    live program: a dump must not change what the compile does, and ``add_output`` mutates the
+    program it is called on.  ``copy`` shares only the frozen input descriptors and ring data, so
+    the caller's ``outputs`` dict is untouched.
+
+    Nothing is FORCED.  ``add_output`` accepts the ``SymArray`` itself, which copies the cell
+    placeholder and the bulk handle without reading ``cells`` — so a bulk (deferred) array is
+    declared as bulk rather than materialised.
+    """
+    from .ir import SymArray
+
+    if not isinstance(obj, SymArray):
+        return program, ""
+    own = obj.program
+    if own is None or own is not program:
+        return program, ""
+    if any(out is obj or out._cells is obj._cells for out in own.outputs.values()):
+        return program, ""                       # already the program's own result — render as-is
+    try:
+        copy = own.copy()
+        name, n = _RESULT_OUTPUT, 1
+        while name in copy.outputs:
+            n += 1
+            name = f"{_RESULT_OUTPUT}_{n}"
+        copy.add_output(name, obj)
+    except Exception as exc:                      # noqa: BLE001 — a dump never breaks a compile
+        return program, (f"# the staged value could not be declared as an output "
+                         f"({type(exc).__name__}: {exc}); the program alone is below\n")
+    return copy, (f"# the value this stage was measured on is returned as {name!r}"
+                  f" (declared on a COPY of the program — the compile is unchanged)\n")
+
+
 def _one(_name: str) -> int:
     """Score every generator as degree 1, the seed this module reports degrees against."""
     return 1
@@ -864,6 +926,12 @@ class CompileTrace:
         chartlib) render through their own hooks; anything the renderer cannot express is written as
         a note rather than raising, because a dump must never break a compile.
 
+        A staged :class:`~polyarray.ir.SymArray` is rendered as the program's RESULT
+        (:func:`_program_with_result`), so the emitted function ends in a ``return`` of the value
+        the stage is about rather than the ``return None`` an undeclared array gives.  Should that
+        enriched render fail, the plain program is rendered instead — a dump degrades, it does not
+        vanish.
+
         Rendered once per stage — the first occurrence — for the same reason as ``detail``.
         """
         if obj is None or key in self._program_text:
@@ -887,11 +955,23 @@ class CompileTrace:
         self._program_text[key] = True
         from . import numpy_source
 
-        try:
-            src = numpy_source.to_numpy_source(program)
-        except Exception as exc:
-            src = (f"# to_numpy_source failed: {type(exc).__name__}: {exc}\n"
-                   f"# (the program is still summarised in stage.txt)\n")
+        with_result, result_note = _program_with_result(program, target)
+        src = None
+        if with_result is not program:
+            try:
+                src = numpy_source.to_numpy_source(with_result)
+                note += result_note
+            except Exception as exc:
+                note += (f"# rendering the staged value as the result failed "
+                         f"({type(exc).__name__}: {exc}); the program alone is below\n")
+        else:
+            note += result_note
+        if src is None:
+            try:
+                src = numpy_source.to_numpy_source(program)
+            except Exception as exc:
+                src = (f"# to_numpy_source failed: {type(exc).__name__}: {exc}\n"
+                       f"# (the program is still summarised in stage.txt)\n")
         (d / "program.py").write_text(note + src, encoding="utf-8")
 
     def _stage_text(self, snap: Snapshot) -> str:
@@ -1216,6 +1296,24 @@ def dump_dir_for(name: str) -> Path | None:
     return _CURRENT.get().dump_dir_for(name)
 
 
+def dump_root() -> Path | None:
+    """Return the ambient trace's dump directory, the parent of every stage directory.
+
+    Returns
+    -------
+    Path or None
+        The root, or ``None`` below :attr:`Level.DUMP`.
+
+    Notes
+    -----
+    For artefacts that belong to the RUN rather than to one stage. A process-wide compiler cache is
+    the case this exists for: one cache serves every stage, so writing it inside a stage directory
+    would attribute all of it to whichever stage happened to compile first, and the stages that
+    followed would look as though they generated nothing.
+    """
+    return _CURRENT.get().dump_root
+
+
 __all__ = [
     "CompileTrace",
     "Level",
@@ -1224,6 +1322,7 @@ __all__ = [
     "active",
     "describe_value",
     "dump_dir_for",
+    "dump_root",
     "level_from_env",
     "measure",
     "off_path",
