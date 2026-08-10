@@ -1360,14 +1360,20 @@ class _Lowerer:
         c = self.core
         name = f"_sub_{len(self.helpers)}"
         self.helpers[key] = name  # reserve before recursing
+        # Params = the sub-program's own inputs, THEN its `int_atoms` (switch scrutinees) as trailing
+        # params — mirroring the top-level lowering (`as_function_def`: inputs then int_atoms). Without
+        # this a grafted sub-Program carrying an `o_<flat_id>` σ scrutinee lowers with an empty
+        # `intatom_exprs` and its `IntAtomRef` KeyErrors; the caller threads the scrutinee in
+        # (`_call_subprogram`), so a merged value kernel can carry per-DOF orientation switches.
         params = tuple(c.Param(name=_safe(inp.name)) for inp in prog.inputs)
+        params += tuple(c.Param(name=_safe(a)) for a in prog.int_atoms)
         input_exprs = {
             inp.name: c.Var(name=_safe(inp.name)) for inp in prog.inputs
         }
         sub = _Lowerer(
             prog,
             input_exprs,
-            {},
+            {a: c.Var(name=_safe(a)) for a in prog.int_atoms},
             self.opts,
             var_gen=c.UniqueVarGen(),
             defs=self.defs,
@@ -1401,7 +1407,11 @@ class _Lowerer:
     def _call_subprogram(self, prog: Program, args: list[PyExprs],
                          out: tuple[SymArray, ...]) -> tuple[str, PyExprs]:
         name = self._helper_for_program(prog)
-        call = self.core.CallExpr(fn=self.core.Var(name=name), args=tuple(args))
+        # Append the caller's expression for each of `prog`'s int_atoms as trailing call args (matching the
+        # trailing params `_helper_for_program` adds). The caller must carry the scrutinee (a merged program
+        # unions its sub-programs' int_atoms), else this KeyErrors loudly — a real mismatch, not silent.
+        call_args = list(args) + [self.intatom_exprs[a] for a in prog.int_atoms]
+        call = self.core.CallExpr(fn=self.core.Var(name=name), args=tuple(call_args))
         return ("tuple", call) if len(out) > 1 else ("single", call)
 
     def _call_vmap(self, fn: StmtOp, body: Program, args: list[PyExprs],
