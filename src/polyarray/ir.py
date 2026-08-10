@@ -29,7 +29,8 @@ import contextvars
 import os
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias, TypeGuard, Union, get_args
+from typing import (Any, Literal, Protocol, TypeAlias, TypeGuard, Union, get_args,
+                    runtime_checkable)
 
 import numpy as np
 import numpy.typing as npt
@@ -39,6 +40,38 @@ from .poly_backend import Poly
 from .rational import RationalFunction, simple_zero
 
 Cell = Union[RationalFunction, float, int]
+
+@runtime_checkable
+class VmapClosure(Protocol):
+    """A ``vmap`` closure, as the metadata :func:`vmap` stamps on it describes.
+
+    The attributes are additive and purely descriptive — evaluation never reads them — so a
+    tool can recover the batched body and the normalised axis tuples without spelunking the
+    closure cells. A front end may stamp the same attributes on a wrapper of its own; naming
+    the shape here is what lets a consumer narrow to it instead of probing with ``getattr``.
+    """
+
+    #: The per-element body the closure batches.
+    _vmap_body: Program
+    #: One entry per operand: the axis to map over, or ``None`` to broadcast it.
+    _in_axes: tuple[int | None, ...]
+    #: One entry per output: the axis the results stack on.
+    _out_axes: tuple[int | None, ...]
+
+
+@runtime_checkable
+class NestedVmapClosure(Protocol):
+    """A multi-variable nested ``vmap`` closure, batched once per bound variable.
+
+    The first :attr:`_nested_n_vars` operands each get their own vmap level; the remaining
+    :attr:`_nested_n_free` broadcast.
+    """
+
+    #: How many leading operands are batched, one nesting level each.
+    _nested_n_vars: int
+    #: How many trailing operands broadcast unbatched.
+    _nested_n_free: int
+
 
 #: A :class:`DimAtom`'s hashable identity: the tuple that names where the runtime
 #: dimension comes from.  Opaque by design — only ever compared and used as a dict key.

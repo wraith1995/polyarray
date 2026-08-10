@@ -80,6 +80,7 @@ import numpy.typing as npt
 from .ir import (
     AbsOp,
     Cell,
+    NestedVmapClosure,
     Ref,
     StmtOp,
     AddOp,
@@ -677,6 +678,7 @@ class _Emitter:
         existing = self.registry.helpers.get(key)
         if existing is not None:
             return existing
+        assert isinstance(fn, NestedVmapClosure)
         n_vars = int(fn._nested_n_vars)
         n_free = int(fn._nested_n_free)
         body_helper = self._emit_program_helper(body)
