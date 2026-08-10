@@ -1282,6 +1282,24 @@ def dump_dir_for(name: str) -> Path | None:
     return _CURRENT.get().dump_dir_for(name)
 
 
+def dump_root() -> Path | None:
+    """The ambient trace's dump directory — the parent of every stage directory.
+
+    Returns
+    -------
+    Path or None
+        The root, or ``None`` below :attr:`Level.DUMP`.
+
+    Notes
+    -----
+    For artefacts that belong to the RUN rather than to one stage. A process-wide compiler cache is
+    the case this exists for: one cache serves every stage, so writing it inside a stage directory
+    would attribute all of it to whichever stage happened to compile first, and the stages that
+    followed would look as though they generated nothing.
+    """
+    return _CURRENT.get().dump_root
+
+
 __all__ = [
     "CompileTrace",
     "Level",
@@ -1290,6 +1308,7 @@ __all__ = [
     "active",
     "describe_value",
     "dump_dir_for",
+    "dump_root",
     "level_from_env",
     "measure",
     "off_path",
