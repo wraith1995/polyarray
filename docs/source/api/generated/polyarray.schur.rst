@@ -8,5 +8,7 @@
 
    .. autosummary::
    
+      mask_zeros
+      sound_sparsity_mask
       symbolic_inverse
    
