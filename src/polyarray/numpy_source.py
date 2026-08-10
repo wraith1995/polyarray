@@ -71,13 +71,18 @@ from __future__ import annotations
 
 import keyword
 import warnings
-from collections.abc import Mapping, Sequence
-from typing import Any, Callable
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from .ir import (
     AbsOp,
+    Cell,
+    NestedVmapClosure,
+    Ref,
+    StmtOp,
     AddOp,
     AssertOp,
     AxisLenOp,
@@ -147,7 +152,7 @@ from .rational import RationalFunction, _poly_to_pyexpr, _ring_names
 __all__ = ["to_numpy_source", "OpRenderer"]
 
 
-def _vmap_body_of(fn: Any) -> Program | None:
+def _vmap_body_of(fn: StmtOp) -> Program | None:
     """Pull a per-point body :class:`Program` out of a ``vmap`` closure.
 
     Mirrors :func:`polyarray.forward._body_of` but kept local so this module
@@ -192,7 +197,9 @@ class _HelperRegistry:
 
 # A renderer maps ``(op, arg_exprs)`` to a single Python expression string that,
 # when evaluated, yields the op's result (a tuple for multi-output ops).
-OpRenderer = Callable[[Any, "list[str]"], str]
+#: Renders one statement op to a numpy expression string: ``(op, arg_exprs) -> str``.
+#: ``arg_exprs`` holds the already-rendered operand expressions, in operand order.
+type OpRenderer = Callable[[Any, list[str]], str]
 
 
 class DeadOpKeyWarning(UserWarning):
@@ -212,13 +219,14 @@ class DeadOpKeyWarning(UserWarning):
     """
 
 
-def _warn_dead_op_keys(keys: Any, where: str) -> None:
+def _warn_dead_op_keys(keys: Iterable[str], where: str) -> None:
     """Warn about supplied keys that name a polyarray op with a private spelling.
 
     Deliberately narrow. A key that resolves to nothing at all is NOT flagged: it may name a
     front-end op polyarray genuinely cannot see, and a false alarm on a legitimate key would
     train people to ignore this warning. A key whose underscore-stripped form IS one of our op
-    classes is a different matter — there is no reading of it that can ever match."""
+    classes is a different matter — there is no reading of it that can ever match.
+    """
     from . import ir as _ir
 
     for key in keys or ():
@@ -277,7 +285,8 @@ def _index_suffix(idx: tuple[int, ...]) -> str:
     return "[" + ", ".join(str(i) for i in idx) + "]"
 
 
-def _const_expr(value: Any) -> str:
+def _const_expr(value: npt.ArrayLike) -> str:
+    """Render a constant operand as a numpy source expression."""
     if isinstance(value, np.ndarray):
         return f"np.array({value.tolist()!r}, dtype=float)"
     return repr(float(value)) if isinstance(value, (int, float)) else repr(value)
@@ -349,11 +358,11 @@ class _Emitter:
     # -- free feed atoms ------------------------------------------------
 
     def _free_names(self) -> tuple[str, ...]:
-        """The free generator names of this scope, in the emitted parameter order (sorted)."""
+        """Return this scope's free generator names, sorted into the emitted parameter order."""
         return tuple(sorted(self.free_gens))
 
     def _free_params(self) -> list[str]:
-        """The parameter identifiers standing for this scope's free generators, in that order."""
+        """Return the parameter identifiers standing for this scope's free generators, in that order."""
         return [self.free_gens[g] for g in self._free_names()]
 
     def _gen_expr(self, gen: str) -> str:
@@ -518,7 +527,8 @@ class _Emitter:
 
     # -- ref resolution (mirrors Program._resolve_ref) ------------------
 
-    def _ref_expr(self, ref: Any) -> str:
+    def _ref_expr(self, ref: Ref) -> str:
+        """Render the expression a statement input ref reads from."""
         if isinstance(ref, InputRef):
             e = self.param[ref.name]
             return e + _index_suffix(ref.indices) if ref.indices else e
@@ -539,7 +549,8 @@ class _Emitter:
 
     # -- op dispatch ----------------------------------------------------
 
-    def _render_op(self, fn: Any, args: list[str]) -> str:
+    def _render_op(self, fn: StmtOp, args: list[str]) -> str:
+        """Render one statement op, via the builtin table, a supplied renderer, or its own hook."""
         renderer = self.builtin.get(type(fn))
         if renderer is None:
             renderer = self.extra_renderers.get(type(fn).__name__)
@@ -576,7 +587,7 @@ class _Emitter:
             f"{type(fn).__name__}': lambda op, args: ...}} to emit it."
         )
 
-    def _emit_vmap_helper(self, fn: Any) -> str:
+    def _emit_vmap_helper(self, fn: StmtOp) -> str:
         """Emit a ``vmap(body)`` closure as a module-level helper; return name.
 
         Mirrors :func:`polyarray.ir.vmap`'s loop exactly: each batched input
@@ -653,18 +664,21 @@ class _Emitter:
         self.registry.defs.append(block)
         return name
 
-    def _emit_nested_vmap_helper(self, fn: Any, body: Program) -> str:
-        """Emit a MULTI-var nested vmap (the antisymmetrizer's k-bound-var ``LLam`` lowering) as a
-        helper: loop the cartesian product of the ``n_vars`` basis-index axes, run the per-slice
-        body, stack into ``(*var_sizes, *cod)``, then move the var axes AFTER the cod axes — exactly
-        mirroring grassmann's ``_nested_vmap`` runtime closure.
+    def _emit_nested_vmap_helper(self, fn: StmtOp, body: Program) -> str:
+        """Emit a multi-variable nested vmap as a helper, returning its name.
+
+        Loops the cartesian product of the bound-variable axes, runs the per-slice body,
+        stacks into ``(*var_sizes, *cod)``, then moves the variable axes after the codomain
+        axes — mirroring the runtime nested-vmap closure exactly.
 
         As in :meth:`_emit_vmap_helper`, free feed atoms the body is open over are forwarded as
-        trailing parameters, passed unbatched to every per-slice call."""
+        trailing parameters, passed unbatched to every per-slice call.
+        """
         key = id(fn)
         existing = self.registry.helpers.get(key)
         if existing is not None:
             return existing
+        assert isinstance(fn, NestedVmapClosure)
         n_vars = int(fn._nested_n_vars)
         n_free = int(fn._nested_n_free)
         body_helper = self._emit_program_helper(body)
@@ -716,7 +730,8 @@ class _Emitter:
             self._nested_cell_list(cells[i]) for i in range(cells.shape[0])
         ) + "]"
 
-    def _cell_expr(self, cell: Any) -> str:
+    def _cell_expr(self, cell: Cell) -> str:
+        """Render one cell as a numpy source expression."""
         if isinstance(cell, RationalFunction):
             return self._rf_expr(cell)
         return repr(float(cell))
@@ -759,57 +774,58 @@ class _Emitter:
 # ---------------------------------------------------------------------------
 
 def _builtin_renderers() -> dict[type, OpRenderer]:
-    def det(op, a):
+    """Build the renderer table for polyarray's own typed op vocabulary."""
+    def det(op: DetOp, a: list[str]) -> str:
         return f"np.linalg.det({a[0]})"
 
-    def inv(op, a):
+    def inv(op: InvOp, a: list[str]) -> str:
         return f"np.linalg.inv({a[0]})"
 
-    def pinv(op, a):
+    def pinv(op: PinvOp, a: list[str]) -> str:
         return f"np.linalg.pinv({a[0]})"
 
-    def solve(op, a):
+    def solve(op: SolveOp, a: list[str]) -> str:
         return f"np.linalg.solve({a[0]}, {a[1]})"
 
-    def sqrt(op, a):
+    def sqrt(op: SqrtOp, a: list[str]) -> str:
         return f"np.sqrt(np.asarray({a[0]}, dtype=float))"
 
-    def absop(op, a):
+    def absop(op: AbsOp, a: list[str]) -> str:
         return f"np.abs(np.asarray({a[0]}, dtype=float))"
 
-    def sign(op, a):
+    def sign(op: SignOp, a: list[str]) -> str:
         return f"np.sign(np.asarray({a[0]}, dtype=float))"
 
-    def tensordot(op, a):
+    def tensordot(op: TensordotOp, a: list[str]) -> str:
         return f"np.tensordot({a[0]}, {a[1]}, axes={op.axes!r})"
 
-    def moveaxis(op, a):
+    def moveaxis(op: MoveaxisOp, a: list[str]) -> str:
         return f"np.moveaxis({a[0]}, {op.source!r}, {op.destination!r})"
 
-    def identity(op, a):
+    def identity(op: IdentityOp, a: list[str]) -> str:
         return f"np.asarray({a[0]})"
 
-    def assertop(op, a):
+    def assertop(op: AssertOp, a: list[str]) -> str:
         # AssertOp returns its first input unchanged (the predicate guards the
         # data dependency); we emit the passthrough only.
         return f"{a[0]}"
 
-    def einsum(op, a):
+    def einsum(op: EinsumOp, a: list[str]) -> str:
         rhs = op._rhs
         return (
             f"np.einsum({op.spec!r}, {a[0]}, "
             f"np.array({rhs.tolist()!r}, dtype=np.{op.rhs_dtype}))"
         )
 
-    def einsum_stmt(op, a):
+    def einsum_stmt(op: EinsumStmtOp, a: list[str]) -> str:
         return (
             f"np.einsum({op.spec!r}, {', '.join(a)}, optimize={op.optimize!r})"
         )
 
-    def qr(op, a):
+    def qr(op: QrOp, a: list[str]) -> str:
         return f"np.linalg.qr({a[0]}, mode={op.mode!r})"
 
-    def svd(op, a):
+    def svd(op: SvdOp, a: list[str]) -> str:
         # Multi-output (U, S, Vh, rank): np.linalg.svd + a thresholded numerical rank (mirrors
         # SvdOp.__call__). Emitted as one self-contained expression (no prelude helper needed).
         rc = "None" if op.rcond is None else repr(op.rcond)
@@ -821,14 +837,14 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
             f"_A, full_matrices={op.full_matrices!r})))({a[0]})"
         )
 
-    def switch(op, a):
+    def switch(op: SwitchOp, a: list[str]) -> str:
         branches = ", ".join(a[1:])
         return f"np.asarray([{branches}][int({a[0]})])"
 
-    def transpose(op, a):
+    def transpose(op: TransposeOp, a: list[str]) -> str:
         return f"np.asarray({a[0]}).T"
 
-    def sinv_full(op, a):
+    def sinv_full(op: SinvFullOp, a: list[str]) -> str:
         # out[i,j] = 1/S[i] on the diagonal for i < rank, else 0 (nrows×ncols).
         n, m = int(op.nrows), int(op.ncols)
         return (
@@ -839,7 +855,7 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
             f"np.concatenate([np.asarray({a[0]}, dtype=float).reshape(-1), np.ones({n})])[:{n}])"
         )
 
-    def gsvd_full(op, a):
+    def gsvd_full(op: GSvdFullOp, a: list[str]) -> str:
         # GSvdOp then re-concatenate [U|UI] / [V|VI] == the full de-whitened factors
         # (mirrors GSvdOp.__call__ exactly). Self-contained: GSvdOp has no numpy builtin.
         rc = "None" if op.rcond is None else repr(float(op.rcond))
@@ -857,7 +873,7 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
             f"np.asarray({a[2]}, dtype=float))"
         )
 
-    def block_diag(op, a):
+    def block_diag(op: BlockDiagOp, a: list[str]) -> str:
         ms = "[" + ", ".join(f"np.asarray({e}, dtype=float)" for e in a) + "]"
         return (
             "(lambda _ms: (lambda _w: np.concatenate([np.concatenate("
@@ -866,100 +882,100 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
             f"({ms})"
         )
 
-    def block_repeat(op, a):
+    def block_repeat(op: BlockRepeatOp, a: list[str]) -> str:
         return f"np.kron(np.eye({int(op.n)}), np.asarray({a[0]}, dtype=float))"
 
-    def dyn_block_repeat(op, a):
+    def dyn_block_repeat(op: DynBlockRepeatOp, a: list[str]) -> str:
         return f"np.kron(np.eye(int({a[1]})), np.asarray({a[0]}, dtype=float))"
 
     # --- Batch-2 relocated generic array ops (bodies moved from grassmann) ---
-    def dyn_eye(op, a):
+    def dyn_eye(op: DynEyeOp, a: list[str]) -> str:
         return f"np.eye(int(np.asarray({a[0]}).shape[{op.axis}]))"
 
-    def dyn_zeros(op, a):
+    def dyn_zeros(op: DynZerosOp, a: list[str]) -> str:
         dims = ", ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
         return f"np.zeros(({dims},))"
 
-    def dyn_eye_tensor(op, a):
+    def dyn_eye_tensor(op: DynEyeTensorOp, a: list[str]) -> str:
         dims = ", ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
         return f"(lambda _d: np.eye(int(np.prod(_d))).reshape(int(np.prod(_d)), *_d))([{dims}])"
 
-    def prod_shape(op, a):
+    def prod_shape(op: ProdShapeOp, a: list[str]) -> str:
         inner = ", ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
         return f"np.asarray(int({op.static} * int(np.prod([{inner}] or [1]))))"
 
-    def sum_shape(op, a):
+    def sum_shape(op: SumShapeOp, a: list[str]) -> str:
         inner = " + ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
         return f"np.asarray(int({op.static} + ({inner or '0'})))"
 
-    def sum_dim(op, a):
+    def sum_dim(op: SumDimOp, a: list[str]) -> str:
         return f"np.asarray(int(sum(np.asarray(_m).shape[{op.axis}] for _m in [{', '.join(a)}])))"
 
-    def prod_dim(op, a):
+    def prod_dim(op: ProdDimOp, a: list[str]) -> str:
         return (f"np.asarray(int(np.prod([np.asarray(_m).shape[{op.axis}] "
                 f"for _m in [{', '.join(a)}]])))")
 
-    def scale_axis_dim(op, a):
+    def scale_axis_dim(op: ScaleAxisDimOp, a: list[str]) -> str:
         return f"np.asarray(int({op.n} * np.asarray({a[0]}).shape[{op.axis}]))"
 
-    def mul_axis_dim(op, a):
+    def mul_axis_dim(op: MulAxisDimOp, a: list[str]) -> str:
         return f"np.asarray(int(int({a[0]}) * np.asarray({a[1]}).shape[{op.axis}]))"
 
-    def comp_rank(op, a):
+    def comp_rank(op: CompRankOp, a: list[str]) -> str:
         return f"np.asarray(int({op.ambient} - int({a[0]})))"
 
-    def hstack(op, a):
+    def hstack(op: HStackOp, a: list[str]) -> str:
         return f"np.hstack([np.asarray(_m, dtype=float) for _m in [{', '.join(a)}]])"
 
-    def col_stack(op, a):
+    def col_stack(op: ColStackOp, a: list[str]) -> str:
         return (f"np.stack([np.asarray(_c, dtype=float).reshape(-1) for _c in "
                 f"[{', '.join(a)}]], axis=1)")
 
-    def scale(op, a):
+    def scale(op: ScaleOp, a: list[str]) -> str:
         return f"({op.factor!r} * np.asarray({a[0]}, dtype=float))"
 
-    def scale_by(op, a):
+    def scale_by(op: ScaleByOp, a: list[str]) -> str:
         return f"(np.asarray({a[1]}, dtype=float) * np.asarray({a[0]}, dtype=float))"
 
-    def add(op, a):
+    def add(op: AddOp, a: list[str]) -> str:
         return "(" + " + ".join(f"np.asarray({e}, dtype=float)" for e in a) + ")"
 
-    def concat(op, a):
+    def concat(op: ConcatOp, a: list[str]) -> str:
         return ("np.concatenate(["
                 + ", ".join(f"np.asarray({e}, dtype=float).reshape(-1)" for e in a) + "])")
 
-    def axis_len(op, a):
+    def axis_len(op: AxisLenOp, a: list[str]) -> str:
         return f"np.asarray(int(np.asarray({a[0]}).shape[{op.axis}]))"
 
-    def reshape(op, a):
+    def reshape(op: ReshapeOp, a: list[str]) -> str:
         return f"np.asarray({a[0]}, dtype=float).reshape({tuple(op.shape)})"
 
-    def const(op, a):
+    def const(op: ConstOp, a: list[str]) -> str:
         val = np.frombuffer(op.data_bytes, dtype=op.dtype).reshape(op.shape)
         return f"np.array({val.tolist()!r}, dtype=np.{op.dtype})"
 
-    def eye(op, a):
+    def eye(op: EyeOp, a: list[str]) -> str:
         return f"np.eye({op.n})"
 
-    def first_cols(op, a):
+    def first_cols(op: FirstColsOp, a: list[str]) -> str:
         return f"np.asarray({a[0]}, dtype=float)[:, :int({a[1]})]"
 
-    def last_cols(op, a):
+    def last_cols(op: LastColsOp, a: list[str]) -> str:
         return f"np.asarray({a[0]}, dtype=float)[:, int({a[1]}):]"
 
     # --- Batch-3 relocated generic array / linalg ops (bodies from grassmann) ---
-    def project(op, a):  # Pᵀ @ v  (ambient coords -> sub-basis coords)
+    def project(op: ProjectOp, a: list[str]) -> str:  # Pᵀ @ v  (ambient coords -> sub-basis coords)
         return f"(np.asarray({a[0]}, dtype=float).T @ np.asarray({a[1]}, dtype=float).reshape(-1))"
 
-    def embed(op, a):  # P @ vsub  (sub-coords -> ambient), reshaped to op.shape
+    def embed(op: EmbedOp, a: list[str]) -> str:  # P @ vsub  (sub-coords -> ambient), reshaped to op.shape
         base = f"(np.asarray({a[0]}, dtype=float) @ np.asarray({a[1]}, dtype=float))"
         return base + (f".reshape({tuple(op.shape)})" if op.shape else "")
 
-    def kron(op, a):  # chained Kronecker product
+    def kron(op: KronOp, a: list[str]) -> str:  # chained Kronecker product
         ms = ", ".join(f"np.asarray({e}, dtype=float)" for e in a)
         return f"__import__('functools').reduce(np.kron, [{ms}])"
 
-    def kron_free(op, a):  # Kron of two maps with trailing free (basis/seed) axes (block ⊗)
+    def kron_free(op: KronFreeOp, a: list[str]) -> str:  # Kron of two maps with trailing free (basis/seed) axes (block ⊗)
         nf, ng = op.nf_free, op.ng_free
         return (
             f"(lambda _F, _G: (_F.reshape(_F.shape[0], 1, _F.shape[1], 1, *_F.shape[2:], *([1]*{ng})) "
@@ -967,20 +983,20 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
             f"_F.shape[0]*_G.shape[0], _F.shape[1]*_G.shape[1], *_F.shape[2:], *_G.shape[2:]))"
             f"(np.asarray({a[0]}, dtype=float), np.asarray({a[1]}, dtype=float))")
 
-    def inv_transpose(op, a):  # inv(A).T
+    def inv_transpose(op: InvTransposeOp, a: list[str]) -> str:  # inv(A).T
         return f"np.linalg.inv(np.asarray({a[0]}, dtype=float)).T"
 
-    def compose_via_std(op, a):  # solve(R_to, R_from)
+    def compose_via_std(op: ComposeViaStdOp, a: list[str]) -> str:  # solve(R_to, R_from)
         return f"np.linalg.solve(np.asarray({a[0]}, dtype=float), np.asarray({a[1]}, dtype=float))"
 
-    def sqrt_spd(op, a):  # the SPD square root via eigh of the symmetrized G
+    def sqrt_spd(op: SqrtSpdOp, a: list[str]) -> str:  # the SPD square root via eigh of the symmetrized G
         return (f"(lambda _w, _V: (_V * np.sqrt(_w)) @ _V.T)(*np.linalg.eigh("
                 f"0.5 * (np.asarray({a[0]}, dtype=float) + np.asarray({a[0]}, dtype=float).T)))")
 
-    def rank(op, a):  # numerical rank of A as a 0-d int
+    def rank(op: RankOp, a: list[str]) -> str:  # numerical rank of A as a 0-d int
         return f"np.asarray(int(np.linalg.matrix_rank(np.asarray({a[0]}, dtype=float), tol={op.tol!r})))"
 
-    def metric_orthonormal(op, a):  # A @ inv(chol(Aᵀ G A))ᵀ
+    def metric_orthonormal(op: MetricOrthonormalOp, a: list[str]) -> str:  # A @ inv(chol(Aᵀ G A))ᵀ
         return (f"(lambda _a, _g: _a @ np.linalg.inv(np.linalg.cholesky(_a.T @ _g @ _a)).T)"
                 f"(np.asarray({a[0]}, dtype=float), np.asarray({a[1]}, dtype=float))")
 

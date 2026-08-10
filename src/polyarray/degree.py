@@ -1,7 +1,7 @@
-"""Whole-program polynomial-degree estimation (lifted from pointwise).
+"""Whole-program polynomial-degree estimation.
 
 :func:`program_degree` walks a :class:`~polyarray.ir.Program`'s statement graph and
-propagates a POLYNOMIAL DEGREE per value from a per-input ``seed``, answering "what
+propagates a polynomial degree per value from a per-input ``seed``, answering "what
 polynomial degree is the program's output in the seeded variables?" — the question a
 quadrature-order chooser asks. Consumers seed their domain knowledge (pointwise seeds
 field inputs with ``FE degree − derivative order`` and affine geometry with 0) and get
@@ -36,7 +36,7 @@ degree weighting (default: every generator weighs 0).
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
 
 import numpy as np
 
@@ -45,11 +45,9 @@ from .forward import _body_of
 
 _INF = float("inf")
 
-# polyarray's NATIVE op degree categories, keyed by the CLASS OBJECT (not its name
-# string). Type-keying is the robustness fix: a rename/relocation of a builtin breaks
-# LOUDLY here at import instead of silently mis-degreeing — the failure mode that shipped
-# when the grassmann→polyarray op relocation renamed ~40 ops and a name-string category
-# table went stale ⇒ unknown op ⇒ `inf` degree ⇒ OverflowError / wrong quadrature order.
+# polyarray's native op degree categories, keyed by the class OBJECT rather than its
+# name: a renamed or relocated builtin then breaks loudly at import instead of falling
+# through to "unknown op" ⇒ `inf` degree ⇒ a wrong quadrature order.
 # Every Stmt.fn op class in `ir` must appear here (guarded by tests/test_degree_coverage.py).
 #   zero        — output depends on SHAPES/structure, not values      ⇒ 0
 #   passthrough — reorder / select / additive / scale-by-constant     ⇒ MAX(operands)
@@ -86,22 +84,36 @@ DEFAULT_DEGREE_KINDS: dict[type, str] = {
     _ir.DetOp: DEG_SPECIAL, _ir.CallOp: DEG_SPECIAL,
 }
 
-# Legacy NAME-string category sets — kept only for callers that still pass FRONT-END op
-# names via `program_degree`'s ``*_ops`` kwargs (front-end ops polyarray must not import).
-# polyarray's OWN builtins are covered type-safely by ``DEFAULT_DEGREE_KINDS`` above and no
-# longer need listing here; a front end may ALSO tag an op class with ``_DEGREE_KIND``.
+# Name-string category sets for FRONT-END ops, which polyarray must not import. A front
+# end extends these through `program_degree`'s ``*_ops`` kwargs, or tags its op class with
+# ``_DEGREE_KIND``. polyarray's own builtins are covered type-safely above.
 DEFAULT_ZERO_OPS: frozenset[str] = frozenset()
 DEFAULT_PASSTHROUGH_OPS: frozenset[str] = frozenset({"AssertOp", "IdentityOp", "MoveaxisOp"})
 DEFAULT_MULTILINEAR_OPS: frozenset[str] = frozenset({"EinsumStmtOp", "EinsumOp", "TensordotOp"})
 
 
-def _op_degree(fn: Any, in_degs: list[float], zero: frozenset[str],
+def _op_degree(fn: _ir.StmtOp, in_degs: list[float], zero: frozenset[str],
                passthrough: frozenset[str], multilinear: frozenset[str]) -> float:
-    """Output degree of a non-``CallOp`` statement from its operand degrees.
+    """Return the output degree of a non-``CallOp`` statement from its operand degrees.
 
-    Category resolution (robust, in order): the type-keyed native map, then an op-carried
-    ``_DEGREE_KIND`` tag (a front-end op may declare its own), then the legacy per-call
-    NAME sets. Unknown ⇒ ``inf`` (safe over-estimate)."""
+    Categories resolve in order: the type-keyed native map, then an op-carried
+    ``_DEGREE_KIND`` tag, then the per-call name sets. Unknown ops give ``inf``, the
+    safe over-estimate.
+
+    Parameters
+    ----------
+    fn
+        The statement's op.
+    in_degs
+        Degree of each operand, in operand order.
+    zero, passthrough, multilinear
+        Front-end op names to add to the corresponding native category.
+
+    Returns
+    -------
+    float
+        The output degree, or ``inf`` when the output is not polynomial in the seeds.
+    """
     kind = DEFAULT_DEGREE_KINDS.get(type(fn)) or getattr(fn, "_DEGREE_KIND", None)
     name = type(fn).__name__
     if kind == DEG_ZERO or name in zero:
@@ -129,12 +141,30 @@ def program_degree(
     multilinear_ops: frozenset[str] | set[str] = frozenset(),
     _depth: int = 0,
 ) -> float:
-    """The polynomial degree of ``program``'s output(s) given per-input degrees ``seed``.
+    """Return the polynomial degree of ``program``'s outputs given per-input degrees.
 
-    ``seed`` maps input names to degrees (missing names default to 0). ``gen_deg`` scores
-    stray ``RationalFunction`` leaf cells by generator name (default 0). The ``*_ops``
-    sets EXTEND the native categories (module docstring); pass a front end's op names
-    there. Reads ``outputs["result"]`` when present, else the max over all outputs.
+    Reads ``outputs["result"]`` when present, else takes the maximum over all outputs.
+
+    Parameters
+    ----------
+    program
+        The program to score.
+    seed
+        Degree of each input by name; missing names count as 0.
+    gen_deg
+        Degree weight of a bare generator name, used to score stray
+        :class:`~polyarray.rational.RationalFunction` leaf cells. Defaults to 0.
+    zero_ops, passthrough_ops, multilinear_ops
+        Front-end op names extending the native degree categories described in the
+        module docstring.
+    _depth
+        Recursion depth through nested ``CallOp`` bodies; a backstop against runaway
+        nesting.
+
+    Returns
+    -------
+    float
+        The output degree, or ``inf`` when the output is not polynomial in the seeds.
     """
     zero = DEFAULT_ZERO_OPS | frozenset(zero_ops)
     passthrough = DEFAULT_PASSTHROUGH_OPS | frozenset(passthrough_ops)
@@ -149,7 +179,7 @@ def program_degree(
     for name, sa in program.input_arrays.items():
         deg_by_id[id(sa._cells)] = float(seed.get(name, 0.0))
 
-    def ref_deg(ref: Any) -> float:
+    def ref_deg(ref: _ir.Ref | _ir.SymArray) -> float:
         rf = getattr(ref, "rf", None)
         if rf is not None and hasattr(rf, "compute_degree"):      # RationalRef splice → weighted leaf
             return float(rf.compute_degree({n: gen_deg(n) for n in rf._ring.names}))

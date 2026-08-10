@@ -1,6 +1,6 @@
-"""Torch backend for batched execution — lower a :class:`~polyarray.ir.Program` to torch via ``pyab`` and
-run it batched with ``torch.vmap``.
+"""Torch backend for batched execution of a :class:`~polyarray.ir.Program`.
 
+Lowers the program to torch through ``pyab`` and runs it batched with ``torch.vmap``.
 This is the torch counterpart of :func:`polyarray.batch.batched_run` (numpy). Rather than a hand-written
 torch evaluator, it uses the sanctioned lowering path: ``pyab.compile_torch(program)`` compiles the IR to a
 per-element torch function, and ``torch.vmap`` batches it over the leading axis — so the batching stays an
@@ -20,11 +20,13 @@ hook on its class (discovered by ``pyab``'s ``_render_op``); a missing lowering 
 from __future__ import annotations
 
 import os
-from typing import Any, Mapping
+from collections.abc import Mapping
 
 import numpy as np
+import numpy.typing as npt
 
 from .ir import Program
+from .pyab import OpLowering
 
 __all__ = [
     "batched_torch",
@@ -36,51 +38,46 @@ __all__ = [
 
 
 def torch_available() -> bool:
-    """True iff both ``torch`` and ``pyarraybackend`` import — the torch backend is usable."""
+    """Report whether both ``torch`` and ``pyarraybackend`` import, i.e. the backend is usable."""
     import importlib.util as u
     return u.find_spec("torch") is not None and u.find_spec("pyarraybackend") is not None
 
 
-# --- pyab op-lowerings for the front-end ops — now the ONE canonical op-carried-hook path ------------
-# The grassmann-origin FEEC ops (``_ReshapeOp``/``_AxisLenOp``/``_FirstColsOp``/``_ProjectOp``/
-# ``_EmbedOp``/``_AddOp``/``_ScaleOp``/``_ConstOp``) each now carry their OWN pyab lowering as a
-# ``__pyab_lower__(self, builder, args, low)`` method on the op class (grassmann ``lower/represent.py`` +
-# ``lower/space_basis.py``) — the sanctioned twin of ``numpy_source``'s ``__numpy_source__`` hook, which
-# pyab's ``_render_op`` discovers by ``getattr``. The orientation ``SwitchOp`` and ``AssertOp`` are native
-# pyab builtins (``pyab._switch_expr`` is now the canonical vmap-safe one-hot; ``AssertOp`` passes through).
-# So NO ``op_lowerings`` dict is needed anymore: plain ``LowerOpts()`` lowers everything.
-#
-# The two functions below stay EXPORTED for back-compat (older callers still write
-# ``LowerOpts(op_lowerings=feec_op_lowerings())``) but are now empty SHIMS — an empty dict means "let the
-# hooks + native builtins do the work". They add nothing and override nothing.
+# --- pyab op lowerings ------------------------------------------------------------------
+# A front-end op carries its own lowering as a ``__pyab_lower__(self, builder, args, low)``
+# method on the op class, which pyab's ``_render_op`` discovers by ``getattr`` — the twin of
+# ``numpy_source``'s ``__numpy_source__`` hook. ``SwitchOp`` and ``AssertOp`` are native pyab
+# builtins. Plain ``LowerOpts()`` therefore lowers everything, and no ``op_lowerings`` dict is
+# needed; the two accessors below stay exported, and empty, for callers that still pass one.
 
-def switch_vmap_op_lowerings() -> dict:
-    """Back-compat shim — returns ``{}``.
+def switch_vmap_op_lowerings() -> dict[str, OpLowering]:
+    """Return an empty op-lowering table for ``SwitchOp``.
 
-    The vmap-safe ``SwitchOp`` lowering (one-hot · stacked branches) is now the CANONICAL pyab
-    builtin (``pyab._Lowerer._switch_expr``): for a dynamic/batched scrutinee it emits the pure-
-    arithmetic one-hot that lowers under ``torch.vmap`` (and a concrete-``Const`` scrutinee takes a
-    direct branch-pick fast path). No ``op_lowerings`` override is needed; kept only so callers that
-    still merge this dict keep working."""
+    The vmap-safe ``SwitchOp`` lowering — a one-hot over stacked branches — is a pyab builtin
+    (``pyab._Lowerer._switch_expr``): a dynamic or batched scrutinee emits the pure-arithmetic
+    one-hot that lowers under ``torch.vmap``, and a concrete ``Const`` scrutinee takes a direct
+    branch-pick fast path. No override is needed.
+    """
     return {}
 
 
-def feec_op_lowerings() -> dict:
-    """Back-compat shim — returns ``{}``.
+def feec_op_lowerings() -> dict[str, OpLowering]:
+    """Return an empty op-lowering table for the FEEC front-end ops.
 
-    The grassmann-origin FEEC ops now carry their own ``__pyab_lower__`` hooks (discovered by pyab's
-    ``_render_op``) and ``SwitchOp``/``AssertOp`` are native builtins, so plain ``LowerOpts()`` lowers
-    the whole FEEC residual. Kept exported (and empty) so callers that still write
-    ``LowerOpts(op_lowerings=feec_op_lowerings())`` keep working with no behaviour change."""
+    Those ops carry their own ``__pyab_lower__`` hooks, so plain ``LowerOpts()`` lowers the whole
+    FEEC residual with no override.
+    """
     return {}
 
 
 def _free_tcp_port() -> int:
-    """A currently-free localhost TCP port (bind to :0, read the OS-assigned port, release).
+    """Return a currently-free localhost TCP port.
 
-    There is a tiny window between release and ``init_process_group`` rebinding it, but the
-    port is per-process and ephemeral, so parallel xdist workers / concurrent runs each get a
-    distinct one — unlike a fixed port, which they all collide on (hang / silent dead PG)."""
+    Binds to port 0, reads the port the OS assigned, and releases it. There is a tiny window
+    between release and ``init_process_group`` rebinding it, but each port is ephemeral and
+    per-process, so parallel xdist workers and concurrent runs each get a distinct one. A fixed
+    port instead collides across them, hanging or leaving a dead process group.
+    """
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -95,9 +92,13 @@ def ensure_torch_pg(port: int | None = None) -> None:
     importing mpi4py), so initializing a 1-rank group here avoids the mpi4py / MPI dependency for
     single-process use. Idempotent.
 
-    ``port`` defaults to a FREE ephemeral port (was a fixed 29591, which collided under
-    ``pytest -n auto`` / concurrent agents). An already-set ``MASTER_PORT`` env still wins
-    (``setdefault``), so a hand-pinned port is honoured."""
+    Parameters
+    ----------
+    port
+        Port for the group's rendezvous. Defaults to a free ephemeral port, so concurrent
+        processes do not collide. An already-set ``MASTER_PORT`` environment variable wins,
+        so a hand-pinned port is honoured.
+    """
     import torch.distributed as td
     if td.is_initialized():
         return
@@ -108,13 +109,31 @@ def ensure_torch_pg(port: int | None = None) -> None:
     td.init_process_group(backend="gloo", rank=0, world_size=1)
 
 
-def batched_torch(program: Program, values: Mapping[str, Any]) -> np.ndarray:
-    """Evaluate ``program`` for a whole batch on torch: each ``values[name]`` carries a leading batch axis
-    ``(B, *decl_shape)``. Returns the ``result`` output as a numpy array ``(B, *out_shape)``.
+def batched_torch(program: Program, values: Mapping[str, npt.ArrayLike]) -> np.ndarray:
+    """Evaluate ``program`` over a whole batch on torch.
 
-    Lowers ``program`` to a per-element torch function via ``pyab.compile_torch`` and batches it with
-    ``torch.vmap`` over axis 0 of every input (in program-input order). Numerically matches the per-element
-    loop to ~machine epsilon (torch's contraction kernels differ from numpy's by ~1 ULP)."""
+    Lowers ``program`` to a per-element torch function via ``pyab.compile_torch`` and batches it
+    with ``torch.vmap`` over axis 0 of every input, in program-input order. Matches the
+    per-element loop to about machine epsilon; torch's contraction kernels differ from numpy's
+    by roughly one ulp.
+
+    Parameters
+    ----------
+    program
+        The program to evaluate.
+    values
+        Input name to a ``(B, *decl_shape)`` array carrying the batch on axis 0.
+
+    Returns
+    -------
+    numpy.ndarray
+        The ``result`` output, shaped ``(B, *out_shape)``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``torch`` or ``pyarraybackend`` is not installed.
+    """
     if not torch_available():
         raise RuntimeError(
             "batched_torch requires `torch` and `pyarraybackend`; install them (optional deps) to use the "
