@@ -17,6 +17,7 @@
       active
       describe_value
       dump_dir_for
+      dump_root
       level_from_env
       measure
       observe_compile
