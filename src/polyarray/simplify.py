@@ -83,7 +83,7 @@ def _simple_stmt(stmt: Stmt) -> bool:
     A dynamic (runtime ``DimAtom``-sized) bulk output is foldable too: with all-numeric
     inputs the statement is a value-invariant map — a constant SVD, GSVD, QR or pinv whose
     numerical rank is statically knowable — so it is executed, its concrete output shape
-    read, and the ``DimAtom``s it created resolved. With any non-numeric input the fold loop
+    read, and the dimension atoms it created resolved. With any non-numeric input the fold loop
     skips it and the dynamic dimension survives unchanged.
     """
     if stmt.fn is None:
@@ -278,7 +278,7 @@ def _seed_bind(
 def _resolve_stmt_dims(
     stmt: Stmt, stmt_idx: int, outs: list[np.ndarray], dim_subst: dict[DimSource, int],
 ) -> None:
-    """Resolve the ``DimAtom``s a folded statement's concrete outputs size.
+    """Resolve the dimension atoms a folded statement's concrete outputs size.
 
     The build-time mirror of :meth:`Program._bind_output`: a not-yet-bound ``DimAtom`` in a
     bulk output's declared shape binds from the realised array's actual axis size, keyed by

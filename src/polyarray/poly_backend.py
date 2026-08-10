@@ -32,9 +32,13 @@ import sympy as sp
 from sympy.polys.rings import PolyElement, PolyRing
 
 if TYPE_CHECKING:
-    from flint import fmpq as _fmpq
     from flint import fmpq_mpoly as _fmpq_mpoly
     from flint import fmpq_mpoly_ctx as _fmpq_mpoly_ctx
+
+try:  # python-flint is optional; the alias below must resolve without it
+    from flint import fmpq as _fmpq
+except ImportError:  # with no flint there is no exact-rational coefficient type
+    _fmpq = mpmath.mpf
 
 #: A ground coefficient of whichever backend is active: a 53-bit ``mpf`` real under
 #: sympy, an exact rational under flint.
