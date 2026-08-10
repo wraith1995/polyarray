@@ -193,7 +193,8 @@ def _warn_dead_op_keys(keys: Any, where: str) -> None:
     Deliberately narrow. A key that resolves to nothing at all is NOT flagged: it may name a
     front-end op polyarray genuinely cannot see, and a false alarm on a legitimate key would
     train people to ignore this warning. A key whose underscore-stripped form IS one of our op
-    classes is a different matter — there is no reading of it that can ever match."""
+    classes is a different matter — there is no reading of it that can ever match.
+    """
     from . import ir as _ir
 
     for key in keys or ():
@@ -544,7 +545,8 @@ class _Emitter:
         """Emit a MULTI-var nested vmap (the antisymmetrizer's k-bound-var ``LLam`` lowering) as a
         helper: loop the cartesian product of the ``n_vars`` basis-index axes, run the per-slice
         body, stack into ``(*var_sizes, *cod)``, then move the var axes AFTER the cod axes — exactly
-        mirroring grassmann's ``_nested_vmap`` runtime closure."""
+        mirroring grassmann's ``_nested_vmap`` runtime closure.
+        """
         key = id(fn)
         existing = self.registry.helpers.get(key)
         if existing is not None:

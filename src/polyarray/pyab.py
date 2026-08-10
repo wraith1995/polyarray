@@ -278,7 +278,8 @@ def _render_sinv_full(op: Any, builder: Any, args: list, low: Any) -> list:
 def _render_gsvd_full(op: Any, builder: Any, args: list, low: Any) -> list:
     """``GSvdOp`` then re-concatenate ``[U|UI]`` / ``[V|VI]`` — reuses the pyab ``_gsvd``
     composite (whiten / svd / rank-threshold / de-whiten) so behaviour matches the native
-    GSVD lowering; ``_gsvd`` reads the operand refs off ``low._cur_in_refs``."""
+    GSVD lowering; ``_gsvd`` reads the operand refs off ``low._cur_in_refs``.
+    """
     c = low.core
     u, ui, v, vi, s, rank = low._gsvd(GSvdOp(rcond=op.rcond), args, None, low._cur_in_refs)
     ufull = c.ConcatExpr(arrays=(u, ui), axis=1)
@@ -288,7 +289,8 @@ def _render_gsvd_full(op: Any, builder: Any, args: list, low: Any) -> list:
 
 def _render_block_diag(op: Any, builder: Any, args: list, low: Any) -> list:
     """Block-diagonal ``diag(A, B, …)`` from zero-padded row-blocks concatenated on axis 0
-    (block sizes read off runtime ``ShapeExpr`` — vmap-safe / dynamic-shape correct)."""
+    (block sizes read off runtime ``ShapeExpr`` — vmap-safe / dynamic-shape correct).
+    """
     c = low.core
     f64 = low._dtype_f64()
     col_widths = [_axis_len(low, x, 1) for x in args]
@@ -532,7 +534,8 @@ def _render_kron(op: Any, builder: Any, args: list, low: Any) -> list:
 def _render_kron_free(op: Any, builder: Any, args: list, low: Any) -> list:
     """Block-Kron on the two space axes with an outer product on the (disjoint) trailing
     free axes.  Reshapes read the runtime ``df/cf/dg/cg`` and free axes off ``ShapeExpr``
-    (vmap-safe)."""
+    (vmap-safe).
+    """
     c = low.core
     f, g = args
     one = c.IntLit(value=1)
@@ -566,7 +569,8 @@ def _render_compose_via_std(op: Any, builder: Any, args: list, low: Any) -> list
 def _render_sqrt_spd(op: Any, builder: Any, args: list, low: Any) -> list:
     """The SPD square root ``(V·√w)·Vᵀ`` from ``eigh`` of the symmetrized ``G``.  The SPD
     guard is a runtime assert that does not change the returned data, so (like ``AssertOp``)
-    it is omitted from the emitted data path; ``torch.vmap`` batches the plain 2-D eigh."""
+    it is omitted from the emitted data path; ``torch.vmap`` batches the plain 2-D eigh.
+    """
     c = low.core
     g = args[0]
     sym = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.FloatLit(value=0.5),
@@ -582,7 +586,8 @@ def _render_sqrt_spd(op: Any, builder: Any, args: list, low: Any) -> list:
 def _render_rank(op: Any, builder: Any, args: list, low: Any) -> list:
     """The numeric column rank of ``A`` as a 0-d int.  ``matrix_rank`` has the same name in
     numpy and torch; the absolute-tol kwarg (``tol=`` numpy / ``atol=`` torch) is passed per
-    namespace."""
+    namespace.
+    """
     c = low.core
     kw = (c.KwArg(name="tol" if low.opts.target != "torch" else "atol",
                   value=c.FloatLit(value=float(op.tol))),)
@@ -660,7 +665,8 @@ def _fp_bound_names(core: Any, params: tuple, body: tuple) -> set[str]:
     alpha-normalized and two different globals could fingerprint alike. Today's emitters
     build no nested defs/lambdas (the only ``FunctionDefStmt``s are the module-level helper
     and entry), so the situation is unreachable; :func:`_helper_fingerprint` REFUSES on a
-    nested def or lambda rather than rely on that, which makes the claim unconditional."""
+    nested def or lambda rather than rely on that, which makes the claim unconditional.
+    """
     bound = {p.name for p in params}
 
     def collect_target(t: Any) -> None:
@@ -704,7 +710,8 @@ def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
     the stream would erase. Also refuses on a NESTED def/lambda, whose binders would make
     :func:`_fp_bound_names`' unscoped set alpha-normalize an outer free global of the same
     spelling (unreachable with today's emitters; refusing keeps the invariant
-    unconditional rather than contingent on them)."""
+    unconditional rather than contingent on them).
+    """
     import hashlib
 
     def has_nested_scope(node: Any) -> bool:
@@ -1058,7 +1065,8 @@ class _Lowerer:
         ``CallExpr(fn=Var("int"), args=(o_var,))`` — the ``int(tensor)`` is exactly
         what breaks ``torch.vmap`` (it calls ``.item()`` on a batched tensor).
         Recover the raw ``o_var`` so the one-hot switch lowers as pure arithmetic.
-        Passthrough if not so wrapped."""
+        Passthrough if not so wrapped.
+        """
         c = self.core
         if isinstance(expr, c.CallExpr) and isinstance(expr.fn, c.Var) and expr.fn.name == "int":
             return expr.args[0]
@@ -1118,7 +1126,7 @@ class _Lowerer:
         return self.core.ReduceExpr(a=a, op=op, axis=None, keepdims=False)
 
     def _svd_rank(self, s_var: Any, max_mn: int, rcond: float | None) -> Any:
-        """rank = number of singular values above numpy's matrix_rank tolerance."""
+        """Rank = number of singular values above numpy's matrix_rank tolerance."""
         c = self.core
         smax = self.b.assign_new(self._reduce(s_var, c.ReduceOp.MAX), base="smax")
         if rcond is None:
@@ -1352,7 +1360,8 @@ class _Lowerer:
         level each, over axis 0); the remaining ``n_free`` args broadcast.  torch
         stacks the batched axes in front, so — matching numpy_source's
         ``_emit_nested_vmap_helper`` — we then ``moveaxis`` the leading ``n_vars``
-        var axes to the end (``(*cod, *var_sizes)``)."""
+        var axes to the end (``(*cod, *var_sizes)``).
+        """
         c = self.core
         n_vars = int(fn._nested_n_vars)
         n_free = int(fn._nested_n_free)
@@ -1397,7 +1406,8 @@ class _Lowerer:
         inline operand is re-emitted in full at every use site.  Binding the Var turns
         those uses into references; pyab's content-addressed CSE then collapses the
         bindings themselves, so an id-keyed memo here still lands on distinct-by-content.
-        Empty arrays keep falling through (nothing to share)."""
+        Empty arrays keep falling through (nothing to share).
+        """
         arr = np.asarray(cells)
         if arr.size == 0:
             return self._cells_expr(cells)
@@ -1930,13 +1940,15 @@ class PyabIROversizedError(RuntimeError):
     """Raised by the oversized-IR backstop in ``raise`` mode (``PYAB_IR_CEILING=raise``): the program's
     symbolic IR blew past the cost ceiling — an eager materialization / un-folded data-independent solve —
     so compilation is aborted HERE (fast + loud, with a top-offenders breakdown) instead of proceeding to
-    the render/codegen that would OOM or hang. Catchable so a caller can fall back / re-plan (`§E2`)."""
+    the render/codegen that would OOM or hang. Catchable so a caller can fall back / re-plan (`§E2`).
+    """
 
 
 def _ir_ceiling_mode() -> str:
     """How the oversized-IR backstop reacts, from ``PYAB_IR_CEILING`` ∈ {``warn`` (default), ``raise``,
     ``off``}. ``raise`` is for CI/dev: turn a blow-up into an instant, attributed failure at compile
-    time rather than a slow OOM/hang downstream (§E1/E2 blow-up blocker-avoidance)."""
+    time rather than a slow OOM/hang downstream (§E1/E2 blow-up blocker-avoidance).
+    """
     return os.environ.get("PYAB_IR_CEILING", "warn").strip().lower()
 
 
@@ -1947,7 +1959,8 @@ def _check_ir_oversized(program: Program, name: str) -> None:
     ``warn`` (one warning, the compile proceeds — DEFAULT, behaviour-preserving), ``raise``
     (:class:`PyabIROversizedError`, abort now with a top-offenders breakdown), or ``off``. Rides
     :func:`polyarray.forward.analyze` (cheap on bulk programs, which it skips — the asymmetry is the
-    signal). The ANALYSIS never breaks a compile; only ``raise`` mode raises, and only deliberately."""
+    signal). The ANALYSIS never breaks a compile; only ``raise`` mode raises, and only deliberately.
+    """
     mode = _ir_ceiling_mode()
     if mode == "off":
         return

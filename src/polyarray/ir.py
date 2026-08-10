@@ -64,7 +64,8 @@ def budget_override(budget: SymbolicBudget | None):
 
 def current_budget_override() -> SymbolicBudget | None:
     """The ambient `budget_override` budget, or None. For builders that construct a `Program` with an
-    EXPLICIT budget (e.g. chartlib's SymbolicInterpreter) and want to honor the override themselves."""
+    EXPLICIT budget (e.g. chartlib's SymbolicInterpreter) and want to honor the override themselves.
+    """
     return _BUDGET_OVERRIDE.get()
 
 
@@ -1015,7 +1016,8 @@ class SymArray:
         :class:`EinsumStmtOp` :class:`Stmt` and keeps the chain deferred. Mathematically the same
         contraction; it is simply not densified into the symbolic ring on the way. A bulk array is by
         construction a Stmt output (opaque atoms), so this never intercepts the numeric lane, and a
-        non-bulk operand set takes exactly the code below."""
+        non-bulk operand set takes exactly the code below.
+        """
         prog = self.program
         operands: list[SymArray | np.ndarray] = [self]
         for o in others:
@@ -1505,7 +1507,8 @@ class BlockRepeatOp:
 @dataclass(frozen=True)
 class DynBlockRepeatOp:
     """``n`` block-diagonal copies of ``A`` with a **runtime** count ``n`` —
-    ``kron(eye(int(n)), A)``."""
+    ``kron(eye(int(n)), A)``.
+    """
 
     def __call__(self, A: np.ndarray, n: np.ndarray) -> np.ndarray:  # noqa: N803
         a = np.asarray(A, dtype=float)
@@ -1527,7 +1530,8 @@ class DynBlockRepeatOp:
 @dataclass(frozen=True)
 class DynEyeOp:
     """A runtime identity sized by a reference array's axis (default the rank column at axis 1;
-    ``axis=k`` sizes ``np.eye`` off ``ref.shape[k]``)."""
+    ``axis=k`` sizes ``np.eye`` off ``ref.shape[k]``).
+    """
 
     axis: int = 1
 
@@ -1548,7 +1552,8 @@ class DynZerosOp:
 @dataclass(frozen=True)
 class DynEyeTensorOp:
     """``np.eye(∏dᵢ).reshape(∏dᵢ, d₀, d₁, …)`` — the vmap identity of a MULTI-axis DimVar binder
-    (a matrix/tensor seed ``ℝⁿ⊸ℝⁿ``); each ``dᵢ`` read from ``refs[i].shape[axes[i]]``."""
+    (a matrix/tensor seed ``ℝⁿ⊸ℝⁿ``); each ``dᵢ`` read from ``refs[i].shape[axes[i]]``.
+    """
 
     axes: tuple[int, ...]
 
@@ -1839,7 +1844,8 @@ class ComposeViaStdOp:
 @dataclass(frozen=True)
 class SqrtSpdOp:
     """The symmetric-positive-definite operator square root ``S`` with ``S·S = G`` — via
-    eigendecomposition of the symmetrized matrix.  **Fails loudly** if ``G`` is not SPD."""
+    eigendecomposition of the symmetrized matrix.  **Fails loudly** if ``G`` is not SPD.
+    """
 
     def __call__(self, G: np.ndarray) -> np.ndarray:  # noqa: N803
         A = 0.5 * (np.asarray(G, dtype=float) + np.asarray(G, dtype=float).T)
@@ -2387,26 +2393,20 @@ class SwitchOp:
 # The op union — polyarray's CLOSED ``Stmt.fn`` vocabulary
 # ---------------------------------------------------------------------------
 #
-# ``Stmt.fn`` itself is deliberately OPEN (``Callable | Program | None``): a front end
-# above polyarray may put its own op class, a ``vmap`` closure, or a plain callable
-# there, and a sub-:class:`Program` is not an op at all.  What IS closed is the set of
-# ops **polyarray owns** — the ~56 frozen dataclasses defined above.  :data:`StmtFn`
-# names that set so a pass over it can be written as an exhaustive ``match`` finished by
-# ``typing.assert_never``: an op added to the union but missing from a pass becomes a
-# *mypy error* instead of a silent capability gap.
+# ``Stmt.fn`` itself is deliberately OPEN (see :data:`StmtOp`): a front end above
+# polyarray may put its own op class, a ``vmap`` closure, or a plain callable there, and
+# a sub-:class:`Program` is not an op at all.  What IS closed is the set of ops
+# **polyarray owns** — the frozen dataclasses defined above.  :data:`StmtFn` names that
+# set so a pass over it can be written as an exhaustive ``match`` finished by
+# ``typing.assert_never``.
 #
-# This exists because omission-by-accident is polyarray's measured failure mode, not a
-# hypothetical one.  Three defects in one day, all "the op was simply not in the ladder":
-# ``KronOp``/``KronFreeOp`` missing from ``exact_fold._sym_apply`` froze the ``Λ²``
-# certificate at 0%; ``SwitchOp`` missing from ``exact_fold`` entirely froze every
-# ``select_x``; and a degree table keyed by class-NAME strings went stale across the
-# grassmann→polyarray op relocation (see ``degree.DEFAULT_DEGREE_KINDS``).  In every case
-# the op was opaque **by omission, never by decision**.
+# This is load-bearing: an op left out of a pass is opaque to it, which degrades
+# silently — a folded constant stays symbolic, a mask stays dense, a certificate stalls
+# at zero — rather than raising.  Naming the union makes the omission a mypy error.
 #
-# Rule for a new op (with `CLAUDE.md`'s "new ops are rare events"): add it to
-# :data:`StmtFn` here, then run mypy — it will name every pass that must now state a
-# decision.  A *deliberate* non-handling is fine, but it must be an explicit arm that
-# says why.
+# Rule for a new op: add it to :data:`StmtFn`, then run mypy — it will name every pass
+# that must now state a decision.  Deliberately not handling an op is fine, but it must
+# be an explicit arm that says why.
 StmtFn: TypeAlias = Union[
     # linalg / scalar deferrals
     DetOp, InvOp, PinvOp, SolveOp, SqrtOp, AbsOp, SignOp, SvdOp, GSvdOp, QrOp,
@@ -2428,14 +2428,29 @@ StmtFn: TypeAlias = Union[
 #: so the two can never drift.
 STMT_FN_OPS: tuple[type, ...] = get_args(StmtFn)
 
+#: Everything a :attr:`Stmt.fn` may hold: one of polyarray's own ops, a nested
+#: :class:`Program`, a front-end op or plain callable, or ``None`` for a statement that
+#: exists only to splice rational expressions.  Narrow it with :func:`is_builtin_op`.
+StmtOp: TypeAlias = Union[StmtFn, "Program", Callable[..., Any], None]
 
-def is_builtin_op(fn: object) -> TypeGuard[StmtFn]:
-    """Whether ``fn`` is one of polyarray's OWN ops (:data:`StmtFn`).
+
+def is_builtin_op(fn: StmtOp) -> TypeGuard[StmtFn]:
+    """Return whether ``fn`` is one of polyarray's own ops (:data:`StmtFn`).
 
     The narrowing gate in front of an exhaustive ``match``: everything else a
     ``Stmt.fn`` may hold — a sub-:class:`Program`, a ``vmap`` closure, a front-end op
     class, a plain callable, ``None`` — is genuinely open and must be handled *before*
     this check, not inside the match.
+
+    Parameters
+    ----------
+    fn
+        The value held by a statement's ``fn`` slot.
+
+    Returns
+    -------
+    bool
+        True when ``fn`` is a member of the closed :data:`StmtFn` union.
     """
     return isinstance(fn, STMT_FN_OPS)
 
@@ -2521,7 +2536,8 @@ def _einsum_label_dims(
     """Map each non-ellipsis label in the spec to the operand axis size it carries.
 
     Operands may be ``SymArray`` (including BULK ones): shapes are read through
-    :func:`_op_shape`, which answers from the placeholder and never materialises cells."""
+    :func:`_op_shape`, which answers from the placeholder and never materialises cells.
+    """
     label_dim: dict[str, int] = {}
     for part, arr in zip(input_parts, operands):
         shp = _op_shape(arr)
@@ -3143,7 +3159,8 @@ class Program:
         own input atoms relabeled onto ``self``, so ``self`` resolves their leaf generators (``V_0_0``…) by
         name when it lowers — a generator ``self`` cannot produce surfaces downstream as an unbound generator.
         A program-less ``foreign`` (numeric, or already inline on ``self``) needs no Stmts and is a plain
-        relabel. Idempotent on ``self``'s own arrays (``foreign.program is self`` ⇒ returned unchanged)."""
+        relabel. Idempotent on ``self``'s own arrays (``foreign.program is self`` ⇒ returned unchanged).
+        """
         src = foreign.program
         if src is self:
             return foreign
@@ -3692,7 +3709,8 @@ _PROBE_DIRECT_EVAL = False
 @contextlib.contextmanager
 def probe_direct_eval():
     """Scope in which the program runner uses no-``compile`` RF evaluation — for FEW-run
-    probes (the structural-mask). See :data:`_PROBE_DIRECT_EVAL`."""
+    probes (the structural-mask). See :data:`_PROBE_DIRECT_EVAL`.
+    """
     global _PROBE_DIRECT_EVAL
     prev = _PROBE_DIRECT_EVAL
     _PROBE_DIRECT_EVAL = True

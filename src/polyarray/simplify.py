@@ -79,7 +79,8 @@ def _simple_stmt(stmt: Stmt) -> bool:
     execute it, read the concrete output shape, and resolve the ``DimAtom``s it
     created (see :func:`_resolve_stmt_dims` / :func:`_substitute_dims`).  When its
     inputs are *not* all numeric the fold loop simply skips it and the dynamic δ
-    survives unchanged — byte-identical to the pre-fold behaviour."""
+    survives unchanged — byte-identical to the pre-fold behaviour.
+    """
     if stmt.fn is None:
         return False
     if isinstance(stmt.fn, _SKIP_OPS):
@@ -89,7 +90,8 @@ def _simple_stmt(stmt: Stmt) -> bool:
 
 def _exec_fn(fn: Any, resolved: list[np.ndarray]) -> list[Any]:
     """Execute a Stmt fn on concrete numeric operands, mirroring ``_run_stmt``'s
-    dispatch (a raw sub-Program runs via ``.run``; everything else is called)."""
+    dispatch (a raw sub-Program runs via ``.run``; everything else is called).
+    """
     if isinstance(fn, Program):
         value_map = {inp.name: np.asarray(v) for inp, v in zip(fn.inputs, resolved)}
         return list(fn.run(value_map).values())
@@ -110,7 +112,8 @@ def _try_eval_ref(
     back. The ``dict(known)`` this used to do was a type coercion, and it ran ONCE PER
     REF of every surviving statement over a ``known`` that reaches 10⁵+ atoms on a
     high-degree affine gate. A non-``dict`` ``Mapping`` is still materialised, so the
-    signature's contract is unchanged."""
+    signature's contract is unchanged.
+    """
     b: dict[str, float] = known if isinstance(known, dict) else dict(known)
     try:
         return np.asarray(prog._resolve_ref(ref, stmt_idx, b), dtype=float)
@@ -121,7 +124,8 @@ def _try_eval_ref(
 def _cells_touch_known(cells: np.ndarray, known: Mapping[str, float]) -> bool:
     """True iff some ``RationalFunction`` cell references a generator in ``known`` — i.e.
     folding ``known`` into ``cells`` would actually substitute something.  When False the
-    fold is a structural no-op on these cells (see :func:`_fold_cells`)."""
+    fold is a structural no-op on these cells (see :func:`_fold_cells`).
+    """
     if not known:
         return False
     for c in cells.reshape(-1):
@@ -145,7 +149,8 @@ def _fold_cells(cells: np.ndarray, known: Mapping[str, float]) -> np.ndarray:
     the cells' generators by NAME — a fallback that knows FIELD degrees but not the
     geometry/position generators, so a broken link silently drops the position's degree
     (the Koszul ``κ = x·`` factor) and under-integrates the drop-Vandermonde.  A fold
-    that substitutes nothing must therefore leave the cell array's identity intact."""
+    that substitutes nothing must therefore leave the cell array's identity intact.
+    """
     if cells.dtype.kind == "f":
         return cells.copy()
     if not _cells_touch_known(cells, known):
@@ -177,7 +182,8 @@ def _numify_constant_cells(cells: np.ndarray) -> np.ndarray:
     ``partial_eval_numeric`` intent that "unused inputs simply go unread". A cell that still
     carries a live generator (genuinely vertex-dependent) is left as an ``RF``, so a
     cell-dependent array stays object-dtype and ``evaluate({})`` still raises — which the
-    ``affine_invariance`` / ``P(T)`` gates read as "does not fold to a constant"."""
+    ``affine_invariance`` / ``P(T)`` gates read as "does not fold to a constant".
+    """
     if cells.dtype.kind == "f":
         return cells
     out = np.empty(cells.shape, dtype=object)
@@ -216,7 +222,8 @@ def _fold_ref(
     known: Mapping[str, float], idx_map: Mapping[int, int],
 ) -> Any:
     """Rewrite a surviving Stmt's input ref: numeric where determined, else a
-    symbolically-folded version (and OutputRef stmt-indices remapped)."""
+    symbolically-folded version (and OutputRef stmt-indices remapped).
+    """
     if isinstance(ref, IntAtomRef):
         return ref
     num = _try_eval_ref(prog, ref, stmt_idx, known)
@@ -276,7 +283,8 @@ def _resolve_stmt_dims(
     carry the axis — e.g. an SVD ``rank`` output whose δ physically sizes a
     downstream ``take_cols`` output); binding follows where the axis actually
     appears, exactly as at run time.  A δ already resolved by an earlier fold is
-    left untouched (first-wins), matching ``d.source not in dim_bindings``."""
+    left untouched (first-wins), matching ``d.source not in dim_bindings``.
+    """
     for k, bound in enumerate(stmt.out):
         if bound._bulk is None or not is_dynamic(bound._bulk.shape):
             continue
@@ -300,7 +308,8 @@ def _record_known(
     A *dynamic* bulk output's declared shape (carrying ``DimAtom`` entries) is
     resolved against ``dim_subst`` before validating the produced tensor's shape
     — a KeyError there means an unresolved δ, which the caller treats as a failed
-    fold (keep the Stmt symbolic)."""
+    fold (keep the Stmt symbolic).
+    """
     for k, bound in enumerate(stmt.out):
         arr = np.asarray(outs[k], dtype=float)
         if bound._bulk is not None:
@@ -339,7 +348,8 @@ def _subst_shape(
     Returns ``(new_shape, changed)``.  A ``DimAtom`` not in ``dim_subst`` (a δ
     from a Stmt that did *not* fold — genuinely data-dependent) passes through
     untouched; concrete entries are unchanged.  ``changed`` lets callers avoid
-    rebuilding shared frozen objects when nothing was substituted."""
+    rebuilding shared frozen objects when nothing was substituted.
+    """
     if not is_dynamic(shape):
         return shape, False
     out: list[Any] = []
@@ -358,7 +368,8 @@ def _subst_bulk_symarray(
 ) -> SymArray:
     """A fresh SymArray with its bulk shape's resolved δ's substituted, or ``sa``
     unchanged when there is nothing to substitute (never mutates in place — the
-    old bulk handle may be shared)."""
+    old bulk handle may be shared).
+    """
     if sa._bulk is None:
         return sa
     new_shape, changed = _subst_shape(sa._bulk.shape, dim_subst)
@@ -402,7 +413,8 @@ def _substitute_dims(
     would never bind (KeyError at run time).  A stmt-sourced δ in an input shape
     that now points at a folded-away Stmt is harmless: at run time the fed array is
     bound directly and that δ is never resolved (the producing Stmt would have, but
-    the input itself is validated axis-by-axis, skipping stmt-sourced dims)."""
+    the input itself is validated axis-by-axis, skipping stmt-sourced dims).
+    """
     if not dim_subst:
         return
     # Statements: input refs + output SymArrays.
@@ -508,7 +520,8 @@ def _is_rebuildable_vmap(fn: Any) -> bool:
     """A vmap closure this pass can REBUILD needs all three attrs :func:`~polyarray.ir.vmap`
     sets — ``_vmap_body`` / ``_in_axes`` / ``_out_axes``. Some front-end wrappers expose only
     ``_vmap_body`` (for body introspection) without the axis tuples; those are NOT rebuildable
-    here (``pa.ir.vmap`` needs the axes), so we must skip them — not crash on a missing attr."""
+    here (``pa.ir.vmap`` needs the axes), so we must skip them — not crash on a missing attr.
+    """
     return all(hasattr(fn, a) for a in ("_vmap_body", "_in_axes", "_out_axes"))
 
 
@@ -516,7 +529,8 @@ def _vmap_closure_of(fn: Any) -> tuple[Any, Any] | None:
     """If ``fn`` is a REBUILDABLE :func:`~polyarray.ir.vmap` closure (or a :class:`CallOp` wrapping
     one — carrying ``_vmap_body`` / ``_in_axes`` / ``_out_axes``), return ``(closure, rewrap)`` where
     ``rewrap`` rebuilds an equivalent ``fn`` from a fresh closure; else ``None`` (a wrapper missing the
-    axis tuples degrades to no-fold)."""
+    axis tuples degrades to no-fold).
+    """
     if _is_rebuildable_vmap(fn):
         return fn, (lambda c: c)
     if isinstance(fn, CallOp) and _is_rebuildable_vmap(fn.fn):
@@ -535,7 +549,8 @@ def _drop_unread_inputs(prog: Program) -> Program:
     and cannot be folded. Dropping it is value-preserving by definition: nothing reads it.
 
     Referencing is decided on ATOMS (:func:`symarray_atoms` over every Stmt operand and every
-    output), not on a syntactic scan, so an input reached through a folded cell still counts."""
+    output), not on a syntactic scan, so an input reached through a folded cell still counts.
+    """
     if not prog.inputs:
         return prog
     used: set[str] = set()
@@ -587,7 +602,8 @@ def _fold_vmap_body(
 
     Returns ``(fn', keep)``: ``keep`` is ``None`` when the operand list is unchanged, else a
     per-operand mask the caller applies (a bound operand is no longer an input of the body, so it
-    must leave the Stmt too, or the ``in_axes`` would misalign)."""
+    must leave the Stmt too, or the ``in_axes`` would misalign).
+    """
     info = _vmap_closure_of(fn)
     if info is None or depth >= _MAX_DESCENT_DEPTH:
         return fn, None
@@ -771,7 +787,8 @@ def _read_stmt_outs(stmt: Stmt, bindings: Mapping[str, Any]) -> list[np.ndarray]
     """Read a Stmt's OUTPUT arrays back from a completed run's ``bindings`` (the dict
     ``Program.build_runtime_bindings`` returns): a bulk output under its bulk name, a
     per-cell output assembled from its cell atoms. ``None`` when any piece is absent
-    (e.g. a dynamic shape this pass does not handle)."""
+    (e.g. a dynamic shape this pass does not handle).
+    """
     outs: list[np.ndarray] = []
     for bound in stmt.out:
         if bound._bulk is not None:
@@ -805,7 +822,8 @@ class NonExactFoldWarning(UserWarning):
     Raised (as a warning) whenever ``mode="hybrid"`` freezes a statement the exact
     lane could not normalize — the certificate for those statements is probabilistic
     (measure-zero failure), not exact-by-construction.  Silence with
-    ``mode="probe"`` (accept probing), or forbid with ``mode="exact"``."""
+    ``mode="probe"`` (accept probing), or forbid with ``mode="exact"``.
+    """
 
 
 class NonDeterministicFoldWarning(NonExactFoldWarning):
@@ -819,7 +837,8 @@ class NonDeterministicFoldWarning(NonExactFoldWarning):
     It is a :class:`NonExactFoldWarning` subclass so that every existing consumer of
     fold provenance (notably pointwise's certificate cache, which decides the ``exact`` bit by
     walking this hierarchy) treats it as non-exact without changes.  Seeing it means the cost
-    model needs fixing, not the budget raising."""
+    model needs fixing, not the budget raising.
+    """
 
 
 _PARTIAL_EVAL_MODES = ("exact", "hybrid", "probe")
@@ -833,7 +852,8 @@ def _resolve_legacy_time_budget(time_budget: float | None) -> float | None:
     committed surface carries it and pointwise has external consumers, but it no longer
     selects certificates: it now sizes the backstop, i.e. it still guarantees the call
     terminates, which is the reason callers passed it.  Because the meaning genuinely changed,
-    passing it warns rather than silently doing something else than it used to."""
+    passing it warns rather than silently doing something else than it used to.
+    """
     if time_budget is None:
         return None                            # `None` = exact_fold's default backstop
     warnings.warn(
@@ -850,7 +870,8 @@ def _resolve_partial_eval_mode(mode: str | None) -> str:
     """``mode`` (or the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default) validated.
 
     The explicit parameter is the API; the env var only moves the DEFAULT
-    (``None``) — an explicit argument always wins."""
+    (``None``) — an explicit argument always wins.
+    """
     if mode is None:
         mode = os.environ.get("POLYARRAY_PARTIAL_EVAL_MODE", "hybrid")
     if mode not in _PARTIAL_EVAL_MODES:
@@ -1074,7 +1095,8 @@ def partial_eval_numeric(
 
     The budget is work, NOT seconds: what certifies is a function of the program alone, so the
     same input yields the same certificate on any machine under any load.  See
-    :class:`NonDeterministicFoldWarning` for the one case where that guarantee lapses."""
+    :class:`NonDeterministicFoldWarning` for the one case where that guarantee lapses.
+    """
     new, _known, _state = _partial_eval_numeric(
         program, probes=probes, seed=seed, rtol=rtol, atol=atol,
         mode=_resolve_partial_eval_mode(mode), work_budget=work_budget,
@@ -1100,7 +1122,8 @@ def partial_eval_numeric_symarray(
     cancellation that completes only at the entry (no single statement invariant)
     still folds, exact-by-construction.  ``mode``/``probes``/``work_budget``/
     ``max_sym_mass`` as in
-    :func:`partial_eval_numeric`."""
+    :func:`partial_eval_numeric`.
+    """
     from .ir import SymArray
     if sa.program is None:
         return sa
@@ -1287,7 +1310,8 @@ def symarray_atoms(sa: SymArray) -> set:
 
 def _symarray_atoms(sa: SymArray) -> set:
     """The run-time binding-key atoms a SymArray reads: its bulk name, or its
-    cells' RationalFunction generators (the keys ``SymArray.evaluate`` resolves)."""
+    cells' RationalFunction generators (the keys ``SymArray.evaluate`` resolves).
+    """
     bulk = getattr(sa, "_bulk", None)
     if bulk is not None:
         return {bulk.name}

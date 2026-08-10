@@ -220,7 +220,8 @@ _WALL_BACKSTOP_SECONDS = 900.0
 def _wall_deadline(wall_backstop: float | None) -> float | None:
     """The monotonic instant the backstop fires, or ``None`` when there is none.
 
-    ``wall_backstop=None`` ⇒ the module default; ``math.inf`` ⇒ no backstop at all."""
+    ``wall_backstop=None`` ⇒ the module default; ``math.inf`` ⇒ no backstop at all.
+    """
     seconds = _WALL_BACKSTOP_SECONDS if wall_backstop is None else float(wall_backstop)
     return None if math.isinf(seconds) else time.monotonic() + seconds
 
@@ -230,7 +231,8 @@ class _Exhausted(Exception):
 
     ``wall`` distinguishes the two exits — ``False`` is the ordinary deterministic work budget,
     ``True`` is the backstop firing, which is a MEASUREMENT BUG (the cost model under-counted
-    this program) and is reported loudly rather than folded into the normal degrade path."""
+    this program) and is reported loudly rather than folded into the normal degrade path.
+    """
 
     def __init__(self, wall: bool = False) -> None:
         super().__init__("wall-clock backstop" if wall else "work budget")
@@ -248,7 +250,8 @@ class _Meter:
     which is why `_MAX_SYM_MASS` (per-op, checked BEFORE the op runs) remains the other half of
     the cost story and is not replaced by this.
 
-    `limit <= 0` means unbounded (used by the calibration harness to measure a full pass)."""
+    `limit <= 0` means unbounded (used by the calibration harness to measure a full pass).
+    """
 
     limit: int
     wall_deadline: float | None = None
@@ -279,7 +282,8 @@ def _exhausted_note(exc: _Exhausted, meter: _Meter) -> str:
 
     The ordinary one names the budget and what was spent, so the fix ("raise it") is legible
     from the warning alone.  The backstop one SHOUTS, because it means the result depends on
-    the machine again and the cost model needs fixing, not the budget."""
+    the machine again and the cost model needs fixing, not the budget.
+    """
     if exc.wall:
         return (f"WALL-CLOCK BACKSTOP fired after {meter.spent} work units — this result is "
                 f"NOT reproducible; the work cost model under-counted this program")
@@ -291,7 +295,8 @@ def _resolve_work_budget(work_budget: int | None) -> int:
 
     The env knob is what makes the budget KEYABLE by pointwise's verdict cache — a certificate
     produced under a different budget must not be served for this one (see
-    ``table_cache._VERDICT_ENV_KNOBS``)."""
+    ``table_cache._VERDICT_ENV_KNOBS``).
+    """
     if work_budget is not None:
         return int(work_budget)
     raw = os.environ.get(_WORK_BUDGET_ENV)
@@ -309,7 +314,8 @@ class _Reason:
     wins — e.g. the QR / front-end sign-fix inside a ``grass_dof`` sub-program,
     not the outer ``Program`` wrapper.  One instance is created PER
     :func:`exact_partial_eval` call and threaded explicitly (no module global —
-    thread-safe, and an escaping exception cannot leak a stale note)."""
+    thread-safe, and an escaping exception cannot leak a stale note).
+    """
 
     __slots__ = ("value",)
 
@@ -382,7 +388,8 @@ def _exact_eval_at(rf: RationalFunction, k: int) -> RationalFunction:
     generator; no RNG): every generator is composed with an exact DYADIC rational
     constant (``0.5 + 0.25·m`` — float→fmpq conversion is exact), so the result is
     an exact constant :class:`RationalFunction`, with no float rounding anywhere.
-    Raises when the point is singular (denominator vanishes there)."""
+    Raises when the point is singular (denominator vanishes there).
+    """
     sub = {g: RationalFunction.constant(0.5 + 0.25 * ((7 * i + 3 * k + 1) % 11))
            for i, g in enumerate(sorted(rf.gens))}
     return rf.compose_multi(sub)
@@ -396,7 +403,8 @@ def _rf_mass(rf: RationalFunction) -> int:
 def _sym_mass(values: Any, cap: int) -> int:
     """Total monomial mass of ``values`` (an operand / list of operands), counted
     EARLY-EXIT: accumulation stops as soon as ``cap`` is exceeded, so an enormous
-    operand costs O(cap) to reject rather than O(size) to measure."""
+    operand costs O(cap) to reject rather than O(size) to measure.
+    """
     total = 0
     stack = list(values) if isinstance(values, list) else [values]
     while stack:
@@ -423,7 +431,8 @@ def _charge(meter: _Meter | None, units: int) -> None:
     The granularity is PER OPERATION: the charge lands before each exact evaluation / gcd /
     Gauss column / vmap slice, so one already-started flint operation can still overrun —
     accepted; the budget bounds the work *started*, exactly as the wall-clock check it
-    replaces did.  What changed is the currency, not the granularity."""
+    replaces did.  What changed is the currency, not the granularity.
+    """
     if meter is not None:
         meter.charge(units)
 
@@ -443,7 +452,8 @@ def _constant_value(rf: RationalFunction, meter: _Meter | None = None) -> float 
     meter, which raises :class:`_Exhausted` when the budget is gone — a pathological cell (an
     enormous uncancelled quintic — the degree-5 regime) must degrade to *unresolved* (⇒ the
     warned probe fallback), never hang the gate.  The charge is this cell's own monomial mass,
-    because that is what both the evaluation and the gcd scale with."""
+    because that is what both the evaluation and the gcd scale with.
+    """
     if rf.is_zero():
         return 0.0                           # exact structural zero (num ≡ 0)
     if not rf.gens:
@@ -475,7 +485,8 @@ def _constant_value(rf: RationalFunction, meter: _Meter | None = None) -> float 
 def _cell_constant(cell: Any, meter: _Meter | None = None) -> float | None:
     """Exact constant value of one cell (float / RF), else ``None``.
 
-    Raises :class:`_Exhausted` (via :func:`_constant_value`) when the budget is gone."""
+    Raises :class:`_Exhausted` (via :func:`_constant_value`) when the budget is gone.
+    """
     if isinstance(cell, (int, float, np.integer, np.floating)):
         return float(cell)
     if isinstance(cell, RationalFunction):
@@ -506,7 +517,8 @@ def _resolve_rf(
 
     ``max_sym_mass`` (when given) caps the SUBSTITUTION's monomial mass: one
     ``compose_multi`` runs uninterrupted, so an oversized replacement set is declared
-    unresolvable up front rather than blowing the time budget from inside."""
+    unresolvable up front rather than blowing the time budget from inside.
+    """
     sub: dict[str, RationalFunction] = {}
     mass = _rf_mass(rf)
     for g in rf.gens:
@@ -594,7 +606,8 @@ def _exact_inv(a: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
     is a unit of the field); the resulting entries are the inverse AS RATIONAL
     FUNCTIONS, i.e. the identity ``A·A⁻¹ = I`` holds identically wherever
     ``det A ≠ 0`` — the correct generic-inverse semantics for identity
-    certification.  Raises on an exactly singular matrix."""
+    certification.  Raises on an exactly singular matrix.
+    """
     a = np.asarray(a, dtype=object)
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
         raise ValueError(f"exact inverse needs a square matrix, got {a.shape}")
@@ -784,7 +797,8 @@ def _const_int(val: Any) -> int | None:
     Several ops carry an integer operand — a rank, a block count — that SIZES the result
     rather than contributing to it.  Such an operand is not something to approximate: if it
     has not resolved to a constant the statement is genuinely unresolved, so the twins bail
-    rather than pick a value."""
+    rather than pick a value.
+    """
     num = _as_numeric(val)
     if num is None or num.size != 1:
         return None
@@ -793,7 +807,8 @@ def _const_int(val: Any) -> int | None:
 
 def _exact_block_repeat(a: np.ndarray, count: int, reason: _Reason) -> list[Any] | None:
     """``n`` block-diagonal copies of ``a`` over exact cells — the shared body of the static
-    (:class:`BlockRepeatOp`) and runtime-counted (:class:`DynBlockRepeatOp`) twins."""
+    (:class:`BlockRepeatOp`) and runtime-counted (:class:`DynBlockRepeatOp`) twins.
+    """
     if a.ndim != 2:
         reason.note("BlockRepeat: non-matrix operand")
         return None
@@ -1353,7 +1368,8 @@ def exact_partial_eval(
     `simplify` turns it into a loud ``NonDeterministicFoldWarning``.  ``None`` disables it.
 
     Never raises on op content — every failure mode degrades to ``unresolved``
-    (which ``mode="hybrid"`` hands to the loud probe fallback)."""
+    (which ``mode="hybrid"`` hands to the loud probe fallback).
+    """
     from .simplify import _record_known
 
     limit = _resolve_work_budget(work_budget)
@@ -1463,7 +1479,8 @@ def exact_fold_cells(
     normal form has total degree zero is replaced by its exact constant.  Cells that
     cannot be normalized (opaque statements in their cone) or that are genuinely
     non-constant are left UNTOUCHED — including object identity when nothing folds
-    (the ``_fold_cells`` structure-transparency contract)."""
+    (the ``_fold_cells`` structure-transparency contract).
+    """
     cells = np.asarray(cells)
     if cells.dtype.kind == "f":
         return cells

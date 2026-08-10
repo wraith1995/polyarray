@@ -78,7 +78,8 @@ _EAGER_CANCEL: contextvars.ContextVar = contextvars.ContextVar("_pa_eager_cancel
 @contextlib.contextmanager
 def eager_cancel(den_degree_threshold: int = 2):
     """Within this context, cancel RF arithmetic results whose denominator degree exceeds the
-    threshold (0 restores the default lazy behavior)."""
+    threshold (0 restores the default lazy behavior).
+    """
     tok = _EAGER_CANCEL.set(int(den_degree_threshold))
     try:
         yield
@@ -153,7 +154,8 @@ def _to_qq(coeff: NumericLike | sp.Expr) -> float:
 
 def _coeff_abs_float(co: Any) -> float:
     """Best-effort ``|coeff|`` → ``float`` across coefficient backends (Python float / int,
-    flint ``fmpq``, sympy Rational/mpf). Used by the numeric-magnitude sparsity test."""
+    flint ``fmpq``, sympy Rational/mpf). Used by the numeric-magnitude sparsity test.
+    """
     if isinstance(co, float):
         return abs(co)
     try:
@@ -331,7 +333,8 @@ class RationalFunction:
         A *numeric* magnitude for a tolerance-based sparsity test: a cell whose numerator
         coefficients are all negligible (``≤ tol·scale``) is an identically-zero rational function
         up to float roundoff (e.g. chartLib QR / Orthopoly's irrational normalization) — a structural
-        zero that exact :meth:`is_zero` misses. Distinct from ``is_zero`` (which is exact)."""
+        zero that exact :meth:`is_zero` misses. Distinct from ``is_zero`` (which is exact).
+        """
         m = 0.0
         for _, co in self._num.terms():
             c = _coeff_abs_float(co)
@@ -594,7 +597,8 @@ class RationalFunction:
         points) but is pure waste for a FEW: the 3-point structural-mask probe
         (:func:`polyarray.schur._structural_mask`) compiled every cell of a degree-5 ``C`` and
         used it 3× — ~31 s (``_compile_eval``: ``builtins.compile`` + ``_poly_term_strings``)
-        of a high-degree symbolic build, for nothing. Byte-identical ⇒ identical mask."""
+        of a high-degree symbolic build, for nothing. Byte-identical ⇒ identical mask.
+        """
         names = _ring_names(self._ring)
         if not names:
             return self._eval_constant_to_float()
@@ -966,7 +970,8 @@ def _eval_poly_full(poly: Poly, names: Sequence[str], bindings: Mapping[str, Any
     :func:`_poly_term_strings` (the source the compiled evaluator is built from), so the result
     is bit-identical to running that compiled evaluator — a skipped zero-coefficient term
     contributes ``0.0`` (a float no-op), so omitting it (as the string builder does) changes
-    nothing."""
+    nothing.
+    """
     total = 0.0
     for monom, coeff in poly.terms():
         c = _coeff_to_float(coeff)
@@ -1224,7 +1229,9 @@ def schur_inverse(matrix: np.ndarray, top_left: int) -> np.ndarray:
 
     For
     ``M = [[A, B], [C, D]]`` with ``A`` square of size ``top_left``,
-    returns
+
+    Returns
+    -------
     ``M^{-1}`` via
     ``S = D - C A^{-1} B``,
     ``[[A^{-1} + A^{-1} B S^{-1} C A^{-1}, -A^{-1} B S^{-1}],

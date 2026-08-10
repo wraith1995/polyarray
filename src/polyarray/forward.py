@@ -1,9 +1,8 @@
-"""Forward-on-IR: post-analysis + cost-driven partial evaluation of a Program.
+"""Post-build analysis and cost-driven partial evaluation of a :class:`Program`.
 
-Plan B step 5.  Once a sampler has been *built* (under whatever
-:class:`SymbolicBudget`), the result is a :class:`~chartlib._symbolic.ir.Program`
-— possibly "big symbols" (budget-zero) or fully collapsed (legacy).  This module
-is the post-build half: **look at the generated code and reshape it by choice.**
+Building a program under a :class:`~polyarray.ir.SymbolicBudget` decides how much
+symbolic structure it carries. This module is the half that runs afterwards: look at
+what was generated, and reshape it by choice.
 
 * :func:`analyze` walks a Program (and every nested sub-Program / vmap body) and
   reports structure + cost — statement counts, deferral/offload nodes, per-output
@@ -13,8 +12,8 @@ is the post-build half: **look at the generated code and reshape it by choice.**
 
 * :func:`partial_eval` is the cost-driven transform: collapse every output cell
   whose symbolic cost exceeds a chosen bound (capturing it as a fresh atom via an
-  ``IdentityOp`` Stmt), leaving cheaper cells symbolic.  It is the opt-in,
-  post-build inverse of the build-time defer-when-over-budget gate, and is
+  ``IdentityOp`` Stmt), leaving cheaper cells symbolic.  It is the post-build
+  counterpart of the build-time defer-when-over-budget gate, and is
   **exactness-preserving** — the captured cell is evaluated at ``run`` time, so
   ``partial_eval(p).run(x) == p.run(x)`` for all ``x`` — it only changes *form*.
 """
@@ -36,6 +35,7 @@ from .ir import (
     RationalRef,
     Ref,
     SymArray,
+    StmtOp,
     SymArrayRef,
     _cell_size,
     is_builtin_op,
@@ -47,7 +47,7 @@ from .rational import RationalFunction
 # Descent into nested programs (sub-Programs + vmap closure bodies)
 # ---------------------------------------------------------------------------
 
-def _body_of(fn) -> Program | None:
+def _body_of(fn: StmtOp) -> Program | None:
     """Pull a per-point body :class:`Program` out of a ``vmap`` closure."""
     for c in getattr(fn, "__closure__", None) or ():
         try:
@@ -60,10 +60,18 @@ def _body_of(fn) -> Program | None:
 
 
 def iter_programs(top: Program) -> list[Program]:
-    """``top`` plus every nested program (sub-Program fns and vmap bodies).
+    """Return ``top`` plus every nested program (sub-Program fns and vmap bodies).
 
-    Deterministic order: ``top`` first, then nested programs in
-    statement / discovery order, deduplicated by identity.
+    Parameters
+    ----------
+    top
+        The outermost program.
+
+    Returns
+    -------
+    list of Program
+        ``top`` first, then nested programs in statement / discovery order,
+        deduplicated by identity.
     """
     seen: dict[int, Program] = {}
     order: list[Program] = []
@@ -115,25 +123,30 @@ class IRReport:
 
     @property
     def n_programs(self) -> int:
+        """Number of programs covered, counting ``top`` and every nested body."""
         return len(self.rows)
 
     @property
     def n_defer(self) -> int:
+        """Number of statements whose ``fn`` is a typed op, summed over all programs."""
         return sum(r.n_defer for r in self.rows)
 
     @property
     def total_mass(self) -> int:
+        """Monomial count over symbolic output cells, summed over all programs."""
         return sum(r.total_mass for r in self.rows)
 
     @property
     def total_operand_mass(self) -> int:
-        """Σ monomial count over non-bulk RF OPERAND cells across all programs — the
-        real codegen/lowering cost (``total_mass`` counts only outputs, which einsums
-        defer to atoms, so it hides the operand expansion)."""
+        """Monomial count over non-bulk rational OPERAND cells, over all programs.
+
+        This is the real codegen cost. ``total_mass`` counts only outputs, which
+        einsums defer to atoms, so it hides the operand expansion entirely.
+        """
         return sum(r.operand_mass for r in self.rows)
 
     def prov_kinds(self) -> dict[str, int]:
-        """Generator-provenance histogram aggregated over all programs."""
+        """Return the generator-provenance histogram aggregated over all programs."""
         out: dict[str, int] = {}
         for r in self.rows:
             for k, v in r.prov_kinds.items():
@@ -158,40 +171,35 @@ class IRReport:
         return "\n".join(lines)
 
 
-def _is_op(fn) -> bool:
-    """A typed IR op (offload / freeze / linalg / control flow) vs a plain
-    callable / sub-Program.
+def _is_op(fn: StmtOp) -> bool:
+    """Return whether ``fn`` is a typed IR op rather than a plain callable or program.
 
-    polyarray's own vocabulary answers by TYPE (:data:`~polyarray.ir.StmtFn`).  The
-    class-name suffix is kept ONLY for ops belonging to a front end above polyarray,
-    which this layer must not import and therefore cannot name — the counted quantity
-    ("how many statements defer to an op") is deliberately open-world.  Every builtin
-    ends in ``Op``, so this is the same answer the name test alone gave.
+    polyarray's own vocabulary answers by type (:data:`~polyarray.ir.StmtFn`). The
+    class-name suffix covers ops belonging to a front end above polyarray, which this
+    layer must not import and therefore cannot name: the counted quantity — how many
+    statements defer to an op — is deliberately open-world.
     """
     return is_builtin_op(fn) or type(fn).__name__.endswith("Op")
 
 
 def _prov_kind(program: Program, gen: str) -> str:
-    """Provenance kind of a generator *as seen by this program's env*.
+    """Return the provenance kind of a generator as seen by this program's env.
 
-    A generator not declared in ``program.env`` is reported ``"extern"`` — a
-    free symbol the program receives a binding for at run time (typically a
-    geometry vertex / DoF atom, which lives in the *geometry's* env, separate
-    from the interpreter program's).  ``"extern"`` is therefore the post-analysis
-    signal "still symbolic over an outside input" — the opposite of ``stmt_out``
-    (collapsed to a program-internal atom).
+    A generator not declared in ``program.env`` reports ``"extern"``: a free symbol the
+    program receives a binding for at run time, typically a geometry vertex or DoF atom
+    living in the geometry's own env. ``"extern"`` therefore reads as "still symbolic
+    over an outside input", the opposite of ``"stmt_out"``.
     """
     p = program.env._provenance.get(gen)
     return getattr(p, "kind", "extern") if p is not None else "extern"
 
 
-def _ref_rf_cells(ref: Ref) -> list:
-    """The RationalFunction operand cells a Stmt input ref carries (non-bulk only).
+def _ref_rf_cells(ref: Ref) -> list[RationalFunction]:
+    """Return the rational operand cells a statement input ref carries, bulk excluded.
 
-    Exhaustive over :data:`~polyarray.ir.Ref` — polyarray's *other* closed sum type —
-    for the same reason the op union is: a ref kind that falls off the end contributes
-    nothing to ``operand_mass``, which reads as "this program is cheap" rather than as a
-    missing case.
+    Exhaustive over :data:`~polyarray.ir.Ref`, polyarray's other closed sum type: a ref
+    kind falling off the end would contribute nothing to ``operand_mass``, which reads
+    as "this program is cheap" rather than as a missing case.
     """
     match ref:
         case SymArrayRef():
@@ -214,6 +222,7 @@ def _ref_rf_cells(ref: Ref) -> list:
 
 
 def _row(program: Program) -> ProgramRow:
+    """Measure one program's statement, output-cell and operand-cell costs."""
     n_defer = sum(_is_op(st.fn) for st in program.statements)
     n_cells = sym_cells = total_mass = max_cell = 0
     op_mass = max_op = n_op = 0
@@ -257,7 +266,18 @@ def _row(program: Program) -> ProgramRow:
 
 
 def analyze(program: Program) -> IRReport:
-    """Walk ``program`` and every nested body; return an :class:`IRReport`."""
+    """Walk ``program`` and every nested body, returning a structural and cost report.
+
+    Parameters
+    ----------
+    program
+        The outermost program.
+
+    Returns
+    -------
+    IRReport
+        One :class:`ProgramRow` per program, ``program`` first.
+    """
     return IRReport(rows=tuple(_row(p) for p in iter_programs(program)))
 
 
@@ -276,11 +296,21 @@ def partial_eval(program: Program, *, max_cell_size: int) -> Program:
 
     Exactness-preserving: the captured cell is evaluated against the run-time
     bindings, so for every input ``x`` the returned program's outputs equal the
-    original's.  Operates on the **top** program's outputs only (nested vmap
-    bodies are left intact); descending into bodies is a later slice.
+    original's.
 
-    ``max_cell_size = 0`` collapses every symbolic output cell to an atom; a huge
-    bound is a no-op.
+    Parameters
+    ----------
+    program
+        The program to transform; it is copied, never mutated.
+    max_cell_size
+        Monomial-count ceiling per output cell. ``0`` collapses every symbolic output
+        cell to an atom; a bound above the heaviest cell is a no-op.
+
+    Returns
+    -------
+    Program
+        A copy with over-budget cells captured. Only the top program's outputs are
+        touched; nested vmap bodies are left intact.
     """
     out = program.copy()
     op = IdentityOp()
