@@ -56,6 +56,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
+import numpy.typing as npt
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -71,6 +72,7 @@ from .ir import (
     AbsOp,
     AddOp,
     AssertOp,
+    Cell,
     AxisLenOp,
     BlockDiagOp,
     BlockRepeatOp,
@@ -127,12 +129,17 @@ from .ir import (
     SqrtOp,
     SvdOp,
     SwitchOp,
+    Ref,
+    Stmt,
+    StmtOp,
+    SymArray,
     SymArrayRef,
     TensordotOp,
     TransposeOp,
     WhileOp,
     is_dynamic,
 )
+from .poly_backend import Poly
 from .rational import RationalFunction, _coeff_to_float, _ring_names
 
 __all__ = [
