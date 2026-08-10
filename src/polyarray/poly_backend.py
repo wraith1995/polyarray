@@ -9,27 +9,42 @@ polynomials over a coefficient field.  Two backends are wired here:
   reference implementation.
 
 * ``"flint"`` — :class:`flint.fmpq_mpoly` from ``python-flint``
-  (FLINT C library, exact rational coefficients).  ~210× faster
-  multivariate multiplication and ~30× faster ring construction at
-  realistic generator counts (see plan §7.10.x backend bench).
+  (FLINT C library, exact rational coefficients).  Roughly two orders of
+  magnitude faster at multivariate multiplication, and an order of magnitude
+  faster at ring construction, at realistic generator counts.
 
 The backend is selected by the :data:`BACKEND` global (default
 ``"sympy"``).  Set the ``CHARTLIB_POLY_BACKEND`` environment variable
 to ``"flint"`` to switch.
 
-Both backends provide a uniform :class:`Poly` and :class:`Ring`
-duck-typed protocol; :mod:`chartlib._symbolic.rational`'s
-``RationalFunction`` works against the protocol.
+Both backends provide a uniform :class:`Poly` and :class:`Ring` duck-typed
+protocol, which :class:`~polyarray.rational.RationalFunction` works against.
 """
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any
 
+import mpmath
 import sympy as sp
 from sympy.polys.rings import PolyElement, PolyRing
+
+if TYPE_CHECKING:
+    from flint import fmpq as _fmpq
+    from flint import fmpq_mpoly as _fmpq_mpoly
+    from flint import fmpq_mpoly_ctx as _fmpq_mpoly_ctx
+
+#: A ground coefficient of whichever backend is active: a 53-bit ``mpf`` real under
+#: sympy, an exact rational under flint.
+type Coeff = mpmath.mpf | _fmpq
+
+#: Anything a ring coerces to a :data:`Coeff` when building a polynomial.
+type CoeffLike = Coeff | int | float | sp.Rational
+
+#: An exponent vector, one entry per ring generator.
+type Monom = tuple[int, ...]
 
 # Backend default is resolved below once flint availability is known: when
 # unset, prefer the sparse flint backend (multivariate monomials are stored
@@ -48,12 +63,10 @@ _RR = sp.RR
 
 
 class _SympyRing:
-    """Wrapper around a sympy :class:`PolyRing`.
+    """A sympy :class:`PolyRing` behind the backend-neutral ring protocol.
 
-    Holds a cached generator-name tuple and exposes the ring API used by
-    ``RationalFunction`` / the eval-codegen.  The methods here mirror
-    the subset of :class:`sympy.polys.rings.PolyRing` that
-    :mod:`chartlib._symbolic.rational` reaches for.
+    Holds a cached generator-name tuple and exposes the subset of the sympy ring API
+    that :class:`~polyarray.rational.RationalFunction` and the eval codegen reach for.
     """
 
     __slots__ = ("_ring", "_names", "_one", "_zero", "_gens")
@@ -88,7 +101,8 @@ class _SympyRing:
     def gen(self, i: int) -> _SympyPoly:
         return self._gens[i]
 
-    def ground_new(self, value: Any) -> _SympyPoly:
+    def ground_new(self, value: CoeffLike) -> _SympyPoly:
+        """Return the constant polynomial ``value``."""
         if isinstance(value, sp.Rational):
             coerced = _RR.convert(value)
         elif isinstance(value, (int, float)):
@@ -97,7 +111,8 @@ class _SympyRing:
             coerced = value
         return _SympyPoly(self._ring.ground_new(coerced), self)
 
-    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> _SympyPoly:
+    def from_dict(self, terms: dict[Monom, CoeffLike]) -> _SympyPoly:
+        """Build a polynomial from an exponent-vector to coefficient mapping."""
         if not terms:
             return self._zero
         coerced = {m: _RR(c) if not isinstance(c, sp.Rational) else _RR.convert(c)
@@ -106,13 +121,11 @@ class _SympyRing:
 
 
 class _SympyPoly:
-    """Wrapper around a sympy :class:`PolyElement` keeping a back-ref to
-    the wrapped :class:`_SympyRing`.
+    """A sympy :class:`PolyElement` with a back-reference to its :class:`_SympyRing`.
 
-    Implements the ``+ - * == is_zero`` arithmetic the rational-function
-    layer needs.  Operands of mixed types coerce: ``Poly + scalar`` is
-    handled by lifting the scalar to a constant polynomial in the same
-    ring.
+    Implements the ``+ - * == is_zero`` arithmetic the rational-function layer needs.
+    Mixed operands coerce: ``Poly + scalar`` lifts the scalar to a constant polynomial
+    in the same ring.
     """
 
     __slots__ = ("_p", "_ring")
@@ -144,31 +157,31 @@ class _SympyPoly:
     def __neg__(self) -> _SympyPoly:
         return _SympyPoly(-self._p, self._ring)
 
-    def __add__(self, other: Any) -> _SympyPoly:
+    def __add__(self, other: _SympyPoly | int | float) -> _SympyPoly:
         if isinstance(other, _SympyPoly):
             return _SympyPoly(self._p + other._p, self._ring)
         if isinstance(other, (int, float)):
             return _SympyPoly(self._p + _RR(other), self._ring)
         return NotImplemented
 
-    def __radd__(self, other: Any) -> _SympyPoly:
+    def __radd__(self, other: _SympyPoly | int | float) -> _SympyPoly:
         return self.__add__(other)
 
-    def __sub__(self, other: Any) -> _SympyPoly:
+    def __sub__(self, other: _SympyPoly | int | float) -> _SympyPoly:
         if isinstance(other, _SympyPoly):
             return _SympyPoly(self._p - other._p, self._ring)
         if isinstance(other, (int, float)):
             return _SympyPoly(self._p - _RR(other), self._ring)
         return NotImplemented
 
-    def __mul__(self, other: Any) -> _SympyPoly:
+    def __mul__(self, other: _SympyPoly | int | float) -> _SympyPoly:
         if isinstance(other, _SympyPoly):
             return _SympyPoly(self._p * other._p, self._ring)
         if isinstance(other, (int, float)):
             return _SympyPoly(self._p * _RR(other), self._ring)
         return NotImplemented
 
-    def __rmul__(self, other: Any) -> _SympyPoly:
+    def __rmul__(self, other: _SympyPoly | int | float) -> _SympyPoly:
         return self.__mul__(other)
 
     def __pow__(self, n: int) -> _SympyPoly:
@@ -177,17 +190,17 @@ class _SympyPoly:
     def total_degree(self) -> int:
         return int(self._p.total_degree())
 
-    def terms(self) -> list[tuple[tuple[int, ...], Any]]:
+    def terms(self) -> list[tuple[Monom, Coeff]]:
         return list(self._p.terms())
 
-    def monoms(self) -> list[tuple[int, ...]]:
+    def monoms(self) -> list[Monom]:
         return list(self._p.monoms())
 
     def n_terms(self) -> int:
         return len(self._p.to_dict())
 
     @property
-    def LC(self) -> Any:
+    def LC(self) -> Coeff:
         if self._p.is_zero:
             return _RR(0)
         return self._p.LC
@@ -196,7 +209,8 @@ class _SympyPoly:
         n2, d2 = self._p.cancel(other._p)
         return _SympyPoly(n2, self._ring), _SympyPoly(d2, self._ring)
 
-    def as_expr(self) -> Any:
+    def as_expr(self) -> sp.Expr:
+        """Render as a sympy expression, for display."""
         return self._p.as_expr()
 
     def __repr__(self) -> str:
@@ -248,9 +262,9 @@ def _sympy_lift(poly: _SympyPoly, target: _SympyRing) -> _SympyPoly:
 # Flint backend (python-flint)
 # ======================================================================
 
-fmpq: Any
-fmpq_mpoly: Any
-fmpq_mpoly_ctx: Any
+fmpq: type[_fmpq] | None
+fmpq_mpoly: type[_fmpq_mpoly] | None
+fmpq_mpoly_ctx: type[_fmpq_mpoly_ctx] | None
 try:
     from flint import fmpq, fmpq_mpoly, fmpq_mpoly_ctx
     _FLINT_AVAILABLE = True
@@ -259,13 +273,17 @@ except ImportError:
     _FLINT_AVAILABLE = False
 
 
-def _float_to_fmpq(x: float | int) -> Any:
-    """Convert a Python float / int to an exact :class:`flint.fmpq`.
+def _float_to_fmpq(x: CoeffLike) -> _fmpq:
+    """Convert a Python float or int to an exact :class:`flint.fmpq`.
 
-    Uses :class:`fractions.Fraction` to recover the exact dyadic
-    rational behind a float ``x`` (no precision loss vs IEEE 754
-    double).  Integers and bools pass through directly.  Caller is
-    responsible for :class:`fmpq` itself.
+    :class:`fractions.Fraction` recovers the exact dyadic rational behind a float, so no
+    precision is lost against the IEEE 754 double. Integers pass through directly, and an
+    ``fmpq`` is returned unchanged.
+
+    Raises
+    ------
+    TypeError
+        If ``x`` is neither an ``fmpq``, an int, nor a float.
     """
     if isinstance(x, fmpq):
         return x
@@ -277,14 +295,17 @@ def _float_to_fmpq(x: float | int) -> Any:
     raise TypeError(f"cannot convert {x!r} ({type(x).__name__}) to fmpq")
 
 
-def _fmpq_to_float(q: Any) -> float:
+def _fmpq_to_float(q: _fmpq) -> float:
+    """Narrow an exact flint rational to a Python float."""
     return float(q)
 
 
 class _FlintRing:
+    """A flint ``fmpq_mpoly_ctx`` behind the backend-neutral ring protocol."""
+
     __slots__ = ("_ctx", "_names", "_one", "_zero", "_gens")
 
-    def __init__(self, ctx: Any, names: tuple[str, ...]) -> None:
+    def __init__(self, ctx: _fmpq_mpoly_ctx, names: tuple[str, ...]) -> None:
         self._ctx = ctx
         self._names = names
         self._zero = _FlintPoly(ctx.from_dict({}), self)
@@ -323,7 +344,8 @@ class _FlintRing:
     def gen(self, i: int) -> _FlintPoly:
         return self._gens[i]
 
-    def ground_new(self, value: Any) -> _FlintPoly:
+    def ground_new(self, value: CoeffLike) -> _FlintPoly:
+        """Return the constant polynomial ``value``."""
         if not self._names:
             return _FlintPoly(self._ctx.from_dict({(): _float_to_fmpq(value)}), self)
         one_monom = (0,) * len(self._names)
@@ -331,7 +353,8 @@ class _FlintRing:
             self._ctx.from_dict({one_monom: _float_to_fmpq(value)}), self
         )
 
-    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> _FlintPoly:
+    def from_dict(self, terms: dict[Monom, CoeffLike]) -> _FlintPoly:
+        """Build a polynomial from an exponent-vector to coefficient mapping."""
         if not terms:
             return self._zero
         coerced = {m: _float_to_fmpq(c) for m, c in terms.items()}
@@ -341,7 +364,7 @@ class _FlintRing:
 class _FlintPoly:
     __slots__ = ("_p", "_ring")
 
-    def __init__(self, p: Any, ring: _FlintRing) -> None:
+    def __init__(self, p: _fmpq_mpoly, ring: _FlintRing) -> None:
         self._p = p
         self._ring = ring
 
@@ -369,31 +392,31 @@ class _FlintPoly:
     def __neg__(self) -> _FlintPoly:
         return _FlintPoly(-self._p, self._ring)
 
-    def __add__(self, other: Any) -> _FlintPoly:
+    def __add__(self, other: _FlintPoly | int | float) -> _FlintPoly:
         if isinstance(other, _FlintPoly):
             return _FlintPoly(self._p + other._p, self._ring)
         if isinstance(other, (int, float)):
             return _FlintPoly(self._p + _float_to_fmpq(other), self._ring)
         return NotImplemented
 
-    def __radd__(self, other: Any) -> _FlintPoly:
+    def __radd__(self, other: _FlintPoly | int | float) -> _FlintPoly:
         return self.__add__(other)
 
-    def __sub__(self, other: Any) -> _FlintPoly:
+    def __sub__(self, other: _FlintPoly | int | float) -> _FlintPoly:
         if isinstance(other, _FlintPoly):
             return _FlintPoly(self._p - other._p, self._ring)
         if isinstance(other, (int, float)):
             return _FlintPoly(self._p - _float_to_fmpq(other), self._ring)
         return NotImplemented
 
-    def __mul__(self, other: Any) -> _FlintPoly:
+    def __mul__(self, other: _FlintPoly | int | float) -> _FlintPoly:
         if isinstance(other, _FlintPoly):
             return _FlintPoly(self._p * other._p, self._ring)
         if isinstance(other, (int, float)):
             return _FlintPoly(self._p * _float_to_fmpq(other), self._ring)
         return NotImplemented
 
-    def __rmul__(self, other: Any) -> _FlintPoly:
+    def __rmul__(self, other: _FlintPoly | int | float) -> _FlintPoly:
         return self.__mul__(other)
 
     def __pow__(self, n: int) -> _FlintPoly:
@@ -406,17 +429,17 @@ class _FlintPoly:
             return 0
         return int(max(sum(m) for m in self._p.monoms()))
 
-    def terms(self) -> list[tuple[tuple[int, ...], Any]]:
+    def terms(self) -> list[tuple[Monom, Coeff]]:
         return list(self._p.terms())
 
-    def monoms(self) -> list[tuple[int, ...]]:
+    def monoms(self) -> list[Monom]:
         return list(self._p.monoms())
 
     def n_terms(self) -> int:
         return len(self._p.monoms())
 
     @property
-    def LC(self) -> Any:
+    def LC(self) -> Coeff:
         if self._p.is_zero():
             return fmpq(0)
         return self._p.leading_coefficient()
@@ -434,8 +457,9 @@ class _FlintPoly:
             return self, other
         return _FlintPoly(self._p / g, self._ring), _FlintPoly(other._p / g, self._ring)
 
-    def as_expr(self) -> Any:
-        # Display-only conversion via sympy.  Slow; not used on hot paths.
+    def as_expr(self) -> sp.Expr:
+        """Render as a sympy expression, for display."""
+        # Slow; not used on hot paths.
         names = self._ring._names
         syms = sp.symbols(names) if names else ()
         if isinstance(syms, sp.Symbol):
@@ -443,7 +467,7 @@ class _FlintPoly:
         expr = sp.S.Zero
         for monom, coeff in self._p.terms():
             c = sp.Rational(int(coeff.numer()), int(coeff.denom()))
-            term: Any = c
+            term: sp.Expr = c
             for i, exp in enumerate(monom):
                 if exp:
                     term = term * syms[i] ** exp
@@ -504,11 +528,12 @@ def _flint_lift(poly: _FlintPoly, target: _FlintRing) -> _FlintPoly:
 if TYPE_CHECKING:
     Poly = _SympyPoly | _FlintPoly
     Ring = _SympyRing | _FlintRing
-    make_ring: Any
-    lift: Any
+
+    #: Build the ring over ``names`` in the active backend, caching it by name tuple.
+    make_ring: Callable[[Sequence[str]], Ring]
+    #: Re-express a polynomial in a target ring that contains all of its generators.
+    lift: Callable[[Poly, Ring], Poly]
 else:
-    make_ring: Any
-    lift: Any
     if BACKEND_NAME is None:
         # Unset → prefer sparse flint when available, else sympy.
         BACKEND_NAME = "flint" if _FLINT_AVAILABLE else "sympy"
@@ -653,8 +678,8 @@ def coeff_zero(poly: _SympyPoly | _FlintPoly) -> bool:
     return poly.is_zero
 
 
-def coeff_to_float(coeff: Any) -> float:
-    """Convert a coefficient (mpf or fmpq) to a Python float."""
+def coeff_to_float(coeff: CoeffLike) -> float:
+    """Narrow a backend coefficient to a Python float."""
     if isinstance(coeff, float):
         return coeff
     if isinstance(coeff, int):

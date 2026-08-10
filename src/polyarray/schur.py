@@ -19,8 +19,7 @@ special-cased only to *skip* the wasted symbolic work, not for correctness.
 
 SymArray-native: blocks are SymArray slices, so the owning ``Program`` rides on the carrier — Stmt deferrals
 emit into it, numerics mixed into symbolic arithmetic are coerced by ``RationalFunction`` itself, and a
-float-cell (numeric) block short-circuits to numpy arithmetic. (Ported from oracle ``vandermonde/schur.py`` —
-pure SymArray algebra, so its home is polyarray; element drivers consume it from here.)
+float-cell (numeric) block short-circuits to numpy arithmetic.
 
 Driver structure:
 1. diagonal / ≤ ``BASE`` → direct (reciprocal / ``cofactor_inverse``);
@@ -28,20 +27,25 @@ Driver structure:
    (``_choose_split``), recurse on the two diagonal blocks, combine, and undo the reordering.
 """
 
+from __future__ import annotations
+
 import os
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 import numpy as np
 
-from .ir import (EinsumStmtOp, InvOp, OutSpec, Program, SymArray, current_budget_override,
-                 is_dynamic, probe_direct_eval)
+from .ir import (Cell, DimAtom, EinsumStmtOp, InvOp, OutSpec, Program, SymArray, SymInput,
+                 current_budget_override, is_dynamic, probe_direct_eval)
 from .rational import RationalFunction, cofactor_inverse, simple_zero
 
 
-def _dim(x: object) -> int:
-    """A static matrix dimension as an ``int``. ``SymArray.shape`` is typed ``int | DimAtom``, but this
-    routine requires statically-shaped square matrices (dynamic ``DimAtom`` ranks are filtered upstream by
-    ``is_dynamic``), so the runtime value is always a plain ``int``.
+def _dim(x: int | DimAtom) -> int:
+    """Narrow a matrix dimension to a static ``int``.
+
+    ``SymArray.shape`` is typed ``int | DimAtom``, but this module only handles statically
+    shaped square matrices — dynamic ranks are filtered upstream by ``is_dynamic`` — so the
+    runtime value is always a plain ``int``.
     """
     return cast(int, x)
 
@@ -59,10 +63,13 @@ _DEFER_MATMUL = 2    # a Schur-combine product with any dim ≥ this → numeric
 
 
 def _defer_thresholds() -> tuple[int, int]:
-    """``(matmul_size, inverse_size)`` deferral thresholds — from the ambient ``SymbolicBudget`` override
-    (``schur_matmul_stmt_size`` / ``schur_inverse_stmt_size``) when set, else the module defaults. Lets a
-    caller dial the Schur inverse per call: ``budget_override(SymbolicBudget.build_big_symbols())`` ⇒ never
-    defer (fully symbolic exact inverse); ``... force_stmts()`` ⇒ always defer (max numeric).
+    """Return the ``(matmul_size, inverse_size)`` deferral thresholds.
+
+    Taken from the ambient :class:`~polyarray.ir.SymbolicBudget` override
+    (``schur_matmul_stmt_size`` / ``schur_inverse_stmt_size``) when set, else the module
+    defaults. This is how a caller dials the Schur inverse per call:
+    ``budget_override(SymbolicBudget.build_big_symbols())`` never defers, giving a fully
+    symbolic exact inverse; ``force_stmts()`` always defers, giving the numeric extreme.
     """
     b = current_budget_override()
     mm = getattr(b, "schur_matmul_stmt_size", None) if b is not None else None
@@ -71,10 +78,12 @@ def _defer_thresholds() -> tuple[int, int]:
 
 
 def _deferred_matmul(*arrs: SymArray) -> SymArray:
-    """Left-to-right product of SymArray blocks. Each 2-factor step emits a numeric matmul Stmt into the
-    carried program when an operand is large (`_DEFER_MATMUL`) — the blocks evaluate numerically at the
-    concrete inputs and the result is fresh atom cells — else inline exact-rational matmul. Float-cell
-    (numeric) operands never defer: `SymArray.matmul` short-circuits them to numpy.
+    """Multiply SymArray blocks left to right, deferring the large steps to numeric statements.
+
+    A two-factor step whose largest dimension reaches the matmul threshold emits a numeric
+    matmul statement into the carried program: the blocks evaluate at the concrete inputs and
+    the result is fresh atom cells. Smaller steps stay inline exact-rational. Float-cell
+    operands never defer, since :meth:`SymArray.matmul` short-circuits them to numpy.
     """
     result = arrs[0]
     mm_thresh = _defer_thresholds()[0]
@@ -83,10 +92,9 @@ def _deferred_matmul(*arrs: SymArray) -> SymArray:
         rows, inner, cols = _dim(result.shape[0]), _dim(result.shape[1]), _dim(nxt.shape[1])
         big = max(rows, inner, cols) >= mm_thresh
         if program is not None and big and not (result.is_numeric and nxt.is_numeric):
-            # A TYPED matmul op (2-D einsum `ij,jk->ik`), NOT an opaque ``lambda a, b: a @ b``: the typed op
-            # lowers through EVERY backend — ``Program.run`` (numeric), ``to_numpy_source``, AND
-            # ``pyab``/torch (a grounded-symbolic ``P(T)`` compiled into savo's vmapped value kernel) — where
-            # an opaque python callable raises "no lowering for op 'function'".
+            # A TYPED matmul op (2-D einsum `ij,jk->ik`), not an opaque ``lambda a, b: a @ b``:
+            # only a typed op lowers through every backend — ``Program.run``, ``to_numpy_source``
+            # and ``pyab``/torch alike. An opaque python callable raises at lowering time.
             (out,) = program.emit_stmt(
                 EinsumStmtOp(spec="ij,jk->ik"),
                 [result, nxt],
@@ -100,16 +108,19 @@ def _deferred_matmul(*arrs: SymArray) -> SymArray:
 
 
 def _base_inverse(arr: SymArray) -> SymArray:
-    """The ≤BASE base-case inverse: emit a numeric `np.linalg.inv` Stmt into the carried program when the
-    block is symbolic and large enough that the symbolic cofactor determinant blows up (`_DEFER_INVERSE`);
-    else exact `cofactor_inverse` (which itself short-circuits float cells).
+    """Invert a base-case block of size at most :data:`BASE`.
+
+    Emits a numeric ``InvOp`` statement into the carried program when the block is symbolic and
+    at least as large as the inverse-deferral threshold, where the symbolic cofactor determinant
+    blows up. Smaller blocks take the exact :func:`~polyarray.rational.cofactor_inverse`, which
+    itself short-circuits float cells.
     """
     n = _dim(arr.shape[0])
     program = arr.program
     if program is not None and not arr.is_numeric and n >= _defer_thresholds()[1]:
-        # A TYPED ``InvOp`` (the SAME op :meth:`SymArray.inverse` defers to), NOT an opaque
-        # ``lambda a: np.linalg.inv(a)``: lowers through Program.run / to_numpy_source / pyab-torch alike,
-        # so a grounded-symbolic ``P(T)`` compiles into savo's value kernel (an opaque callable cannot).
+        # A TYPED ``InvOp`` — the same op :meth:`SymArray.inverse` defers to — rather than an
+        # opaque ``lambda a: np.linalg.inv(a)``, so it lowers through Program.run,
+        # to_numpy_source and pyab/torch alike. An opaque callable lowers through none of them.
         (out,) = program.emit_stmt(
             InvOp(),
             [arr],
@@ -128,8 +139,10 @@ _MASK_TOL = 1e-9
 
 
 def _zero_cells(rows: int, cols: int, symbolic: bool) -> np.ndarray:
-    """A zero block in the matching lane: ring-less constant ``RationalFunction`` cells for the symbolic
-    lane (``RationalFunction`` joins rings on contact), float zeros for the numeric.
+    """Build a zero block in the matching lane.
+
+    Ring-less constant :class:`RationalFunction` cells for the symbolic lane, which join rings
+    on contact; plain float zeros for the numeric lane.
     """
     if symbolic:
         return np.full((rows, cols), RationalFunction.constant(0), dtype=object)
@@ -145,12 +158,13 @@ def _zero_cells(rows: int, cols: int, symbolic: bool) -> np.ndarray:
 # correctness comes from ``.evaluate(inputs)``; the mask only steers the recursion.
 
 
-def _probe_binding(inputs, k: int) -> dict:
-    """The ``k``-th DETERMINISTIC generic binding for the program ``inputs`` — irrational-spaced coordinates,
-    distinct per probe and per slot, so the probed cells are generic (non-degenerate) and no RNG is
-    involved.
+def _probe_binding(inputs: Sequence[SymInput], k: int) -> dict[str, np.ndarray]:
+    """Build the ``k``-th deterministic generic binding for a program's inputs.
+
+    Coordinates are irrational-spaced and distinct per probe and per slot, so the probed cells
+    are generic rather than degenerate, and no RNG is involved.
     """
-    binding: dict = {}
+    binding: dict[str, np.ndarray] = {}
     for ii, inp in enumerate(inputs):
         n = int(np.prod(inp.shape))
         vec = np.array(
@@ -161,11 +175,16 @@ def _probe_binding(inputs, k: int) -> dict:
 
 
 def _structural_mask(matrix: SymArray) -> np.ndarray | None:
-    """Boolean nonzero mask for a ``SymArray`` carrying a program, by DETERMINISTIC probing.
+    """Compute a boolean nonzero mask by deterministic probing.
 
-    Evaluates ``matrix`` at ``_N_PROBES`` fixed generic inputs (no RNG) and ORs the ``> _MASK_TOL`` patterns.
-    Returns ``None`` when ``matrix`` carries no program (or a dynamic/bulk-shaped input) so the caller falls
-    back to the syntactic ``simple_zero`` mask.
+    Evaluates ``matrix`` at :data:`_N_PROBES` fixed generic inputs and ORs the patterns above
+    :data:`_MASK_TOL`.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        ``None`` when ``matrix`` carries no program, or has a dynamic or bulk-shaped input, so
+        the caller falls back to the syntactic mask.
     """
     if matrix.program is None:
         return None
@@ -173,10 +192,9 @@ def _structural_mask(matrix: SymArray) -> np.ndarray | None:
     if any(is_dynamic(inp.shape) for inp in inputs):
         return None
     mask: np.ndarray | None = None
-    # A 3-point probe runs the C program only 3× — no-``compile`` RF evaluation (direct term
-    # sum, both in the program runner via ``probe_direct_eval`` and in the output-cell loop
-    # via ``compiled=False``) is much cheaper than codegen on a degree-5 C, and
-    # byte-identical, so the probed mask is unchanged.
+    # Direct term-sum evaluation (``probe_direct_eval`` in the program runner, ``compiled=False``
+    # in the output-cell loop) is much cheaper than codegen for the handful of probe points, and
+    # gives byte-identical values.
     with probe_direct_eval():
         for k in range(_N_PROBES):
             try:
@@ -189,17 +207,18 @@ def _structural_mask(matrix: SymArray) -> np.ndarray | None:
     return mask
 
 
-def _approx_zero(cell: object) -> bool:
-    """The SOUND roundoff-accepting zero test for the sparsity mask. A cell is zero iff it is a SYNTACTIC
-    (coefficient) zero, OR it is a CONSTANT (a number, or a total-degree-0 ``RationalFunction``) whose
-    magnitude is ``< _MASK_TOL`` — a true zero landed as float ROUNDOFF (a numeric ``Vref⁻¹`` over the
-    irrational normalized basis makes the P(T) value rows ``~1e-17``, not exact ``0``).
+def _approx_zero(cell: Cell) -> bool:
+    """Test a cell for zero, accepting roundoff only where that is sound.
 
-    Roundoff is applied ONLY to CONSTANTS: a constant does not vary, so ``|const| < tol`` is genuinely a
-    rounded zero. This is the crucial soundness distinction from the retired numeric probe, which read a
-    SYMBOLIC cell's magnitude at a few generic points — where a tiny-but-nonzero cell gave a WRONG inverse
-    (the 5e20 wrong-inverse bug). A vertex-dependent ``RationalFunction`` stays EXACT (``simple_zero``, no
-    roundoff, no sampling). Guarded end-to-end by the numeric-vs-symbolic P(T) backstop.
+    A cell counts as zero when it is a syntactic (coefficient) zero, or when it is a constant —
+    a number, or a total-degree-0 :class:`RationalFunction` — of magnitude below
+    :data:`_MASK_TOL`. Inverting over an irrational normalized basis lands true zeros at
+    roundoff scale rather than exactly zero, so the tolerance is load-bearing.
+
+    Applying the tolerance only to constants is what keeps it sound: a constant does not vary,
+    so a small magnitude really is a rounded zero. Reading a *symbolic* cell's magnitude at
+    sample points instead would drop a tiny-but-nonzero cell and yield a wrong inverse, so a
+    vertex-dependent cell stays exact.
     """
     if simple_zero(cell):
         return True
@@ -211,9 +230,7 @@ def _approx_zero(cell: object) -> bool:
 
 
 def _syntactic_mask(cells: np.ndarray) -> np.ndarray:
-    """Conservative mask: a cell is nonzero unless it is a syntactic OR roundoff-constant zero
-    (:func:`_approx_zero`).
-    """
+    """Build the conservative mask: a cell is nonzero unless :func:`_approx_zero` proves it zero."""
     out = np.empty(cells.shape, dtype=bool)
     for idx in np.ndindex(cells.shape):
         out[idx] = not _approx_zero(cells[idx])
@@ -221,20 +238,20 @@ def _syntactic_mask(cells: np.ndarray) -> np.ndarray:
 
 
 def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
-    """The nonzero mask steering the recursion — SOUND by default (§certainty).
+    """Resolve the nonzero mask steering the recursion. Sound by default.
 
-    An explicitly-threaded sub-mask wins. Otherwise the syntactic ``simple_zero`` mask: it marks a cell
-    zero ONLY when its numerator polynomial is coefficient-zero, so it can NEVER false-zero a truly-
-    nonzero cell (at worst it is conservative — dense — when it cannot prove a cell zero, which is always
-    safe: a denser mask only makes the block split less aggressive, never wrong).
+    An explicitly threaded sub-mask wins. Otherwise the syntactic mask applies: it marks a cell
+    zero only when its numerator polynomial is coefficient-zero, so it can never false-zero a
+    truly non-zero cell. At worst it is conservative — dense where it cannot prove a cell zero
+    — which only makes the block split less aggressive, never wrong.
 
-    The numeric probe ``_structural_mask`` is UNSOUND and NO LONGER the default: it marks a cell zero when
-    it is merely SMALL (< ``_MASK_TOL``) at a few sample points, so a *tiny-but-nonzero* cell is dropped
-    and the Schur split silently returns a WRONG inverse (demonstrated on degree-5 elements — the
-    symbolic ``P(T)`` came out ``5e20`` off the true ``inv(C)``; adding sample points does not help, the cells are tiny at
-    every point). It survives only behind an explicit, self-labelled-unsound opt-in
-    (``POLYARRAY_SCHUR_UNSOUND_PROBE_MASK``) for a large element whose cancellation-sparsity a sound exact
-    fold cannot yet recover — and only ever with the numeric-vs-symbolic ``P(T)`` backstop watching it.
+    :func:`_structural_mask`, the numeric probe, is unsound and not the default: it marks a
+    cell zero when it is merely small at a few sample points, so a tiny-but-nonzero cell is
+    dropped and the Schur split silently returns a wrong inverse. Adding sample points does not
+    help, because such cells are small everywhere. It is reachable only through the explicit,
+    self-labelled ``POLYARRAY_SCHUR_UNSOUND_PROBE_MASK`` opt-in, for a large element whose
+    cancellation sparsity a sound exact fold cannot recover, and only under an external
+    correctness backstop.
     """
     if mask is not None:
         return mask
@@ -251,15 +268,18 @@ def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
 
 
 def _all_zero(mask_block: np.ndarray) -> bool:
+    """Report whether every entry of a mask block is structurally zero."""
     return not mask_block.any()
 
 
 def _is_diagonal(mask: np.ndarray) -> bool:
+    """Report whether the mask has no non-zero off-diagonal entry."""
     n = mask.shape[0]
     return not any(mask[i, j] for i in range(n) for j in range(n) if i != j)
 
 
 def _diag_inverse(arr: SymArray) -> np.ndarray:
+    """Invert a diagonal matrix by taking reciprocals down the diagonal."""
     cells = arr.cells
     n = cells.shape[0]
     out = _zero_cells(n, n, symbolic=not arr.is_numeric)
@@ -286,9 +306,16 @@ def _rightmost_nonzero(mask: np.ndarray) -> list[int]:
 
 
 def _by_row_zeros(arr: SymArray, mask: np.ndarray) -> tuple[list[int], list[int], SymArray, np.ndarray]:
-    """Reorder rows ascending by their rightmost non-zero column — clustering rows whose support is confined
-    to early columns at the top (exposing block-lower-triangular structure). The mask is reordered in
-    lockstep. Returns ``(new_order, sizes, reordered_arr, reordered_mask)``.
+    """Reorder rows ascending by their rightmost non-zero column.
+
+    This clusters rows whose support is confined to early columns at the top, exposing
+    block-lower-triangular structure. The mask is reordered in lockstep.
+
+    Returns
+    -------
+    tuple
+        ``(new_order, sizes, reordered_arr, reordered_mask)``, where ``sizes[i]`` is the
+        rightmost non-zero column of the row now at position ``i``.
     """
     rightmost = _rightmost_nonzero(mask)
     new_order = sorted(range(len(rightmost)), key=lambda k: rightmost[k])
@@ -297,12 +324,18 @@ def _by_row_zeros(arr: SymArray, mask: np.ndarray) -> tuple[list[int], list[int]
 
 
 def _components(mask: np.ndarray) -> list[tuple[list[int], list[int]]]:
-    """Connected components of the bipartite row↔column graph (``row i ~ col j`` iff ``mask[i,j]``).
+    """Find the connected components of the bipartite row-column graph, ``row i ~ col j`` iff ``mask[i, j]``.
 
-    A matrix block-DIAGONAL under a (possibly asymmetric) row/column permutation splits into one component
-    per block, each inverting independently — catching structure the block-*triangular* split cannot (e.g. a
-    6×6 that is three disjoint 2×2 blocks, block-diagonal but not triangular). Returns ``[(rows, cols), …]``
-    with sorted index lists; for a nonsingular matrix every component is square.
+    A matrix that is block-diagonal under a possibly asymmetric row/column permutation splits
+    into one component per block, each inverting independently. This catches structure the
+    block-*triangular* split cannot: a 6x6 of three disjoint 2x2 blocks is block-diagonal but
+    not triangular.
+
+    Returns
+    -------
+    list of (list of int, list of int)
+        ``(rows, cols)`` index lists per component. For a nonsingular matrix every component is
+        square.
     """
     n = mask.shape[0]
     parent = list(range(2 * n))                                  # rows 0..n-1, cols n..2n-1
@@ -329,10 +362,16 @@ def _components(mask: np.ndarray) -> list[tuple[list[int], list[int]]]:
 
 
 def _choose_split(n: int, sizes: list[int]) -> int | None:
-    """The split ``p`` (square blocks ``p`` and ``n−p``) whose top-right ``p×(n−p)`` block is structurally
-    zero — i.e. the first ``p`` rows' support stays within the first ``p`` columns (``sizes[p-1] < p``, using
-    the ascending sort). Among valid splits pick the most balanced (closest to ``n/2``). ``None`` if no
-    zero-block split exists.
+    """Choose the split ``p`` whose top-right ``p x (n-p)`` block is structurally zero.
+
+    Valid when the first ``p`` rows' support stays within the first ``p`` columns, i.e.
+    ``sizes[p - 1] < p`` under the ascending sort. Among valid splits the most balanced one
+    wins.
+
+    Returns
+    -------
+    int or None
+        The chosen split, or ``None`` if no zero-block split exists.
     """
     valid = [p for p in range(1, n) if sizes[p - 1] < p]
     if not valid:
@@ -344,11 +383,13 @@ def _choose_split(n: int, sizes: list[int]) -> int | None:
 
 
 def _schur_combine(M: SymArray, k: int, mask: np.ndarray) -> SymArray:
-    """Invert ``M`` split at ``k`` via Schur, recursing on the diagonal blocks. Handles the block-lower-
-    triangular fast path (``B == 0`` per the mask) and the general case. The mask is sliced in lockstep with
-    ``M`` so the diagonal-block recursions see the true sparsity; the Schur complement ``S`` is a fresh
-    arithmetic product with no sampled mask, so it gets the syntactic ``simple_zero`` mask. Matrix products
-    go through ``_deferred_matmul`` so a large combine defers to a numeric Stmt instead of blowing up.
+    """Invert ``M`` split at ``k`` via Schur, recursing on the diagonal blocks.
+
+    Covers both the block-lower-triangular fast path, where the mask says the top-right block
+    is zero, and the general case. The mask is sliced in lockstep with ``M`` so the
+    diagonal-block recursions see the true sparsity; the Schur complement is a fresh arithmetic
+    product with no probed mask of its own, so it takes the syntactic one. Matrix products go
+    through :func:`_deferred_matmul`, so a large combine defers to a numeric statement.
     """
     n = _dim(M.shape[0])
     symbolic = not M.is_numeric
@@ -375,46 +416,55 @@ def _schur_combine(M: SymArray, k: int, mask: np.ndarray) -> SymArray:
 
 
 def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None = None,
-                     program: object = None) -> SymArray:
-    """Invert a (square) matrix via the block-triangular Schur recursion — the sparsity-aware sibling of
-    :meth:`SymArray.inverse`.
+                     program: Program | None = None) -> SymArray:
+    """Invert a square matrix via the block-triangular Schur recursion.
 
-    Accepts a ``SymArray`` or a raw cell ndarray; returns a ``SymArray`` of ``RationalFunction``/numeric
-    cells, propagating the input's owning ``Program`` so downstream simplify/sparsity/codegen passes apply
-    and Stmt deferrals emit into it. ``RationalFunction`` arithmetic coerces numerics and joins rings on
-    contact.
+    The sparsity-aware sibling of :meth:`SymArray.inverse`. :class:`RationalFunction`
+    arithmetic coerces numerics and joins rings on contact, so symbolic and numeric blocks mix
+    freely.
 
-    ``mask`` is the boolean nonzero mask steering the block split. Pass it when the caller can compute the
-    sparsity cheaply/exactly; when omitted it is resolved from ``matrix`` by DETERMINISTIC probing (a
-    program-carrying SymArray) or the syntactic ``simple_zero`` fallback. A conservative (denser) mask only
-    makes the split less aggressive, never wrong.
+    Parameters
+    ----------
+    matrix
+        The matrix to invert, as a :class:`SymArray` or a raw cell ndarray.
+    mask
+        Boolean nonzero mask steering the block split. Pass it when the caller can compute the
+        sparsity cheaply and exactly; when omitted it is resolved from ``matrix`` by
+        deterministic probing, or by the syntactic fallback. A denser mask only makes the split
+        less aggressive, never wrong.
+    program
+        The shared program the inverse should be grounded onto, so the emitted statements lower
+        through a value kernel compiled from it rather than being stranded on a by-product
+        program. When ``matrix`` already rides ``program``, or ``matrix`` is numeric or
+        program-less, this is a no-op and statements emit into ``matrix``'s own program.
 
-    ``program`` (GROUNDED SYMBOLIC): the SHARED ``Program`` the block-triangular inverse should be GROUNDED
-    onto — so a symbolic ``P(T)`` lowers through a value kernel compiled from that shared program (savo's
-    block program) rather than leaving Stmts stranded on an ephemeral by-product program. When ``matrix``
-    already rides ``program`` (or ``program`` is ``None``, or ``matrix`` is numeric / program-less) this is a
-    no-op and the Stmts emit into ``matrix``'s own program as before (backward compatible). Otherwise the
-    block-split mask is resolved on ``matrix``'s OWN program FIRST — its inputs are the clean generic-cell
-    generators the deterministic structural probe needs — and only then is ``matrix`` GRAFTED onto
-    ``program`` (:meth:`Program.graft`): ``matrix``'s cells may reference not only shared input atoms but
-    also *its program's own producing Stmts* (e.g. the world-Vandermonde's grassmann-lowered derivative-DOF
-    ``grass_dof`` Stmts), so a bare relabel would strand those; the graft emits ``matrix``'s program as a
-    sub-Program Stmt of ``program`` (fresh dedup'd outputs). The recursion's own deferred leaf-inverse /
-    Schur-combine Stmts (``schur_inverse``/``schur_matmul``) then emit natively onto ``program`` (mask
-    threaded so it never re-probes on the shared program), and several elements' ``P(T)``s grounded on one
-    shared program do not collide.
+        Otherwise the block-split mask is resolved on ``matrix``'s own program **first** — its
+        inputs are the clean generic-cell generators the deterministic probe needs — and only
+        then is ``matrix`` grafted onto ``program``. A graft rather than a relabel is
+        load-bearing: ``matrix``'s cells may reference its program's own producing statements,
+        not just shared input atoms, and a relabel would strand those. The graft emits
+        ``matrix``'s program as a sub-program statement with deduplicated outputs, so several
+        inverses grounded on one shared program do not collide.
+
+    Returns
+    -------
+    SymArray
+        The inverse, carrying the owning program so downstream simplify, sparsity and codegen
+        passes apply to it.
     """
     M = matrix if isinstance(matrix, SymArray) else SymArray(matrix)
     if program is not None and M.program is not None and M.program is not program:
         mask = _resolve_mask(M, mask)                       # probe on M's OWN (clean-input) program first
-        M = cast(Program, program).graft(M)                 # bring M's producing Stmts onto `program`
+        M = program.graft(M)                                # bring M's producing Stmts onto `program`
     return _invert(M, mask=mask)
 
 
 def _invert(M: SymArray, mask: np.ndarray | None = None) -> SymArray:
-    """The recursion proper, on the SymArray carrier. ``mask`` steers the block-triangular split; when
-    omitted it is resolved from ``M``. Sub-recursions thread the corresponding sub-mask so the sparsity
-    stays aligned through the row reordering and block splits.
+    """Run the recursion proper on the SymArray carrier.
+
+    ``mask`` steers the block-triangular split, and is resolved from ``M`` when omitted.
+    Sub-recursions thread the corresponding sub-mask so the sparsity stays aligned through the
+    row reordering and block splits.
     """
     mask = _resolve_mask(M, mask)
     n = _dim(M.shape[0])
