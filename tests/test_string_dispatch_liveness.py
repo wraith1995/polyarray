@@ -58,28 +58,30 @@ def _op_names() -> set[str]:
 # --------------------------------------------------------------------------------------------
 
 def test_batch_inner_dispatch_dicts_resolve_on_both_sides():
-    """`_apply`'s inner dicts map an op NAME to a numpy FUNCTION NAME. Both halves are strings,
-    and the outer ladder's test only checks that the op is reachable — not that the numpy
-    attribute it then resolves actually exists."""
+    """`_apply`'s inner dicts pick a numpy function per op CLASS. Both halves must resolve.
+
+    The keys are op classes, so a wrong key cannot survive import — but the values are the
+    numpy callables, and nothing else checks that the attribute a value names still exists.
+    """
     tree = ast.parse(inspect.getsource(B._apply))
     checked = 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.Dict):
             continue
-        keys = [k.value for k in node.keys
-                if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+        keys = [k.id for k in node.keys if isinstance(k, ast.Name)]
         if not keys or not all(k.endswith("Op") for k in keys):
-            continue                                   # not an op-name-keyed dict
+            continue                                   # not an op-keyed dict
         for k in keys:
             assert isinstance(getattr(ir, k, None), type), \
                 f"batch._apply dispatches on {k!r}, which is not an op class in polyarray.ir"
             checked += 1
-        # Values that are bare strings are numpy attribute names (np.linalg.<value>).
+        # Values name a numpy callable: `np.sqrt`, `np.linalg.pinv`.
         for v in node.values:
-            if isinstance(v, ast.Constant) and isinstance(v.value, str):
-                assert hasattr(np.linalg, v.value), \
-                    f"batch._apply resolves np.linalg.{v.value} — which does not exist"
-    assert checked, "found no op-name-keyed dict in batch._apply — the heuristic broke"
+            if isinstance(v, ast.Attribute):
+                mod = np.linalg if getattr(v.value, "attr", None) == "linalg" else np
+                assert hasattr(mod, v.attr), \
+                    f"batch._apply resolves {ast.unparse(v)} — which does not exist"
+    assert checked, "found no op-keyed dict in batch._apply — the heuristic broke"
 
 
 # --------------------------------------------------------------------------------------------

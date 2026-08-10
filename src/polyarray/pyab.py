@@ -53,9 +53,21 @@ import os
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
+import numpy.typing as npt
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from pyarraybackend.backends.python_backend import CompiledModule as NumpyModule
+    from pyarraybackend.backends.python_backend import PythonBackendOptions
+    from pyarraybackend.backends.torch_backend import CompiledModule as TorchModule
+    from pyarraybackend.backends.torch_backend import TorchBackendOptions
+    from pyarraybackend.ir.builder import StmtBuilder
+    from pyarraybackend.ir.core import Device, FusionOpts, KernelKind, PyExprs, PyStmts
 
 from .ir import (
     AbsOp,
@@ -65,9 +77,10 @@ from .ir import (
     BlockDiagOp,
     BlockRepeatOp,
     CallOp,
+    Cell,
     ColStackOp,
-    CompRankOp,
     ComposeViaStdOp,
+    CompRankOp,
     ConcatOp,
     Const,
     ConstOp,
@@ -95,6 +108,7 @@ from .ir import (
     MetricOrthonormalOp,
     MoveaxisOp,
     MulAxisDimOp,
+    NestedVmapClosure,
     OutputRef,
     PinvOp,
     ProdDimOp,
@@ -104,25 +118,30 @@ from .ir import (
     QrOp,
     RankOp,
     RationalRef,
+    Ref,
     ReshapeOp,
     ScaleAxisDimOp,
     ScaleByOp,
     ScaleOp,
     SignOp,
     SinvFullOp,
-    SqrtSpdOp,
-    SumDimOp,
-    SumShapeOp,
     SolveOp,
     SqrtOp,
+    SqrtSpdOp,
+    Stmt,
+    StmtOp,
+    SumDimOp,
+    SumShapeOp,
     SvdOp,
     SwitchOp,
+    SymArray,
     SymArrayRef,
     TensordotOp,
     TransposeOp,
     WhileOp,
     is_dynamic,
 )
+from .poly_backend import Poly
 from .rational import RationalFunction, _coeff_to_float, _ring_names
 
 __all__ = [
@@ -142,11 +161,15 @@ __all__ = [
 Target = Literal["torch", "numpy"]
 Placement = Literal["plain", "vmap", "fuse"]
 
-# An op-lowering hook: ``(op, builder, arg_exprs, lowerer) -> list[PyExprs]`` —
-# one expression per op output.  Keyed by op *class name* so front-ends can lower
-# their own Stmt ops without polyarray importing them (mirrors
-# ``to_numpy_source``'s ``op_renderers``).
-OpLowering = Callable[..., list]
+#: An op-lowering hook: ``(op, builder, arg_exprs, lowerer)`` to one expression per op
+#: output.  Keyed by op *class name* so a front end can lower its own statement ops
+#: without polyarray importing them, mirroring ``to_numpy_source``'s ``op_renderers``.
+#: Spelled loosely at run time because pyab is an optional dependency; the precise
+#: shape is the one written above.
+type OpLowering = Callable[..., list[Any]]
+
+#: What :func:`prepare` reports about the simplifications it applied, keyed by pass name.
+type PrepReport = dict[str, int | str | bool]
 
 
 @dataclass(frozen=True)
@@ -190,13 +213,15 @@ class LowerOpts:
 # Lazy PyAB import — keeps ``import polyarray`` free of a pyarraybackend dep.
 # ---------------------------------------------------------------------------
 
-def _core() -> Any:
+def _core() -> ModuleType:
+    """Import and return ``pyarraybackend.ir.core``, the pyab node vocabulary."""
     from pyarraybackend.ir import core
 
     return core
 
 
-def _builder_mod() -> Any:
+def _builder_mod() -> ModuleType:
+    """Import and return ``pyarraybackend.ir.builder``, the statement builder module."""
     from pyarraybackend.ir import builder
 
     return builder
@@ -211,22 +236,24 @@ def _builder_mod() -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _axis_len(low: Any, x: Any, axis: int) -> Any:
-    """Runtime length of ``x``'s axis ``axis`` as a pyab int expr (``x.shape[axis]``)."""
+def _axis_len(low: _Lowerer, x: PyExprs, axis: int) -> PyExprs:
+    """Emit ``x.shape[axis]`` as a pyab integer expression."""
     c = low.core
     return c.AccessExpr(base=c.ShapeExpr(x=x), index=(c.IntLit(value=int(axis)),))
 
 
-def _f64_scalar(low: Any, v: float) -> Any:
+def _f64_scalar(low: _Lowerer, v: float) -> PyExprs:
+    """Emit ``v`` as a 0-d float64 array expression."""
     c = low.core
     return c.ArrayExpr(obj=c.FloatLit(value=float(v)), dtype=low._dtype_f64())
 
 
-def _static_eye(low: Any, n_expr: Any) -> Any:
-    """An ``n×n`` f64-exact identity ``where(arange(n)[:,None]==arange(n)[None,:], 1, 0)``.
+def _static_eye(low: _Lowerer, n_expr: PyExprs) -> PyExprs:
+    """Emit an exact ``n x n`` float64 identity.
 
-    Built without a namespace ``eye`` (whose torch default is float32); ``n_expr`` may be a
-    static ``IntLit`` or a runtime int expr, so one builder serves static and dynamic ``n``.
+    Built as ``where(arange(n)[:, None] == arange(n)[None, :], 1, 0)`` rather than a
+    namespace ``eye``, whose torch default is float32. ``n_expr`` may be a static ``IntLit``
+    or a runtime integer expression, so one builder serves both static and dynamic ``n``.
     """
     c = low.core
     r = c.ArangeExpr(start=c.IntLit(value=0), stop=n_expr)
@@ -236,13 +263,13 @@ def _static_eye(low: Any, n_expr: Any) -> Any:
     return c.WhereExpr(cond=eq, x=_f64_scalar(low, 1.0), y=_f64_scalar(low, 0.0))
 
 
-def _render_transpose(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_transpose(op: TransposeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``A.T`` — full-reverse transpose (``axes=None``)."""
     c = low.core
     return [c.TransposeExpr(a=args[0], axes=None)]
 
 
-def _render_sinv_full(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_sinv_full(op: SinvFullOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``out[i,j] = 1/Sᵢ`` on the diagonal for ``i < rank`` else 0 (an ``nrows×ncols`` array).
 
     Built as ``where(eye_nm, recip_row[:,None], 0)`` where ``recip_row`` is ``1/Sᵢ`` masked to
@@ -276,10 +303,13 @@ def _render_sinv_full(op: Any, builder: Any, args: list, low: Any) -> list:
     return [c.WhereExpr(cond=eye, x=recip_col, y=zero)]
 
 
-def _render_gsvd_full(op: Any, builder: Any, args: list, low: Any) -> list:
-    """``GSvdOp`` then re-concatenate ``[U|UI]`` / ``[V|VI]`` — reuses the pyab ``_gsvd``
-    composite (whiten / svd / rank-threshold / de-whiten) so behaviour matches the native
-    GSVD lowering; ``_gsvd`` reads the operand refs off ``low._cur_in_refs``."""
+def _render_gsvd_full(op: GSvdFullOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Run the GSVD and re-concatenate ``[U|UI]`` and ``[V|VI]``.
+
+    Reuses the pyab ``_gsvd`` composite — whiten, svd, rank-threshold, de-whiten — so this
+    matches the native GSVD lowering. ``_gsvd`` reads the operand refs off
+    ``low._cur_in_refs``.
+    """
     c = low.core
     u, ui, v, vi, s, rank = low._gsvd(GSvdOp(rcond=op.rcond), args, None, low._cur_in_refs)
     ufull = c.ConcatExpr(arrays=(u, ui), axis=1)
@@ -287,14 +317,17 @@ def _render_gsvd_full(op: Any, builder: Any, args: list, low: Any) -> list:
     return [ufull, vfull, s, rank]
 
 
-def _render_block_diag(op: Any, builder: Any, args: list, low: Any) -> list:
-    """Block-diagonal ``diag(A, B, …)`` from zero-padded row-blocks concatenated on axis 0
-    (block sizes read off runtime ``ShapeExpr`` — vmap-safe / dynamic-shape correct)."""
+def _render_block_diag(op: BlockDiagOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Build ``diag(A, B, ...)`` from zero-padded row blocks concatenated on axis 0.
+
+    Block sizes are read off runtime ``ShapeExpr``, so this is vmap-safe and correct under
+    dynamic shapes.
+    """
     c = low.core
     f64 = low._dtype_f64()
     col_widths = [_axis_len(low, x, 1) for x in args]
 
-    def add(a: Any, b: Any) -> Any:
+    def add(a: PyExprs, b: PyExprs) -> PyExprs:
         return c.BinaryExpr(op=c.BinaryOp.ADD, lhs=a, rhs=b)
 
     row_blocks = []
@@ -320,13 +353,13 @@ def _render_block_diag(op: Any, builder: Any, args: list, low: Any) -> list:
             else c.ConcatExpr(arrays=tuple(row_blocks), axis=0)]
 
 
-def _render_block_repeat(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_block_repeat(op: BlockRepeatOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``n`` block-diagonal copies of ``A`` = ``kron(eye(n), A)`` (static ``n``)."""
     eye = _static_eye(low, low.core.IntLit(value=int(op.n)))
     return [low._ns_call("kron", (eye, args[0]))]
 
 
-def _render_dyn_block_repeat(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_dyn_block_repeat(op: DynBlockRepeatOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``int(n)`` block-diagonal copies of ``A`` = ``kron(eye(int(n)), A)`` (runtime ``n``)."""
     c = low.core
     nn = c.CallExpr(fn=c.Var(name="int"), args=(args[1],))
@@ -340,19 +373,19 @@ def _render_dyn_block_repeat(op: Any, builder: Any, args: list, low: Any) -> lis
 # polyarray helpers ``_axis_len``/``_static_eye``.
 
 
-def _render_dyn_eye(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_dyn_eye(op: DynEyeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """Runtime ``eye(ref.shape[axis])`` sized by ``ref``'s (un-batched) axis."""
     return [_static_eye(low, _axis_len(low, args[0], int(op.axis)))]
 
 
-def _render_dyn_zeros(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_dyn_zeros(op: DynZerosOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``zeros((d₀, d₁, …))`` with each ``dᵢ`` a runtime axis of ``refs[i]``."""
     c = low.core
     shape = tuple(_axis_len(low, args[i], int(ax)) for i, ax in enumerate(op.axes))
     return [c.ZerosExpr(shape=shape, dtype=low._dtype_f64())]
 
 
-def _render_dyn_eye_tensor(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_dyn_eye_tensor(op: DynEyeTensorOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``eye(∏dᵢ).reshape(∏dᵢ, d₀, …)`` with each ``dᵢ`` a runtime axis of ``refs[i]``."""
     c = low.core
     dims = [_axis_len(low, args[i], int(ax)) for i, ax in enumerate(op.axes)]
@@ -364,8 +397,8 @@ def _render_dyn_eye_tensor(op: Any, builder: Any, args: list, low: Any) -> list:
     return [c.ReshapeExpr(a=eye, shape=(prod, *dims))]
 
 
-def _render_prod_shape(op: Any, builder: Any, args: list, low: Any) -> list:
-    """``static · ∏ refs[i].shape[axes[i]]`` as a runtime 0-d int."""
+def _render_prod_shape(op: ProdShapeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Emit ``static · ∏ refs[i].shape[axes[i]]`` as a runtime 0-d int."""
     c = low.core
     out: Any = c.IntLit(value=int(op.static))
     for i, ax in enumerate(op.axes):
@@ -373,8 +406,8 @@ def _render_prod_shape(op: Any, builder: Any, args: list, low: Any) -> list:
     return [out]
 
 
-def _render_sum_shape(op: Any, builder: Any, args: list, low: Any) -> list:
-    """``static + Σ refs[i].shape[axes[i]]`` as a runtime 0-d int."""
+def _render_sum_shape(op: SumShapeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Emit ``static + Σ refs[i].shape[axes[i]]`` as a runtime 0-d int."""
     c = low.core
     out: Any = c.IntLit(value=int(op.static))
     for i, ax in enumerate(op.axes):
@@ -382,7 +415,7 @@ def _render_sum_shape(op: Any, builder: Any, args: list, low: Any) -> list:
     return [out]
 
 
-def _render_sum_dim(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_sum_dim(op: SumDimOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``Σ mats[i].shape[axis]`` as a runtime 0-d int."""
     c = low.core
     out: Any = c.IntLit(value=0)
@@ -391,7 +424,7 @@ def _render_sum_dim(op: Any, builder: Any, args: list, low: Any) -> list:
     return [out]
 
 
-def _render_prod_dim(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_prod_dim(op: ProdDimOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``∏ mats[i].shape[axis]`` as a runtime 0-d int."""
     c = low.core
     out: Any = c.IntLit(value=1)
@@ -400,53 +433,53 @@ def _render_prod_dim(op: Any, builder: Any, args: list, low: Any) -> list:
     return [out]
 
 
-def _render_scale_axis_dim(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_scale_axis_dim(op: ScaleAxisDimOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``n · mat.shape[axis]`` as a runtime 0-d int."""
     c = low.core
     return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.IntLit(value=int(op.n)),
                          rhs=_axis_len(low, args[0], int(op.axis)))]
 
 
-def _render_mul_axis_dim(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_mul_axis_dim(op: MulAxisDimOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``int(n) · mat.shape[axis]`` as a runtime 0-d int."""
     c = low.core
     n = c.CallExpr(fn=c.Var(name="int"), args=(args[0],))
     return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=n, rhs=_axis_len(low, args[1], int(op.axis)))]
 
 
-def _render_comp_rank(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_comp_rank(op: CompRankOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``ambient − int(rank)`` as a runtime 0-d int."""
     c = low.core
     rank = c.CallExpr(fn=c.Var(name="int"), args=(args[0],))
     return [c.BinaryExpr(op=c.BinaryOp.SUB, lhs=c.IntLit(value=int(op.ambient)), rhs=rank)]
 
 
-def _render_hstack(op: Any, builder: Any, args: list, low: Any) -> list:
-    """``[A | B | …]`` — concat 2-D matrices along axis 1."""
+def _render_hstack(op: HStackOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Concatenate 2-D matrices along axis 1, giving ``[A | B | ...]``."""
     c = low.core
     return [c.ConcatExpr(arrays=tuple(args), axis=1)]
 
 
-def _render_col_stack(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_col_stack(op: ColStackOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """Flatten each operand then stack as columns on axis 1."""
     c = low.core
     flat = [c.ReshapeExpr(a=x, shape=(c.IntLit(value=-1),)) for x in args]
     return [c.StackExpr(arrays=tuple(flat), axis=1)]
 
 
-def _render_scale(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_scale(op: ScaleOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``factor · x``."""
     c = low.core
     return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.FloatLit(value=float(op.factor)), rhs=args[0])]
 
 
-def _render_scale_by(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_scale_by(op: ScaleByOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``s · x`` (runtime scalar)."""
     c = low.core
     return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=args[1], rhs=args[0])]
 
 
-def _render_add(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_add(op: AddOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """Left-fold ``x0 + x1 + …`` over the operands."""
     c = low.core
     out = args[0]
@@ -455,44 +488,44 @@ def _render_add(op: Any, builder: Any, args: list, low: Any) -> list:
     return [out]
 
 
-def _render_concat(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_concat(op: ConcatOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """Flatten each operand then concatenate on axis 0."""
     c = low.core
     flat = [c.ReshapeExpr(a=x, shape=(c.IntLit(value=-1),)) for x in args]
     return [c.ConcatExpr(arrays=tuple(flat), axis=0)]
 
 
-def _render_axis_len(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_axis_len(op: AxisLenOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``x.shape[axis]`` as a 0-d int."""
     return [_axis_len(low, args[0], int(op.axis))]
 
 
-def _render_reshape(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_reshape(op: ReshapeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``A.reshape(shape)`` (static shape)."""
     c = low.core
     return [c.ReshapeExpr(a=args[0], shape=tuple(c.IntLit(value=int(d)) for d in op.shape))]
 
 
-def _render_const(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_const(op: ConstOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """Rematerialize the frozen constant as a pyab f64 array literal."""
     arr = np.frombuffer(op.data_bytes, dtype=op.dtype).reshape(op.shape)
     return [low._const_expr(np.asarray(arr, dtype=float))]
 
 
-def _render_eye(op: Any, builder: Any, args: list, low: Any) -> list:
-    """The static ``n×n`` identity (built f64-exactly)."""
+def _render_eye(op: EyeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Emit the static ``n x n`` identity, exact in float64."""
     return [_static_eye(low, low.core.IntLit(value=int(op.n)))]
 
 
-def _render_first_cols(op: Any, builder: Any, args: list, low: Any) -> list:
-    """``A[:, :int(rank)]``."""
+def _render_first_cols(op: FirstColsOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Take the leading ``rank`` columns, ``A[:, :int(rank)]``."""
     c = low.core
     rank = c.CallExpr(fn=c.Var(name="int"), args=(args[1],))
     return [c.AccessExpr(base=args[0], index=(c.Slice(), c.Slice(stop=rank)))]
 
 
-def _render_last_cols(op: Any, builder: Any, args: list, low: Any) -> list:
-    """``A[:, int(rank):]`` — the complementary (trailing) columns."""
+def _render_last_cols(op: LastColsOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Take the trailing columns, ``A[:, int(rank):]`` — the complement of the leading ones."""
     c = low.core
     rank = c.CallExpr(fn=c.Var(name="int"), args=(args[1],))
     return [c.AccessExpr(base=args[0], index=(c.Slice(), c.Slice(start=rank)))]
@@ -505,7 +538,7 @@ def _render_last_cols(op: Any, builder: Any, args: list, low: Any) -> list:
 # linalg. ``_shape_axis_expr`` becomes the identical polyarray helper ``_axis_len``.
 
 
-def _render_project(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_project(op: ProjectOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``P.T @ v.reshape(-1)`` — project ambient coords onto the sub-basis."""
     c = low.core
     p_t = c.TransposeExpr(a=args[0], axes=None)
@@ -513,7 +546,7 @@ def _render_project(op: Any, builder: Any, args: list, low: Any) -> list:
     return [c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=p_t, rhs=v_flat)]
 
 
-def _render_embed(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_embed(op: EmbedOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``(P @ vsub).reshape(shape)`` — pad sub-coords into the ambient layout."""
     c = low.core
     mm = c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=args[0], rhs=args[1])
@@ -522,7 +555,7 @@ def _render_embed(op: Any, builder: Any, args: list, low: Any) -> list:
     return [mm]
 
 
-def _render_kron(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_kron(op: KronOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """Chained Kronecker product ``kron(kron(a0, a1), …)``."""
     acc = args[0]
     for m in args[1:]:
@@ -530,15 +563,17 @@ def _render_kron(op: Any, builder: Any, args: list, low: Any) -> list:
     return [acc]
 
 
-def _render_kron_free(op: Any, builder: Any, args: list, low: Any) -> list:
-    """Block-Kron on the two space axes with an outer product on the (disjoint) trailing
-    free axes.  Reshapes read the runtime ``df/cf/dg/cg`` and free axes off ``ShapeExpr``
-    (vmap-safe)."""
+def _render_kron_free(op: KronFreeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Take a block Kronecker product on the two space axes, outer on the trailing free axes.
+
+    The free axes are disjoint, so they combine as an outer product. Reshapes read the
+    runtime block and free dimensions off ``ShapeExpr``, keeping the lowering vmap-safe.
+    """
     c = low.core
     f, g = args
     one = c.IntLit(value=1)
 
-    def ax(x: Any, i: int) -> Any:
+    def ax(x: PyExprs, i: int) -> PyExprs:
         return _axis_len(low, x, i)
     df, cf = ax(f, 0), ax(f, 1)
     dg, cg = ax(g, 0), ax(g, 1)
@@ -553,21 +588,24 @@ def _render_kron_free(op: Any, builder: Any, args: list, low: Any) -> list:
     return [c.ReshapeExpr(a=prod, shape=out_shape)]
 
 
-def _render_inv_transpose(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_inv_transpose(op: InvTransposeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``inv(A).T`` — the dual-basis inverse-transpose."""
     c = low.core
     return [c.TransposeExpr(a=low._ns_call("linalg.inv", (args[0],)), axes=None)]
 
 
-def _render_compose_via_std(op: Any, builder: Any, args: list, low: Any) -> list:
+def _render_compose_via_std(op: ComposeViaStdOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """``solve(R_to, R_from)`` — compose two changes-of-basis through the std rep."""
     return [low._ns_call("linalg.solve", (args[0], args[1]))]
 
 
-def _render_sqrt_spd(op: Any, builder: Any, args: list, low: Any) -> list:
-    """The SPD square root ``(V·√w)·Vᵀ`` from ``eigh`` of the symmetrized ``G``.  The SPD
-    guard is a runtime assert that does not change the returned data, so (like ``AssertOp``)
-    it is omitted from the emitted data path; ``torch.vmap`` batches the plain 2-D eigh."""
+def _render_sqrt_spd(op: SqrtSpdOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Emit the SPD square root ``(V·√w)·Vᵀ`` from ``eigh`` of the symmetrized ``G``.
+
+    The SPD guard is a runtime assertion that does not change the returned data, so, as with
+    ``AssertOp``, it is omitted from the emitted data path. ``torch.vmap`` batches the plain
+    2-D eigh.
+    """
     c = low.core
     g = args[0]
     sym = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.FloatLit(value=0.5),
@@ -580,21 +618,23 @@ def _render_sqrt_spd(op: Any, builder: Any, args: list, low: Any) -> list:
     return [c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=vscaled, rhs=c.TransposeExpr(a=vv, axes=None))]
 
 
-def _render_rank(op: Any, builder: Any, args: list, low: Any) -> list:
-    """The numeric column rank of ``A`` as a 0-d int.  ``matrix_rank`` has the same name in
-    numpy and torch; the absolute-tol kwarg (``tol=`` numpy / ``atol=`` torch) is passed per
-    namespace."""
+def _render_rank(op: RankOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Emit the numeric column rank of ``A`` as a 0-d int.
+
+    ``matrix_rank`` has the same name in numpy and torch, but the absolute-tolerance keyword
+    differs (``tol=`` versus ``atol=``), so it is passed per namespace.
+    """
     c = low.core
     kw = (c.KwArg(name="tol" if low.opts.target != "torch" else "atol",
                   value=c.FloatLit(value=float(op.tol))),)
     return [low._ns_call("linalg.matrix_rank", (args[0],), kw)]
 
 
-def _render_metric_orthonormal(op: Any, builder: Any, args: list, low: Any) -> list:
-    """``A · L⁻ᵀ`` with ``L Lᵀ = AᵀGA`` (Cholesky) — metric orthonormalization."""
+def _render_metric_orthonormal(op: MetricOrthonormalOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Orthonormalize ``A`` in the ``G`` metric: ``A · L⁻ᵀ`` where ``L Lᵀ = AᵀGA``."""
     c = low.core
 
-    def mm(x: Any, y: Any) -> Any:
+    def mm(x: PyExprs, y: PyExprs) -> PyExprs:
         return c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=x, rhs=y)
     a, g = args
     at = c.TransposeExpr(a=a, axes=None)
@@ -604,7 +644,7 @@ def _render_metric_orthonormal(op: Any, builder: Any, args: list, low: Any) -> l
     return [mm(a, linvt)]
 
 
-_ARRAY_OP_LOWERINGS: dict[type, Any] = {
+_ARRAY_OP_LOWERINGS: dict[type, OpLowering] = {
     TransposeOp: _render_transpose,
     SinvFullOp: _render_sinv_full,
     GSvdFullOp: _render_gsvd_full,
@@ -650,28 +690,30 @@ _ARRAY_OP_LOWERINGS: dict[type, Any] = {
 # ---------------------------------------------------------------------------
 
 
-def _fp_bound_names(core: Any, params: tuple, body: tuple) -> set[str]:
-    """Every name BOUND inside the def: its params, plain assignment targets,
-    let/for binders, nested def names. Everything else is FREE (module globals —
-    ``torch``/``functional``/``np`` and already-emitted helper callees) and must keep
-    its spelling in the fingerprint.
+def _fp_bound_names(core: ModuleType, params: tuple[PyExprs, ...],
+                    body: tuple[PyStmts, ...]) -> set[str]:
+    """Collect every name bound inside a def: params, assignment targets, binders, nested defs.
+
+    Everything else is free — module globals such as ``torch`` or ``np``, and already-emitted
+    helper callees — and must keep its spelling in the fingerprint.
 
     ⚠ This set is UNSCOPED — a binder anywhere in the body marks its spelling bound for the
     WHOLE body, so an outer FREE global sharing a nested binder's spelling would be
     alpha-normalized and two different globals could fingerprint alike. Today's emitters
     build no nested defs/lambdas (the only ``FunctionDefStmt``s are the module-level helper
     and entry), so the situation is unreachable; :func:`_helper_fingerprint` REFUSES on a
-    nested def or lambda rather than rely on that, which makes the claim unconditional."""
+    nested def or lambda rather than rely on that, which makes the claim unconditional.
+    """
     bound = {p.name for p in params}
 
-    def collect_target(t: Any) -> None:
+    def collect_target(t: PyExprs) -> None:
         if isinstance(t, core.Var):
             bound.add(t.name)
         elif isinstance(t, core.TupleExpr):
             for el in t.elts:
                 collect_target(el)
 
-    def walk(node: Any) -> None:
+    def walk(node: object) -> None:
         if isinstance(node, core.AssignStmt):
             collect_target(node.target)
         elif isinstance(node, core.FunctionDefStmt):
@@ -693,11 +735,12 @@ def _fp_bound_names(core: Any, params: tuple, body: tuple) -> set[str]:
     return bound
 
 
-def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
-    """A content-complete structural fingerprint of a helper def's ``(params, body)``,
-    invariant under the SPELLING of its bound names (params carry upstream-minted uid
-    suffixes that differ across content-identical rebuilds; locals are deterministic but
-    ride along in the same normalization). Bound names are replaced by their
+def _helper_fingerprint(core: ModuleType, params: tuple[PyExprs, ...],
+                        body: tuple[PyStmts, ...]) -> str | None:
+    """Fingerprint a helper def's ``(params, body)`` completely, ignoring bound-name spelling.
+
+    Params carry upstream-minted uid suffixes that differ across content-identical rebuilds,
+    and locals ride along in the same normalization. Bound names are replaced by their
     first-occurrence index in a deterministic traversal; free names keep their spelling,
     so equal fingerprints ⇒ alpha-equivalent pure functions over the same module
     globals ⇒ one def can serve every call site. Returns ``None`` (⇒ no interning) on
@@ -705,10 +748,11 @@ def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
     the stream would erase. Also refuses on a NESTED def/lambda, whose binders would make
     :func:`_fp_bound_names`' unscoped set alpha-normalize an outer free global of the same
     spelling (unreachable with today's emitters; refusing keeps the invariant
-    unconditional rather than contingent on them)."""
+    unconditional rather than contingent on them).
+    """
     import hashlib
 
-    def has_nested_scope(node: Any) -> bool:
+    def has_nested_scope(node: PyStmts) -> bool:
         if isinstance(node, core.FunctionDefStmt) or (
                 hasattr(core, "LambdaExpr") and isinstance(node, core.LambdaExpr)):
             return True
@@ -734,7 +778,7 @@ def _helper_fingerprint(core: Any, params: tuple, body: tuple) -> str | None:
 
     budget = [_FP_MAX_NODES]
 
-    def ser(node: Any) -> None:
+    def ser(node: object) -> None:
         budget[0] -= 1
         if budget[0] < 0:
             raise _FpTooLarge(_FP_MAX_NODES)
@@ -827,12 +871,12 @@ class _Lowerer:
     def __init__(
         self,
         program: Program,
-        input_exprs: Mapping[str, Any],
-        intatom_exprs: Mapping[str, Any],
+        input_exprs: Mapping[str, PyExprs],
+        intatom_exprs: Mapping[str, PyExprs],
         opts: LowerOpts,
         *,
-        var_gen: Any = None,
-        defs: list[Any] | None = None,
+        var_gen: Callable[[str], str] | None = None,
+        defs: list[PyStmts] | None = None,
         helpers: dict[int, str] | None = None,
         fp_helpers: dict[str, str] | None = None,
     ) -> None:
@@ -881,17 +925,19 @@ class _Lowerer:
 
     # -- namespace helpers ------------------------------------------------
 
-    def _ns(self, path: str) -> Any:
+    def _ns(self, path: str) -> PyExprs:
         """Build ``<ns>.a.b.c`` as a MemberExpr chain (e.g. ``torch.linalg.qr``)."""
         node = self.array_ns
         for part in path.split("."):
             node = self.core.MemberExpr(base=node, name=part)
         return node
 
-    def _ns_call(self, path: str, args: Sequence[Any], kwargs: Sequence[Any] = ()) -> Any:
+    def _ns_call(self, path: str, args: Sequence[PyExprs],
+                 kwargs: Sequence[tuple[str, PyExprs]] = ()) -> PyExprs:
         return self.core.CallExpr(fn=self._ns(path), args=tuple(args), kwargs=tuple(kwargs))
 
-    def _dtype_f64(self) -> Any:
+    def _dtype_f64(self) -> PyExprs:
+        """Return the backend's float64 dtype expression."""
         if not self.opts.dtype_f64:
             return None
         from pyarraybackend.ir.types import f64
@@ -900,13 +946,15 @@ class _Lowerer:
 
     # -- driver: emit the program body, bind inputs, return output exprs --
 
-    def run(self) -> list[Any]:
+    def run(self) -> list[PyExprs]:
+        """Lower every statement and return one expression per program output."""
         self._bind_inputs()
         for stmt_idx, stmt in enumerate(self.prog.statements):
             self._emit_stmt(stmt_idx, stmt)
         return self._output_exprs()
 
-    def body_stmts(self) -> tuple[Any, ...]:
+    def body_stmts(self) -> tuple[PyStmts, ...]:
+        """Return the statements emitted so far, without resetting the builder."""
         return self.b.finish(reset=False)
 
     # -- inputs -----------------------------------------------------------
@@ -927,7 +975,7 @@ class _Lowerer:
 
     # -- statements -------------------------------------------------------
 
-    def _emit_stmt(self, stmt_idx: int, stmt: Any) -> None:
+    def _emit_stmt(self, stmt_idx: int, stmt: Stmt) -> None:
         if stmt.fn is None:
             return
         arg_exprs = [self._ref_expr(r) for r in stmt.in_]
@@ -949,7 +997,8 @@ class _Lowerer:
         else:  # pragma: no cover - defensive
             raise AssertionError(kind)
 
-    def _bind_output(self, stmt_idx: int, out_idx: int, bound: Any, var: Any) -> None:
+    def _bind_output(self, stmt_idx: int, out_idx: int, bound: SymArray, var: PyExprs) -> None:
+        """Record the expression a statement output binds to, per cell or as a whole tensor."""
         self.outvar[(stmt_idx, out_idx)] = var
         if bound._bulk is not None:
             self.bulkmap[bound._bulk.name] = var
@@ -963,7 +1012,7 @@ class _Lowerer:
 
     # -- ref resolution (mirrors Program._resolve_ref) --------------------
 
-    def _ref_expr(self, ref: Any) -> Any:
+    def _ref_expr(self, ref: Ref) -> PyExprs:
         if isinstance(ref, InputRef):
             return self._index(self.input_exprs[ref.name], ref.indices)
         if isinstance(ref, OutputRef):
@@ -982,7 +1031,7 @@ class _Lowerer:
             )
         raise TypeError(f"pyab: unknown Ref {type(ref).__name__}")
 
-    def _index(self, base: Any, idx: tuple[int, ...]) -> Any:
+    def _index(self, base: PyExprs, idx: tuple[int, ...]) -> PyExprs:
         if not idx:
             return base
         return self.core.AccessExpr(
@@ -992,8 +1041,9 @@ class _Lowerer:
     # -- op dispatch ------------------------------------------------------
 
     def _render_op(
-        self, fn: Any, args: list[Any], out: Any, in_refs: Any = ()
-    ) -> tuple[str, Any]:
+        self, fn: StmtOp, args: list[PyExprs], out: tuple[SymArray, ...],
+        in_refs: Sequence[Ref] = ()
+    ) -> tuple[str, PyExprs | list[PyExprs]]:
         c = self.core
         # Front-end ops first (keyed by class name), then the builtin vocabulary.
         renderer = self.extra.get(type(fn).__name__)
@@ -1080,20 +1130,22 @@ class _Lowerer:
             f"{type(fn).__name__}': ...}}), or extend pyab._Lowerer._render_op."
         )
 
-    def _unwrap_int_call(self, expr: Any) -> Any:
+    def _unwrap_int_call(self, expr: PyExprs) -> PyExprs:
         """Strip the ``int(...)`` wrapper pyab puts on an :class:`IntAtomRef`.
 
         :meth:`_ref_expr` renders an :class:`~polyarray.ir.IntAtomRef` scrutinee as
         ``CallExpr(fn=Var("int"), args=(o_var,))`` — the ``int(tensor)`` is exactly
         what breaks ``torch.vmap`` (it calls ``.item()`` on a batched tensor).
         Recover the raw ``o_var`` so the one-hot switch lowers as pure arithmetic.
-        Passthrough if not so wrapped."""
+        Passthrough if not so wrapped.
+        """
         c = self.core
         if isinstance(expr, c.CallExpr) and isinstance(expr.fn, c.Var) and expr.fn.name == "int":
             return expr.args[0]
         return expr
 
-    def _switch_expr(self, fn: Any, args: list[Any], scrutinee_ref: Any = None) -> Any:
+    def _switch_expr(self, fn: SwitchOp, args: list[PyExprs],
+                     scrutinee_ref: Ref | None = None) -> PyExprs:
         """Canonical :class:`~polyarray.ir.SwitchOp` lowering — ``branch[scrutinee]``.
 
         Two lanes, chosen by whether the scrutinee is STATICALLY a concrete int:
@@ -1143,11 +1195,12 @@ class _Lowerer:
     # plain (undecorated) callable and they run eager; only ``place="fuse"``
     # across the rank hits the break.
 
-    def _reduce(self, a: Any, op: Any) -> Any:
+    def _reduce(self, a: PyExprs, op: PyExprs) -> PyExprs:
+        """Reduce ``a`` over every axis with ``op``."""
         return self.core.ReduceExpr(a=a, op=op, axis=None, keepdims=False)
 
-    def _svd_rank(self, s_var: Any, max_mn: int, rcond: float | None) -> Any:
-        """rank = number of singular values above numpy's matrix_rank tolerance."""
+    def _svd_rank(self, s_var: PyExprs, max_mn: int, rcond: float | None) -> PyExprs:
+        """Rank = number of singular values above numpy's matrix_rank tolerance."""
         c = self.core
         smax = self.b.assign_new(self._reduce(s_var, c.ReduceOp.MAX), base="smax")
         if rcond is None:
@@ -1160,7 +1213,7 @@ class _Lowerer:
         gt = c.BinaryExpr(op=c.BinaryOp.GT, lhs=s_var, rhs=tol)
         return self._reduce(gt, c.ReduceOp.SUM)
 
-    def _svd(self, fn: Any, args: list[Any], out: Any) -> list[Any]:
+    def _svd(self, fn: SvdOp, args: list[PyExprs], out: tuple[SymArray, ...]) -> list[PyExprs]:
         c = self.core
         # U, S, Vh are static-shape; recover m, n from the U / Vh output specs.
         m = int(out[0].cells.shape[0])
@@ -1175,7 +1228,8 @@ class _Lowerer:
         rankv = self.b.assign_new(self._svd_rank(sv, max(m, n), fn.rcond), base="rank")
         return [uv, sv, vhv, rankv]
 
-    def _gsvd(self, fn: Any, args: list[Any], out: Any, in_refs: Any) -> list[Any]:
+    def _gsvd(self, fn: GSvdOp, args: list[PyExprs], out: tuple[SymArray, ...],
+              in_refs: Sequence[Ref]) -> list[PyExprs]:
         """Metric-aware GSVD as a composite of cholesky / svd / solve + FFS split.
 
         Mirrors :meth:`polyarray.ir.GSvdOp.__call__` exactly: whiten ``A`` by the
@@ -1191,10 +1245,10 @@ class _Lowerer:
         id_w = self.opts.simplify_gsvd and self._ref_is_identity(in_refs[2], n_w)
         id_v = self.opts.simplify_gsvd and self._ref_is_identity(in_refs[1], n_v)
 
-        def new(e: Any, base: str) -> Any:
+        def new(e: PyExprs, base: str) -> PyExprs:
             return self.b.assign_new(e, base=base)
 
-        def mm(x: Any, y: Any) -> Any:
+        def mm(x: PyExprs, y: PyExprs) -> PyExprs:
             return c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=x, rhs=y)
 
         lwt = None if id_w else new(c.TransposeExpr(a=new(self._ns_call("linalg.cholesky", (M_W,)), "Lw"), axes=None), "LwT")
@@ -1228,8 +1282,8 @@ class _Lowerer:
         vi = c.AccessExpr(base=v_full, index=(colon, tail))
         return [u, ui, v, vi, sv, rankv]
 
-    def _ref_shape(self, ref: Any) -> tuple[int, ...]:
-        """Static shape of an operand ref (for the rank tolerance / FFS dims)."""
+    def _ref_shape(self, ref: Ref) -> tuple[int, ...]:
+        """Return an operand ref's static shape, as the rank tolerance and dimensions need it."""
         if isinstance(ref, SymArrayRef):
             base = ref._bulk.shape if ref._bulk is not None else ref.cells.shape
             return tuple(base)
@@ -1245,8 +1299,8 @@ class _Lowerer:
             return tuple(np.asarray(ref.value).shape)
         raise TypeError(f"pyab: cannot take a static shape of {type(ref).__name__}")
 
-    def _ref_is_identity(self, ref: Any, n: int) -> bool:
-        """True iff ``ref`` is a numerically-known ``n x n`` identity matrix."""
+    def _ref_is_identity(self, ref: Ref, n: int) -> bool:
+        """Report whether ``ref`` is a numerically-known ``n x n`` identity matrix."""
         if isinstance(ref, Const):
             val = np.asarray(ref.value)
             return val.shape == (n, n) and np.allclose(val, np.eye(n))
@@ -1259,7 +1313,7 @@ class _Lowerer:
 
     # -- WhileOp -> WhileHop (torch.while_loop / functional.while_loop) -----
 
-    def _while(self, fn: Any, args: list[Any], out: Any) -> tuple[str, Any]:
+    def _while(self, fn: WhileOp, args: list[PyExprs], out: tuple[SymArray, ...]) -> tuple[str, PyExprs]:
         c = self.core
         if not isinstance(fn.cond, Program) or not isinstance(fn.body, Program):
             raise NotImplementedError(
@@ -1279,7 +1333,7 @@ class _Lowerer:
 
     # -- QR (small-Householder interception) ------------------------------
 
-    def _qr(self, fn: Any, args: list[Any], out: Any) -> tuple[str, Any]:
+    def _qr(self, fn: QrOp, args: list[PyExprs], out: tuple[SymArray, ...]) -> tuple[str, PyExprs]:
         sq = self.opts.small_qr
         m, n = _static_matrix_shape(out)
         if (
@@ -1344,12 +1398,14 @@ class _Lowerer:
         self.defs.append(c.FunctionDefStmt(name=name, params=params, body=body))
         return name
 
-    def _call_subprogram(self, prog: Program, args: list[Any], out: Any) -> tuple[str, Any]:
+    def _call_subprogram(self, prog: Program, args: list[PyExprs],
+                         out: tuple[SymArray, ...]) -> tuple[str, PyExprs]:
         name = self._helper_for_program(prog)
         call = self.core.CallExpr(fn=self.core.Var(name=name), args=tuple(args))
         return ("tuple", call) if len(out) > 1 else ("single", call)
 
-    def _call_vmap(self, fn: Any, body: Program, args: list[Any], out: Any) -> tuple[str, Any]:
+    def _call_vmap(self, fn: StmtOp, body: Program, args: list[PyExprs],
+                   out: tuple[SymArray, ...]) -> tuple[str, PyExprs]:
         c = self.core
         if getattr(fn, "_nested_n_vars", None) is not None:
             return self._call_nested_vmap(fn, body, args)
@@ -1375,14 +1431,17 @@ class _Lowerer:
         call = c.CallExpr(fn=hop, args=tuple(args))
         return ("tuple", call) if len(out) > 1 else ("single", call)
 
-    def _call_nested_vmap(self, fn: Any, body: Program, args: list[Any]) -> tuple[str, Any]:
-        """Multi-var nested vmap (grassmann's k-bound-var ``LLam``) -> nested
-        ``VMapHop``.  The body's first ``n_vars`` args are batched (one vmap
-        level each, over axis 0); the remaining ``n_free`` args broadcast.  torch
-        stacks the batched axes in front, so — matching numpy_source's
+    def _call_nested_vmap(self, fn: StmtOp, body: Program, args: list[PyExprs]) -> tuple[str, PyExprs]:
+        """Lower a multi-variable nested vmap to nested ``VMapHop``s.
+
+        The body's first ``n_vars`` args are batched, one vmap level each over axis 0; the
+        remaining ``n_free`` args broadcast. torch stacks the batched axes in front, so,
+        matching numpy_source's
         ``_emit_nested_vmap_helper`` — we then ``moveaxis`` the leading ``n_vars``
-        var axes to the end (``(*cod, *var_sizes)``)."""
+        var axes to the end (``(*cod, *var_sizes)``).
+        """
         c = self.core
+        assert isinstance(fn, NestedVmapClosure)
         n_vars = int(fn._nested_n_vars)
         n_free = int(fn._nested_n_free)
         n_args = n_vars + n_free
@@ -1406,17 +1465,18 @@ class _Lowerer:
 
     # -- cells / rational functions ---------------------------------------
 
-    def _const_expr(self, value: Any) -> Any:
+    def _const_expr(self, value: npt.ArrayLike) -> PyExprs:
         c = self.core
         if isinstance(value, np.ndarray):
             return _const_array_expr(c, value)
         return c.FloatLit(value=float(value))
 
-    def _cells_expr_shared(self, cells: np.ndarray) -> Any:
-        """CSE wrapper for :meth:`_cells_expr` on an OPERAND ref: assemble a non-bulk
-        OBJECT-dtype cell array ONCE into a Var (keyed on ``id(cells)``) and reuse it,
-        so a SymArray consumed as an operand by many Stmts is materialised a single time
-        rather than re-scattered element-wise (nested ``stack`` of per-cell ``_poly_to_ir``
+    def _cells_expr_shared(self, cells: np.ndarray) -> PyExprs:
+        """Assemble an operand ref's cell array once and reuse it, as common-subexpression elimination.
+
+        A non-bulk object-dtype cell array is materialised into a ``Var`` keyed on cell
+        identity, so a SymArray consumed as an operand by many statements is built a single
+        time rather than re-scattered element-wise (nested ``stack`` of per-cell ``_poly_to_ir``
         trees) at every consumption site — the dominant non-bulk codegen blow-up.
 
         Float arrays go through the same Var now.  They used to fall through ("not worth
@@ -1426,7 +1486,8 @@ class _Lowerer:
         inline operand is re-emitted in full at every use site.  Binding the Var turns
         those uses into references; pyab's content-addressed CSE then collapses the
         bindings themselves, so an id-keyed memo here still lands on distinct-by-content.
-        Empty arrays keep falling through (nothing to share)."""
+        Empty arrays keep falling through (nothing to share).
+        """
         arr = np.asarray(cells)
         if arr.size == 0:
             return self._cells_expr(cells)
@@ -1438,7 +1499,7 @@ class _Lowerer:
         self._cells_cse[key] = var
         return var
 
-    def _cells_expr(self, cells: np.ndarray) -> Any:
+    def _cells_expr(self, cells: np.ndarray) -> PyExprs:
         """Assemble an ndarray of cells (floats and/or RationalFunctions)."""
         c = self.core
         cells = np.asarray(cells)
@@ -1455,7 +1516,7 @@ class _Lowerer:
         # tensor leaves with ``stack`` so the result is a real backend tensor.
         return self._stack_cells(cells)
 
-    def _stack_cells(self, cells: np.ndarray) -> Any:
+    def _stack_cells(self, cells: np.ndarray) -> PyExprs:
         c = self.core
         cells = np.asarray(cells, dtype=object)
         if cells.ndim == 0:
@@ -1466,14 +1527,14 @@ class _Lowerer:
         rows = [self._stack_cells(cells[i]) for i in range(cells.shape[0])]
         return c.StackExpr(arrays=tuple(rows), axis=0)
 
-    def _leaf_tensor(self, cell: Any) -> Any:
-        """A single scalar cell rendered as a 0-d backend tensor expr."""
+    def _leaf_tensor(self, cell: Cell) -> PyExprs:
+        """Render a single scalar cell as a 0-d backend tensor expression."""
         c = self.core
         if isinstance(cell, RationalFunction):
             return c.ArrayExpr(obj=self._rf_expr(cell), dtype=self._dtype_f64())
         return c.ArrayExpr(obj=c.FloatLit(value=float(cell)), dtype=self._dtype_f64())
 
-    def _rf_expr(self, rf: RationalFunction) -> Any:
+    def _rf_expr(self, rf: RationalFunction) -> PyExprs:
         c = self.core
         names = _ring_names(rf._ring)
         gens: list[Any] = []
@@ -1492,8 +1553,9 @@ class _Lowerer:
 
     # -- outputs ----------------------------------------------------------
 
-    def _output_exprs(self) -> list[Any]:
-        exprs: list[Any] = []
+    def _output_exprs(self) -> list[PyExprs]:
+        """Render one expression per program output."""
+        exprs: list[PyExprs] = []
         for _, sa in self.prog.outputs.items():
             if sa._bulk is not None:
                 exprs.append(self.bulkmap[sa._bulk.name])
@@ -1506,7 +1568,7 @@ class _Lowerer:
 # Small module-level helpers
 # ---------------------------------------------------------------------------
 
-def _vmap_body_of(fn: Any) -> Program | None:
+def _vmap_body_of(fn: StmtOp) -> Program | None:
     body = getattr(fn, "_vmap_body", None)
     if isinstance(body, Program):
         return body
@@ -1531,15 +1593,15 @@ def _safe(name: str) -> str:
     return "p_" + sane if keyword.iskeyword(sane) else sane
 
 
-def _pylit(core: Any, value: Any) -> Any:
+def _pylit(core: ModuleType, value: object) -> PyExprs:
     """Render a python int / tuple-of-ints axis spec as an IR literal."""
     if isinstance(value, (tuple, list)):
         return core.TupleExpr(elts=tuple(core.IntLit(value=int(v)) for v in value))
     return core.IntLit(value=int(value))
 
 
-def _const_array_expr(core: Any, value: Any) -> Any:
-    """A dense float constant as ONE ``ConstArrayExpr``.
+def _const_array_expr(core: ModuleType, value: npt.ArrayLike) -> PyExprs:
+    """Render a dense float constant as one ``ConstArrayExpr``.
 
     The element-wise spelling (``ArrayExpr`` over a nested ``TupleExpr`` of
     ``FloatLit``) costs one IR node per entry, which large constant tables make the
@@ -1552,20 +1614,20 @@ def _const_array_expr(core: Any, value: Any) -> Any:
     )
 
 
-def _nested_tuple(core: Any, obj: Any) -> Any:
-    """A (possibly nested) python list of floats -> nested TupleExpr of FloatLit."""
+def _nested_tuple(core: ModuleType, obj: object) -> PyExprs:
+    """Render a possibly nested Python list of floats as a nested ``TupleExpr`` of ``FloatLit``."""
     if isinstance(obj, (list, tuple)):
         return core.TupleExpr(elts=tuple(_nested_tuple(core, o) for o in obj))
     return core.FloatLit(value=float(obj))
 
 
-def _ret_value(core: Any, out_exprs: list[Any]) -> Any:
+def _ret_value(core: ModuleType, out_exprs: list[PyExprs]) -> PyExprs:
     if len(out_exprs) == 1:
         return out_exprs[0]
     return core.TupleExpr(elts=tuple(out_exprs))
 
 
-def _static_matrix_shape(out: Any) -> tuple[int | None, int | None]:
+def _static_matrix_shape(out: SymArray) -> tuple[int | None, int | None]:
     """(m, n) of the QR operand, recovered from the produced Q output shape.
 
     ``QrOp`` reduced: Q is ``m x n``.  We read the output SymArray cell shapes:
@@ -1581,7 +1643,7 @@ def _static_matrix_shape(out: Any) -> tuple[int | None, int | None]:
     return (int(q_shape[0]), int(q_shape[1]))
 
 
-def _poly_to_ir(core: Any, poly: Any, gens: Sequence[Any]) -> Any:
+def _poly_to_ir(core: ModuleType, poly: Poly, gens: Sequence[PyExprs]) -> PyExprs:
     """Render a backend ``Poly`` as an IR arithmetic expr over ``gens`` exprs.
 
     Mirrors :func:`polyarray.rational._poly_term_strings`: each term
@@ -1622,7 +1684,7 @@ def _poly_to_ir(core: Any, poly: Any, gens: Sequence[Any]) -> Any:
     return _balanced(core, terms, core.BinaryOp.ADD)
 
 
-def _balanced(core: Any, exprs: list[Any], op: Any) -> Any:
+def _balanced(core: ModuleType, exprs: list[PyExprs], op: PyExprs) -> PyExprs:
     """Fold ``exprs`` with binary ``op`` into a balanced tree (log depth)."""
     if len(exprs) == 1:
         return exprs[0]
@@ -1641,8 +1703,8 @@ def _balanced(core: Any, exprs: list[Any], op: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 def _emit_householder_qr(
-    low: _Lowerer, a_expr: Any, m: int, n: int, mode: str
-) -> tuple[Any, Any]:
+    low: _Lowerer, a_expr: PyExprs, m: int, n: int, mode: str
+) -> tuple[PyExprs, PyExprs]:
     """Emit unrolled Householder QR of an ``m x n`` (m>=n) matrix.
 
     Returns ``(Q_expr, R_expr)`` — reduced (``m x n`` / ``n x n``) for
@@ -1657,19 +1719,19 @@ def _emit_householder_qr(
     one = c.FloatLit(value=1.0)
     zero = c.FloatLit(value=0.0)
 
-    def sca(base: str, e: Any) -> Any:
+    def sca(base: str, e: PyExprs) -> PyExprs:
         return b.assign_new(e, base=base)
 
-    def add(x: Any, y: Any) -> Any:
+    def add(x: PyExprs, y: PyExprs) -> PyExprs:
         return c.BinaryExpr(op=c.BinaryOp.ADD, lhs=x, rhs=y)
 
-    def sub(x: Any, y: Any) -> Any:
+    def sub(x: PyExprs, y: PyExprs) -> PyExprs:
         return c.BinaryExpr(op=c.BinaryOp.SUB, lhs=x, rhs=y)
 
-    def mul(x: Any, y: Any) -> Any:
+    def mul(x: PyExprs, y: PyExprs) -> PyExprs:
         return c.BinaryExpr(op=c.BinaryOp.MUL, lhs=x, rhs=y)
 
-    def div(x: Any, y: Any) -> Any:
+    def div(x: PyExprs, y: PyExprs) -> PyExprs:
         return c.BinaryExpr(op=c.BinaryOp.TRUEDIV, lhs=x, rhs=y)
 
     # Materialise the input matrix entries as scalar tensor Vars.
@@ -1771,7 +1833,7 @@ def _emit_householder_qr(
     return q_expr, r_expr
 
 
-def _as_tensor(low: _Lowerer, e: Any) -> Any:
+def _as_tensor(low: _Lowerer, e: PyExprs) -> PyExprs:
     c = low.core
     return c.ArrayExpr(obj=e, dtype=low._dtype_f64())
 
@@ -1795,8 +1857,8 @@ _VMAP_COLLAPSIBLE = (
 )
 
 
-def _sole_collapsible_op(body: Program) -> Any:
-    """The single collapsible op in a vmap body, or None.
+def _sole_collapsible_op(body: Program) -> StmtOp | None:
+    """Find the single collapsible op in a vmap body, or ``None``.
 
     ``IdentityOp`` statements (the bulk->per-cell unpack / freeze passthroughs)
     and ``fn=None`` splices are ignored — they never change values.  If the body
@@ -1828,13 +1890,13 @@ def _batched_einsum_spec(spec: str) -> str:
     return f"{ins}->{batch}{rhs.strip()}"
 
 
-def _batched_op(op: Any) -> Any:
+def _batched_op(op: StmtOp) -> StmtOp | None:
     if isinstance(op, EinsumStmtOp):
         return EinsumStmtOp(spec=_batched_einsum_spec(op.spec), optimize=op.optimize)
     return op  # det / inv / pinv / solve / sqrt / abs / sign batch over leading dims
 
 
-def _verify_collapse(fn: Any, body: Program, batched_op: Any, *, m: int, seed: int) -> bool:
+def _verify_collapse(fn: StmtOp, body: Program, batched_op: StmtOp, *, m: int, seed: int) -> bool:
     """Numerically check ``vmap(body)(probe) == batched_op(probe)`` on a probe."""
     rng = np.random.default_rng(seed)
     probes: list[np.ndarray] = []
@@ -1888,7 +1950,7 @@ def collapse_vmap(program: Program, *, probe_batch: int = 4, seed: int = 12345) 
     return new, collapsed
 
 
-def prepare(program: Program, *, opts: LowerOpts | None = None) -> tuple[Program, dict[str, Any]]:
+def prepare(program: Program, *, opts: LowerOpts | None = None) -> tuple[Program, PrepReport]:
     """Apply backend-prep simplifications; return ``(program, report)``.
 
     Run automatically by :func:`as_function_def` / :func:`lower_program_into` /
@@ -1913,12 +1975,12 @@ def prepare(program: Program, *, opts: LowerOpts | None = None) -> tuple[Program
 
 def lower_program_into(
     program: Program,
-    builder: Any,
-    arg_exprs: Sequence[Any],
+    builder: StmtBuilder,
+    arg_exprs: Sequence[PyExprs],
     *,
-    intatom_exprs: Mapping[str, Any] | None = None,
+    intatom_exprs: Mapping[str, PyExprs] | None = None,
     opts: LowerOpts | None = None,
-) -> tuple[list[Any], list[Any]]:
+) -> tuple[list[PyExprs], list[PyStmts]]:
     """Inline ``program`` into ``builder`` at the current point.
 
     ``arg_exprs`` are the PyAB exprs bound to the program inputs (in
@@ -1956,27 +2018,36 @@ _IR_CELLS_CEILING = 8192          # number of symbolic output cells (eager per-c
 
 
 class PyabIROversizedError(RuntimeError):
-    """Raised by the oversized-IR backstop in ``raise`` mode (``PYAB_IR_CEILING=raise``): the program's
-    symbolic IR blew past the cost ceiling — an eager materialization / un-folded data-independent solve —
-    so compilation is aborted HERE (fast + loud, with a top-offenders breakdown) instead of proceeding to
-    the render/codegen that would OOM or hang. Catchable so a caller can fall back / re-plan (`§E2`)."""
+    """Raised by the oversized-IR backstop under ``PYAB_IR_CEILING=raise``.
+
+    The program's symbolic IR has passed the cost ceiling — the fingerprint of an eager
+    materialization, or an un-folded data-independent solve — so compilation aborts here,
+    with a top-offenders breakdown, rather than proceeding to a render that would exhaust
+    memory or hang. Catchable, so a caller can fall back or re-plan.
+    """
 
 
 def _ir_ceiling_mode() -> str:
-    """How the oversized-IR backstop reacts, from ``PYAB_IR_CEILING`` ∈ {``warn`` (default), ``raise``,
-    ``off``}. ``raise`` is for CI/dev: turn a blow-up into an instant, attributed failure at compile
-    time rather than a slow OOM/hang downstream (§E1/E2 blow-up blocker-avoidance)."""
+    """Read how the oversized-IR backstop should react, from ``PYAB_IR_CEILING``.
+
+    One of ``warn`` (the default), ``raise`` or ``off``. ``raise`` suits CI and development:
+    it turns a blow-up into an instant, attributed failure at compile time rather than a slow
+    exhaustion downstream.
+    """
     return os.environ.get("PYAB_IR_CEILING", "warn").strip().lower()
 
 
 def _check_ir_oversized(program: Program, name: str) -> None:
-    """Backstop the eager-materialization blow-up class: when ``program``'s symbolic IR is pathologically
-    large (the fingerprint of a per-cell scatter that should be a deferred ``bulk`` node, or a
-    data-independent solve/SVD that should be constant-folded), react per :func:`_ir_ceiling_mode` —
-    ``warn`` (one warning, the compile proceeds — DEFAULT, behaviour-preserving), ``raise``
+    """Guard against the eager-materialization blow-up before rendering.
+
+    When ``program``'s symbolic IR is pathologically large — the fingerprint of a per-cell
+    scatter that should be a deferred bulk node, or a data-independent solve or SVD that
+    should have been constant-folded — react per :func:`_ir_ceiling_mode`:
+    ``warn`` (one warning, the compile proceeds; the default), ``raise``
     (:class:`PyabIROversizedError`, abort now with a top-offenders breakdown), or ``off``. Rides
     :func:`polyarray.forward.analyze` (cheap on bulk programs, which it skips — the asymmetry is the
-    signal). The ANALYSIS never breaks a compile; only ``raise`` mode raises, and only deliberately."""
+    signal). The ANALYSIS never breaks a compile; only ``raise`` mode raises, and only deliberately.
+    """
     mode = _ir_ceiling_mode()
     if mode == "off":
         return
@@ -2013,7 +2084,7 @@ def as_function_def(
     *,
     name: str = "f",
     opts: LowerOpts | None = None,
-) -> tuple[Any, ...]:
+) -> tuple[PyStmts, ...]:
     """Emit ``program`` as PyAB statements: helper ``def``s + one ``def name``.
 
     The returned tuple is ready to hand to a PyAB backend ``compile``.  The
@@ -2042,18 +2113,18 @@ emit_module_stmts = as_function_def
 
 def call_lowered(
     program: Program,
-    builder: Any,
-    arg_exprs: Sequence[Any],
+    builder: StmtBuilder,
+    arg_exprs: Sequence[PyExprs],
     *,
     place: Placement = "plain",
     in_dims: Sequence[int | None] | None = None,
     out_dim: int = 0,
-    device: Any = None,
-    fusion_opts: Any = None,
-    kernel_kind: Any = None,
+    device: Device | None = None,
+    fusion_opts: FusionOpts | None = None,
+    kernel_kind: KernelKind | None = None,
     name: str | None = None,
     opts: LowerOpts | None = None,
-) -> tuple[tuple[Any, ...], Any]:
+) -> tuple[tuple[PyStmts, ...], PyExprs]:
     """Emit ``program`` as a callable ``def`` + a *placed* call, into ``builder``.
 
     The ``def`` (plus helper defs) is returned as ``module_defs`` — the caller
@@ -2092,7 +2163,7 @@ def call_lowered(
         dev = device if device is not None else Device.CPU
         kk = kernel_kind if kernel_kind is not None else core.KernelKind.TORCH_COMPILE
 
-        def _body(child: Any) -> Any:
+        def _body(child: PyStmts) -> PyStmts:
             return core.CallExpr(fn=fvar, args=args)
 
         result = builder.region(
@@ -2107,13 +2178,17 @@ def compile_torch(
     *,
     name: str = "f",
     opts: LowerOpts | None = None,
-    options: Any = None,
-    dump_dir: Any = None,
-) -> Any:
-    """Convenience: lower ``program`` and compile it with PyAB's torch backend.
+    options: TorchBackendOptions | None = None,
+    dump_dir: Path | str | None = None,
+) -> TorchModule:
+    """Lower ``program`` and compile it with PyAB's torch backend.
 
-    Returns the ``CompiledModule``; ``module.<name>`` is the callable.  Requires
-    ``torch``.  ``opts.target`` is forced to ``"torch"``.
+    Requires ``torch``. ``opts.target`` is forced to ``"torch"``.
+
+    Returns
+    -------
+    TorchModule
+        The compiled module; ``module.<name>`` is the callable.
     """
     from pyarraybackend.backends import torch_backend
 
@@ -2127,13 +2202,17 @@ def compile_numpy(
     *,
     name: str = "f",
     opts: LowerOpts | None = None,
-    options: Any = None,
-    dump_dir: Any = None,
-) -> Any:
-    """Convenience: lower ``program`` and compile it with PyAB's numpy backend.
+    options: PythonBackendOptions | None = None,
+    dump_dir: Path | str | None = None,
+) -> NumpyModule:
+    """Lower ``program`` and compile it with PyAB's numpy backend.
 
-    Returns the ``CompiledModule``; ``module.<name>`` is the callable.  Needs no
-    torch.  ``opts.target`` is forced to ``"numpy"``.
+    Needs no torch. ``opts.target`` is forced to ``"numpy"``.
+
+    Returns
+    -------
+    NumpyModule
+        The compiled module; ``module.<name>`` is the callable.
     """
     from pyarraybackend.backends import python_backend
 

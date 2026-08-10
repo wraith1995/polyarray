@@ -38,6 +38,7 @@ Modeled propagation rules
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias, assert_never
 
@@ -106,6 +107,7 @@ from .ir import (
     SvdOp,
     SwitchOp,
     SymArray,
+    Ref,
     SymArrayRef,
     TensordotOp,
     TransposeOp,
@@ -118,7 +120,14 @@ from .rational import simple_zero
 
 # A mask is an ``ndarray`` of bool (True = structurally zero), or ``None`` when
 # the shape is dynamic / unknown (treated as all-False / unknown by consumers).
-Mask: TypeAlias = "np.ndarray | None"
+Mask: TypeAlias = np.ndarray | None
+
+#: One axis index, or a tuple/list of them — what ``np.moveaxis`` accepts.
+Axes: TypeAlias = int | Sequence[int]
+
+#: The ``axes`` argument of ``np.tensordot``: a contraction count, or the two
+#: index lists to contract over.
+TensordotAxes: TypeAlias = int | Sequence[Sequence[int]]
 
 
 # ---------------------------------------------------------------------------
@@ -126,16 +135,16 @@ Mask: TypeAlias = "np.ndarray | None"
 # ---------------------------------------------------------------------------
 
 def add_mask(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """``A + B`` / ``A - B`` rule: structurally zero where **both** are zero."""
+    """Combine masks under ``A + B`` / ``A - B``: zero where **both** are zero."""
     return np.asarray(a, dtype=bool) & np.asarray(b, dtype=bool)
 
 
 def mul_mask(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """``A * B`` / Hadamard rule: structurally zero where **either** is zero."""
+    """Combine masks under ``A * B`` / Hadamard: zero where **either** is zero."""
     return np.asarray(a, dtype=bool) | np.asarray(b, dtype=bool)
 
 
-def tensordot_mask(a: np.ndarray, b: np.ndarray, axes: Any) -> np.ndarray:
+def tensordot_mask(a: np.ndarray, b: np.ndarray, axes: TensordotAxes) -> np.ndarray:
     """Boolean ``np.tensordot`` contraction of two structural-zero masks.
 
     ``out`` is structurally zero iff **every** contributing product pair has a
@@ -161,8 +170,8 @@ def einsum_mask(spec: str, *masks: np.ndarray, optimize: bool = True) -> np.ndar
     return np.asarray(count) == 0.0
 
 
-def moveaxis_mask(mask: np.ndarray, source: Any, destination: Any) -> np.ndarray:
-    """``MoveaxisOp`` rule: permute the mask exactly like ``np.moveaxis``."""
+def moveaxis_mask(mask: np.ndarray, source: Axes, destination: Axes) -> np.ndarray:
+    """Permute a mask exactly as ``np.moveaxis`` permutes its array."""
     return np.moveaxis(np.asarray(mask, dtype=bool), source, destination)
 
 
@@ -171,7 +180,7 @@ def moveaxis_mask(mask: np.ndarray, source: Any, destination: Any) -> np.ndarray
 # ---------------------------------------------------------------------------
 
 def _static_shape(sa: SymArray) -> tuple[int, ...] | None:
-    """The concrete shape of ``sa``, or ``None`` if dynamic (``DimAtom``-sized)."""
+    """Return the concrete shape of ``sa``, or ``None`` if it is ``DimAtom``-sized."""
     shp = sa._bulk.shape if sa._bulk is not None else sa._cells.shape
     if is_dynamic(shp):
         return None
@@ -179,19 +188,19 @@ def _static_shape(sa: SymArray) -> tuple[int, ...] | None:
 
 
 def _false_mask(sa: SymArray) -> Mask:
-    """All-False (unknown) mask shaped like ``sa`` (``None`` if dynamic)."""
+    """Return an all-False (unknown) mask shaped like ``sa``, or ``None`` if dynamic."""
     shp = _static_shape(sa)
     return None if shp is None else np.zeros(shp, dtype=bool)
 
 
 def _array_mask(sa: SymArray) -> Mask:
-    """Structural-zero mask for an *input* / leaf SymArray (never unpacks bulk)."""
+    """Return the structural-zero mask of a leaf SymArray, never unpacking bulk."""
     if sa._bulk is not None:
         return _false_mask(sa)
     return cells_sparsity(np.asarray(sa._cells))
 
 
-def block_zero_mask(symarray_or_cells: Any) -> np.ndarray:
+def block_zero_mask(symarray_or_cells: SymArray | np.ndarray) -> np.ndarray:
     """Read the structural-zero pattern of a (Vandermonde) matrix.
 
     The convenience the oracle M3 Schur inverse calls to choose the ``(p, q)``
@@ -274,28 +283,32 @@ class SparsityReport:
 # ---------------------------------------------------------------------------
 
 def _index(mask: Mask, indices: tuple[int, ...]) -> Mask:
+    """Index into a mask the way a ref's ``indices`` index into its array."""
     if mask is None or not indices:
         return mask
     return np.asarray(mask[indices])
 
 
 def _resolve_ref_mask(
-    ref: Any,
+    ref: Ref,
     input_masks: dict[str, Mask],
     stmt_out_masks: dict[tuple[int, int], Mask],
     cells_id_to_mask: dict[int, Mask],
     bulk_name_to_mask: dict[str, Mask],
 ) -> Mask:
-    """Structural-zero mask flowing in through a Stmt input ref.
+    """Return the structural-zero mask flowing in through a statement input ref.
 
-    Returns ``None`` for refs that carry no array mask (an ``IntAtomRef``
-    selector) or whose shape is dynamic/unknown — callers treat ``None`` as
-    "unknown", which keeps the pass conservative (all-False downstream).
+    A :class:`SymArrayRef` to a prior statement output or to an input carries that
+    array's *fresh-atom* cells, which have no structural zeros of their own, so the
+    propagated mask is looked up by cells identity — the producing op's modeled rule —
+    before falling back to the cells' own pattern.
 
-    A :class:`SymArrayRef` to a prior Stmt output / input carries that array's
-    *fresh-atom* cells, which have no structural zeros of their own — so we look
-    up the **propagated** mask by cells identity (the producing op's modeled
-    rule) before falling back to the cells' own pattern.
+    Returns
+    -------
+    Mask
+        ``None`` for a ref that carries no array mask (an ``IntAtomRef`` selector) or
+        whose shape is dynamic. Callers read ``None`` as "unknown", which keeps the pass
+        conservative.
     """
     if isinstance(ref, InputRef):
         return _index(input_masks.get(ref.name), ref.indices)
@@ -356,17 +369,16 @@ def _apply_op(stmt: Stmt, in_masks: list[Mask]) -> list[Mask]:
 def _apply_builtin_op(
     fn: StmtFn, in_masks: list[Mask], outs: tuple[SymArray, ...], unknown: list[Mask],
 ) -> list[Mask]:
-    """The modeled mask rule for one polyarray-owned op.
+    """Apply the modeled mask rule for one polyarray-owned op.
 
-    EXHAUSTIVE over :data:`~polyarray.ir.StmtFn`; ``assert_never`` makes a newly added op
+    Exhaustive over :data:`~polyarray.ir.StmtFn`; ``assert_never`` makes a newly added op
     a mypy error rather than a silent fall-through.
 
-    **Unlike the exact-fold lane, an omission here is not a soundness bug**: ``unknown``
-    (all-False) is the conservative answer for every op, and the pass's hard rule is that
-    false *negatives* are safe while false *positives* are a correctness bug.  So the
-    grouped arm below is a PRECISION ledger, not a correctness one — but it is still a
-    ledger, which is the point: "no rule yet" now has to be written down per op instead of
-    being the silent default.
+    Unlike the exact-fold lane, an omission here is not a soundness bug: ``unknown``
+    (all-False) is the conservative answer for every op, since false negatives are safe
+    while false positives are a correctness bug. The grouped arm below is therefore a
+    precision ledger — but a ledger nonetheless, so that "no rule yet" is written down
+    per op instead of being the silent default.
     """
     match fn:
       # --- contraction ops -------------------------------------------------

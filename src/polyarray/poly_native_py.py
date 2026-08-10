@@ -1,36 +1,49 @@
 """Pure-Python native polynomial backend.
 
-A dict-of-monomial-tuples sparse multivariate polynomial engine,
-generic over the coefficient type via a :class:`ValueHandle`.  Selected
-by ``CHARTLIB_POLY_BACKEND=native_py``; the coefficient type is chosen
-by ``CHARTLIB_POLY_COEFF`` (slice A1 only ships ``double``).
+A dict-of-monomial-tuples sparse multivariate polynomial engine, generic over the
+coefficient type via a :class:`ValueHandle`. Selected by
+``CHARTLIB_POLY_BACKEND=native_py``, with the coefficient type chosen by
+``CHARTLIB_POLY_COEFF``.
 
-The aim is to strip the per-op Python tax that
-:class:`sympy.polys.rings.PolyElement` carries while keeping the
-existing :class:`Poly` / :class:`Ring` protocol unchanged so that
-``rational.py`` continues to work without modification.
+It implements the same :class:`Poly` / :class:`Ring` protocol as the sympy and flint
+backends, without the per-op Python cost of :class:`sympy.polys.rings.PolyElement`.
 """
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, TypeAlias
 
+import mpmath
 import sympy as sp
 
 from .poly_native_value import ValueHandle
 
-_VALUE: ValueHandle | None = None
+#: A coefficient of the active :class:`ValueHandle`: a Python float under ``double``,
+#: an ``mpmath.mpf`` under ``mpf`` / ``quad``.
+Coeff: TypeAlias = float | mpmath.mpf
+
+#: Anything a value handle coerces to a :data:`Coeff`.
+CoeffLike: TypeAlias = int | Coeff
+
+#: An exponent vector, one entry per ring generator.
+Monom: TypeAlias = tuple[int, ...]
+
+_VALUE: ValueHandle[Any] | None = None
 _RING_CACHE: dict[tuple[str, ...], _NativePyRing] = {}
 _POS_MAP_CACHE: dict[tuple[int, int], tuple[int, ...]] = {}
 
 
-def configure(value: ValueHandle) -> None:
+def configure(value: ValueHandle[Any]) -> None:
     """Install the active coefficient :class:`ValueHandle`.
 
-    Called once from :mod:`poly_backend` when dispatching to this
-    engine.  Switching to a different handle invalidates the ring /
-    pos_map caches (they are keyed on object identity, and rings carry
-    the handle they were built with).
+    Called once from :mod:`poly_backend` when it dispatches to this engine. Switching
+    handles invalidates the ring and pos-map caches, which are keyed on object identity
+    and hold rings built with the previous handle.
+
+    Parameters
+    ----------
+    value
+        The coefficient arithmetic every ring built from now on will use.
     """
     global _VALUE
     if _VALUE is value:
@@ -40,7 +53,8 @@ def configure(value: ValueHandle) -> None:
     _VALUE = value
 
 
-def _require_value() -> ValueHandle:
+def _require_value() -> ValueHandle[Any]:
+    """Return the installed value handle, or raise if the backend was never configured."""
     if _VALUE is None:
         raise RuntimeError(
             "native_py backend is not configured; "
@@ -50,7 +64,8 @@ def _require_value() -> ValueHandle:
     return _VALUE
 
 
-def _unit_monom(n: int, i: int) -> tuple[int, ...]:
+def _unit_monom(n: int, i: int) -> Monom:
+    """Return the degree-1 exponent vector for generator ``i`` in an ``n``-generator ring."""
     m = [0] * n
     m[i] = 1
     return tuple(m)
@@ -102,14 +117,16 @@ class _NativePyRing:
     def gen(self, i: int) -> _NativePyPoly:
         return self._gens[i]
 
-    def ground_new(self, value: Any) -> _NativePyPoly:
+    def ground_new(self, value: CoeffLike) -> _NativePyPoly:
+        """Return the constant polynomial ``value``."""
         c = self._value.from_python(value)
         if self._value.is_exact_zero(c):
             return self._zero
         one_monom = (0,) * self._n
         return _NativePyPoly._make_raw({one_monom: c}, self)
 
-    def from_dict(self, terms: dict[tuple[int, ...], Any]) -> _NativePyPoly:
+    def from_dict(self, terms: dict[Monom, CoeffLike]) -> _NativePyPoly:
+        """Build a polynomial from an exponent-vector to coefficient mapping."""
         if not terms:
             return self._zero
         from_python = self._value.from_python
@@ -143,12 +160,12 @@ class _NativePyPoly:
         self._hash = None
 
     @classmethod
-    def _make_raw(cls, terms: dict[tuple[int, ...], Any],
+    def _make_raw(cls, terms: dict[Monom, Coeff],
                   ring: _NativePyRing) -> _NativePyPoly:
-        """Internal: skip the structural-zero filter.
+        """Build a polynomial from terms already known to carry no structural zeros.
 
-        Callers must guarantee no entries in ``terms`` are
-        ``v.is_exact_zero``.
+        Skips the filter :meth:`from_dict` applies; callers must guarantee that no
+        coefficient in ``terms`` satisfies the handle's ``is_exact_zero``.
         """
         p = cls.__new__(cls)
         p._terms = terms
@@ -196,10 +213,10 @@ class _NativePyPoly:
             {m: neg(c) for m, c in self._terms.items()}, self._ring,
         )
 
-    def _coerce_scalar(self, other: Any) -> _NativePyPoly:
+    def _coerce_scalar(self, other: CoeffLike) -> _NativePyPoly:
         return self._ring.ground_new(other)
 
-    def __add__(self, other: Any) -> _NativePyPoly:
+    def __add__(self, other: _NativePyPoly | CoeffLike) -> _NativePyPoly:
         if isinstance(other, _NativePyPoly):
             if self._ring is not other._ring:
                 return NotImplemented
@@ -222,10 +239,10 @@ class _NativePyPoly:
             return self.__add__(self._coerce_scalar(other))
         return NotImplemented
 
-    def __radd__(self, other: Any) -> _NativePyPoly:
+    def __radd__(self, other: _NativePyPoly | CoeffLike) -> _NativePyPoly:
         return self.__add__(other)
 
-    def __sub__(self, other: Any) -> _NativePyPoly:
+    def __sub__(self, other: _NativePyPoly | CoeffLike) -> _NativePyPoly:
         if isinstance(other, _NativePyPoly):
             if self._ring is not other._ring:
                 return NotImplemented
@@ -249,12 +266,12 @@ class _NativePyPoly:
             return self.__sub__(self._coerce_scalar(other))
         return NotImplemented
 
-    def __rsub__(self, other: Any) -> _NativePyPoly:
+    def __rsub__(self, other: _NativePyPoly | CoeffLike) -> _NativePyPoly:
         if isinstance(other, (int, float)):
             return self._coerce_scalar(other).__sub__(self)
         return NotImplemented
 
-    def __mul__(self, other: Any) -> _NativePyPoly:
+    def __mul__(self, other: _NativePyPoly | CoeffLike) -> _NativePyPoly:
         if isinstance(other, _NativePyPoly):
             if self._ring is not other._ring:
                 return NotImplemented
@@ -275,7 +292,7 @@ class _NativePyPoly:
                 ((m_only, c_only),) = other._terms.items()
                 if m_only == one_monom and v_is_one(c_only):
                     return self
-            out: dict[tuple[int, ...], Any] = {}
+            out: dict[Monom, Coeff] = {}
             for m_a, c_a in self._terms.items():
                 for m_b, c_b in other._terms.items():
                     m = tuple(a + b for a, b in zip(m_a, m_b))
@@ -293,7 +310,7 @@ class _NativePyPoly:
             return self.__mul__(self._coerce_scalar(other))
         return NotImplemented
 
-    def __rmul__(self, other: Any) -> _NativePyPoly:
+    def __rmul__(self, other: _NativePyPoly | CoeffLike) -> _NativePyPoly:
         return self.__mul__(other)
 
     def __pow__(self, n: int) -> _NativePyPoly:
@@ -413,18 +430,17 @@ def _native_py_div_deg1(
     num: _NativePyPoly,
     den: _NativePyPoly,
 ) -> tuple[_NativePyPoly, _NativePyPoly]:
-    """Schoolbook polynomial long division specialised to a total-
-    degree-≤-1 divisor.
+    """Divide by a divisor of total degree at most 1, schoolbook style.
 
-    Pick any generator ``x_k`` whose coefficient in ``den`` is non-zero
-    and use it as the pivot.  At each step, find the term in the
-    running remainder with the highest pivot exponent (which is ≥ 1)
-    and cancel it by subtracting a scaled-and-shifted copy of ``den``.
-    Termination: the max pivot exponent in the remainder strictly
-    decreases each iteration.
+    Any generator whose coefficient in ``den`` is non-zero serves as the pivot. Each
+    step cancels the remainder term of highest pivot exponent by subtracting a scaled,
+    shifted copy of ``den``; that exponent strictly decreases, so the loop terminates.
 
-    Returns ``(quotient, remainder)``; the remainder is structurally
-    zero iff ``den`` exactly divides ``num``.
+    Returns
+    -------
+    tuple of (_NativePyPoly, _NativePyPoly)
+        Quotient and remainder. The remainder is structurally zero exactly when ``den``
+        divides ``num``.
     """
     ring = num._ring
     n = ring._n
@@ -514,6 +530,7 @@ def _native_py_div_deg1(
 
 
 def make_ring(names: Sequence[str]) -> _NativePyRing:
+    """Return the ring over ``names``, building and caching it on first use."""
     value = _require_value()
     key = tuple(names)
     cached = _RING_CACHE.get(key)
@@ -525,6 +542,7 @@ def make_ring(names: Sequence[str]) -> _NativePyRing:
 
 
 def _pos_map(src: _NativePyRing, target: _NativePyRing) -> tuple[int, ...]:
+    """Map each generator position in ``src`` to its position in ``target``."""
     key = (id(src), id(target))
     pm = _POS_MAP_CACHE.get(key)
     if pm is None:
@@ -543,6 +561,7 @@ def _pos_map(src: _NativePyRing, target: _NativePyRing) -> tuple[int, ...]:
 
 
 def lift(poly: _NativePyPoly, target: _NativePyRing) -> _NativePyPoly:
+    """Re-express ``poly`` in ``target``, which must contain every generator of its ring."""
     src = poly._ring
     if src is target:
         return poly
@@ -550,7 +569,7 @@ def lift(poly: _NativePyPoly, target: _NativePyRing) -> _NativePyPoly:
         return target._zero
     pos_map = _pos_map(src, target)
     n_tgt = target._n
-    new_terms: dict[tuple[int, ...], Any] = {}
+    new_terms: dict[Monom, Coeff] = {}
     for monom, coeff in poly._terms.items():
         new_monom = [0] * n_tgt
         for src_pos, exp in enumerate(monom):

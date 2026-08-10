@@ -27,16 +27,59 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import os
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, TypeAlias, TypeGuard, Union, get_args
+from typing import (Any, Literal, Protocol, TypeAlias, TypeGuard, Union, get_args,
+                    runtime_checkable)
 
 import numpy as np
+import numpy.typing as npt
 
 from .int_atom import IntAtom
+from .poly_backend import Poly
 from .rational import RationalFunction, simple_zero
 
 Cell = Union[RationalFunction, float, int]
+
+@runtime_checkable
+class VmapClosure(Protocol):
+    """A ``vmap`` closure, as the metadata :func:`vmap` stamps on it describes.
+
+    The attributes are additive and purely descriptive — evaluation never reads them — so a
+    tool can recover the batched body and the normalised axis tuples without spelunking the
+    closure cells. A front end may stamp the same attributes on a wrapper of its own; naming
+    the shape here is what lets a consumer narrow to it instead of probing with ``getattr``.
+    """
+
+    #: The per-element body the closure batches.
+    _vmap_body: Program
+    #: One entry per operand: the axis to map over, or ``None`` to broadcast it.
+    _in_axes: tuple[int | None, ...]
+    #: One entry per output: the axis the results stack on.
+    _out_axes: tuple[int | None, ...]
+
+
+@runtime_checkable
+class NestedVmapClosure(Protocol):
+    """A multi-variable nested ``vmap`` closure, batched once per bound variable.
+
+    The first :attr:`_nested_n_vars` operands each get their own vmap level; the remaining
+    :attr:`_nested_n_free` broadcast.
+    """
+
+    #: How many leading operands are batched, one nesting level each.
+    _nested_n_vars: int
+    #: How many trailing operands broadcast unbatched.
+    _nested_n_free: int
+
+
+#: A :class:`DimAtom`'s hashable identity: the tuple that names where the runtime
+#: dimension comes from.  Opaque by design — only ever compared and used as a dict key.
+type DimSource = tuple[object, ...]
+
+#: Anything numpy accepts as an index: an int, a slice, an index array, or a tuple
+#: mixing them.
+type Index = int | slice | np.ndarray | Sequence[int] | tuple[int | slice | np.ndarray | Sequence[int] | None, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +96,7 @@ _BUDGET_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
 
 
 @contextlib.contextmanager
-def budget_override(budget: SymbolicBudget | None):
+def budget_override(budget: SymbolicBudget | None) -> Iterator[None]:
     """Within this context, budget-less `Program`s use `budget` (None restores default)."""
     tok = _BUDGET_OVERRIDE.set(budget)
     try:
@@ -63,8 +106,11 @@ def budget_override(budget: SymbolicBudget | None):
 
 
 def current_budget_override() -> SymbolicBudget | None:
-    """The ambient `budget_override` budget, or None. For builders that construct a `Program` with an
-    EXPLICIT budget (e.g. chartlib's SymbolicInterpreter) and want to honor the override themselves."""
+    """Return the ambient :func:`budget_override` budget, or ``None``.
+
+    For builders that construct a :class:`Program` with an explicit budget and want to honour
+    the override themselves.
+    """
     return _BUDGET_OVERRIDE.get()
 
 
@@ -103,7 +149,7 @@ class SymbolEnv:
     """Global identity table for symbolic generators.
 
     Allocates fresh generator names with attached :class:`Provenance`
-    metadata.  Two ``RationalFunction``s with the same generator name
+    metadata.  Two rational functions with the same generator name
     refer to the same algebraic object regardless of which ring they
     were originally constructed in — :class:`SymbolEnv` is what
     enforces that invariant.
@@ -154,7 +200,7 @@ class SymbolEnv:
         """Return all generator names ever issued, in insertion order."""
         return tuple(self._provenance.keys())
 
-    def __contains__(self, name: object) -> bool:
+    def __contains__(self, name: str) -> bool:
         return isinstance(name, str) and name in self._provenance
 
     def __len__(self) -> int:
@@ -332,11 +378,10 @@ class SymbolicBudget:
 
     @classmethod
     def legacy(cls) -> SymbolicBudget:
-        """The pre-Plan-B symbolic path (identical to ``SymbolicBudget()``).
+        """Return the fully-deferring budget, identical to a bare ``SymbolicBudget()``.
 
-        Named so callers can *select* the legacy path explicitly and on the
-        record, rather than relying on the bare default.  Every deferral gate
-        defers, exactly as before Plan B step 4.
+        Named so a caller can select it explicitly and on the record rather than relying on
+        the default. Every deferral gate defers.
         """
         return cls()
 
@@ -346,7 +391,7 @@ class SymbolicBudget:
         *,
         retain_covariant: bool = False,
         surface_frame: bool | None = None,
-        **overrides: Any,
+        **overrides: int | bool | None,
     ) -> SymbolicBudget:
         """Budget-zero: retain the parameterization (chart φ) built from vertices.
 
@@ -376,11 +421,11 @@ class SymbolicBudget:
         )
 
     @classmethod
-    def force_stmts(cls, **overrides: Any) -> SymbolicBudget:
-        """The "no symbolic budget" preset: drive every modeled op to a Stmt.
+    def force_stmts(cls, **overrides: int | bool | None) -> SymbolicBudget:
+        """Return the no-symbolic-budget preset, driving every modeled op to a statement.
 
-        The opposite of :meth:`build_big_symbols`: rather than retaining
-        closed-form rational structure, this forces every modeled op to
+        The opposite of :meth:`build_big_symbols`: rather than retaining closed-form rational
+        structure, this forces every modeled op to
         emit an imperative :class:`Stmt` (no closed-form rational lane), so
         Grassman's symbolic inputs flow through as deferred Stmts that are
         simplified afterward (the build-then-simplify novelty).
@@ -519,6 +564,7 @@ class SymArrayRef:
 
     @property
     def cells(self) -> np.ndarray:
+        """Return the underlying cell array."""
         return self._cells
 
     def __repr__(self) -> str:
@@ -587,7 +633,7 @@ class DimAtom:
 
 
 def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool:
-    """True iff any entry of ``shape`` is a :class:`DimAtom` (a runtime dim).
+    """Report whether any entry of ``shape`` is a :class:`DimAtom`, i.e. a runtime dimension.
 
     The single gate that routes a shape away from the static per-cell
     build-time path (cell-atom allocation, ``np.ndindex``, cell-size math)
@@ -692,7 +738,7 @@ class SymArray:
 
     def __init__(
         self,
-        cells: Any,
+        cells: np.ndarray | Sequence[Cell] | Cell,
         program: Program | None = None,
         name: str | None = None,
     ) -> None:
@@ -725,7 +771,7 @@ class SymArray:
     # ------------------------------------------------------------------
 
     @property
-    def cells(self) -> Any:
+    def cells(self) -> np.ndarray:
         """Per-cell ndarray; auto-unpacks a bulk array to atom RFs.
 
         For a bulk array this materialises (one ``unpack`` Stmt, memoised)
@@ -737,7 +783,7 @@ class SymArray:
             return unpack(self)._cells
         return self._cells
 
-    def __array__(self, dtype: Any = None) -> np.ndarray:
+    def __array__(self, dtype: np.dtype | None = None) -> np.ndarray:
         if dtype is None:
             return self.cells
         return self.cells.astype(dtype)
@@ -747,28 +793,34 @@ class SymArray:
         # A dynamic bulk array (an axis sized by a runtime ``DimAtom``) has a
         # 0-d placeholder ``_cells``; its build-time shape is the symbolic
         # ``_bulk.shape`` (may carry ``DimAtom`` entries — see B6).
+        """Return the array's shape, with a ``DimAtom`` for any runtime-sized axis."""
         if self._bulk is not None and is_dynamic(self._bulk.shape):
             return self._bulk.shape
         return self._cells.shape
 
     @property
     def dtype(self) -> np.dtype:
+        """Return the cell array's dtype."""
         return self._cells.dtype
 
     @property
     def ndim(self) -> int:
+        """Return the number of axes."""
         return self._cells.ndim
 
     @property
-    def flat(self) -> Any:
+    def flat(self) -> np.flatiter:
+        """Iterate the cells in row-major order."""
         return self.cells.flat
 
     @property
     def is_numeric(self) -> bool:
+        """Report whether this array is purely numeric — float cells, no deferred bulk."""
         return self._bulk is None and self._cells.dtype.kind == "f"
 
     @property
     def is_scalar(self) -> bool:
+        """Report whether this array is a scalar, i.e. has no axes."""
         return self._cells.shape == ()
 
     def __len__(self) -> int:
@@ -776,13 +828,13 @@ class SymArray:
             raise TypeError("len() of 0-d SymArray")
         return self._cells.shape[0]
 
-    def __getitem__(self, idx: Any) -> Any:
+    def __getitem__(self, idx: Index) -> SymArray:
         out = self.cells[idx]
         if isinstance(out, np.ndarray):
             return SymArray(out, program=self.program)
         return out
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[SymArray]:
         for c in self.cells:
             if isinstance(c, np.ndarray):
                 yield SymArray(c, program=self.program)
@@ -800,7 +852,8 @@ class SymArray:
     # one owning Program.
     # ------------------------------------------------------------------
 
-    def _elementwise(self, other: Any, op: Any) -> SymArray:
+    def _elementwise(self, other: SymArray | npt.ArrayLike,
+                     op: Callable[[np.ndarray, np.ndarray], np.ndarray]) -> SymArray:
         a = self.cells
         if isinstance(other, SymArray):
             b = other.cells
@@ -822,16 +875,16 @@ class SymArray:
         a = self.cells
         return SymArray(-a if a.dtype.kind == "f" else -_ensure_object(a), program=self.program)
 
-    def __add__(self, other: Any) -> SymArray:
+    def __add__(self, other: SymArray | npt.ArrayLike) -> SymArray:
         return self._elementwise(other, lambda x, y: x + y)
 
-    def __radd__(self, other: Any) -> SymArray:
+    def __radd__(self, other: SymArray | npt.ArrayLike) -> SymArray:
         return self._elementwise(other, lambda x, y: y + x)
 
-    def __sub__(self, other: Any) -> SymArray:
+    def __sub__(self, other: SymArray | npt.ArrayLike) -> SymArray:
         return self._elementwise(other, lambda x, y: x - y)
 
-    def __rsub__(self, other: Any) -> SymArray:
+    def __rsub__(self, other: SymArray | npt.ArrayLike) -> SymArray:
         return self._elementwise(other, lambda x, y: y - x)
 
     def __repr__(self) -> str:
@@ -1000,11 +1053,12 @@ class SymArray:
         return SymArray(result, program=self.program)
 
     def einsum(self, subscripts: str, *others: SymArray | np.ndarray) -> SymArray:
-        """``np.einsum(subscripts, self, *others)`` on the cells, threading the program — a general
-        axis-specified contraction (the DOF-axis recombinations pointwise's sampler needs, e.g.
-        ``"mi...,ip->mp..."``). Numeric short-circuit when every operand is a float array; object
-        cell-arithmetic (``RationalFunction`` ``*``/``+``) otherwise. One program, two lanes (as
-        :meth:`matmul`). The bound program is ``self``'s; any ``SymArray`` operand must share it (or be
+        """Contract cells with ``np.einsum(subscripts, self, *others)``, threading the program.
+
+        A general axis-specified contraction, as in ``"mi...,ip->mp..."``. Numeric operands
+        short-circuit to a float einsum; otherwise the cells contract through
+        :class:`RationalFunction` arithmetic. One program, two lanes, as in :meth:`matmul`.
+        The bound program is ``self``'s; any ``SymArray`` operand must share it (or be
         program-less / numeric).
 
         **Bulk in, bulk out** (as :meth:`reshape`): a contraction wants no per-cell VALUES, only the
@@ -1015,7 +1069,8 @@ class SymArray:
         :class:`EinsumStmtOp` :class:`Stmt` and keeps the chain deferred. Mathematically the same
         contraction; it is simply not densified into the symbolic ring on the way. A bulk array is by
         construction a Stmt output (opaque atoms), so this never intercepts the numeric lane, and a
-        non-bulk operand set takes exactly the code below."""
+        non-bulk operand set takes exactly the code below.
+        """
         prog = self.program
         operands: list[SymArray | np.ndarray] = [self]
         for o in others:
@@ -1158,7 +1213,8 @@ class SymArray:
         """Element-wise sign; 0-d only in slice B."""
         return self._scalar_op(SignOp(), "sign", float_fn=np.sign)
 
-    def _scalar_op(self, stmt_fn, name: str, *, float_fn) -> SymArray:
+    def _scalar_op(self, stmt_fn: StmtFn, name: str, *,
+                   float_fn: Callable[[np.ndarray], np.ndarray]) -> SymArray:
         if self.cells.dtype.kind == "f":
             return SymArray(np.asarray(float_fn(self.cells)), program=self.program)
         if self.program is None:
@@ -1232,6 +1288,7 @@ class DetOp:
     """Typed ``np.linalg.det`` over a bound numeric matrix."""
 
     def __call__(self, A: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(np.linalg.det(np.asarray(A)))
 
 
@@ -1240,6 +1297,7 @@ class InvOp:
     """Typed ``np.linalg.inv`` over a bound numeric matrix."""
 
     def __call__(self, A: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.linalg.inv(np.asarray(A))
 
 
@@ -1248,6 +1306,7 @@ class PinvOp:
     """Typed ``np.linalg.pinv`` over a bound numeric matrix."""
 
     def __call__(self, A: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.linalg.pinv(np.asarray(A))
 
 
@@ -1256,6 +1315,7 @@ class SolveOp:
     """Typed ``np.linalg.solve`` over bound numeric ``A``, ``b``."""
 
     def __call__(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.linalg.solve(np.asarray(A), np.asarray(b))
 
 
@@ -1264,6 +1324,7 @@ class SqrtOp:
     """Typed element-wise ``np.sqrt`` over a bound numeric array."""
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.sqrt(np.asarray(x, dtype=float))
 
 
@@ -1272,6 +1333,7 @@ class AbsOp:
     """Typed element-wise ``np.abs`` over a bound numeric array."""
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.abs(np.asarray(x, dtype=float))
 
 
@@ -1280,6 +1342,7 @@ class SignOp:
     """Typed element-wise ``np.sign`` over a bound numeric array."""
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.sign(np.asarray(x, dtype=float))
 
 
@@ -1376,6 +1439,7 @@ class GSvdOp:
     def __call__(
         self, A: np.ndarray, M_V: np.ndarray, M_W: np.ndarray
     ) -> tuple[np.ndarray, ...]:
+        """Evaluate the op on concrete numeric operands."""
         A = np.asarray(A, dtype=float)
         Lw = np.linalg.cholesky(np.asarray(M_W, dtype=float))  # M_W = Lw Lwᵀ
         Rw = np.linalg.cholesky(np.asarray(M_V, dtype=float))  # M_V = Rw Rwᵀ
@@ -1424,6 +1488,7 @@ class TransposeOp:
     """
 
     def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(A).T
 
 
@@ -1441,6 +1506,7 @@ class SinvFullOp:
     ncols: int
 
     def __call__(self, S: np.ndarray, rank: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         r = int(rank)
         out = np.zeros((self.nrows, self.ncols))
         s = np.asarray(S, dtype=float)
@@ -1465,6 +1531,7 @@ class GSvdFullOp:
     def __call__(
         self, A: np.ndarray, M_V: np.ndarray, M_W: np.ndarray
     ) -> tuple[np.ndarray, ...]:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         U, UI, V, VI, S, rank = GSvdOp(rcond=self.rcond)(A, M_V, M_W)
         Ufull = np.concatenate([np.asarray(U), np.asarray(UI)], axis=1)
         Vfull = np.concatenate([np.asarray(V), np.asarray(VI)], axis=1)
@@ -1476,6 +1543,7 @@ class BlockDiagOp:
     """Block-diagonal assembly ``diag(A, B, …)`` of the bound operands."""
 
     def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         arrs = [np.asarray(m, dtype=float) for m in mats]
         rows = sum(a.shape[0] for a in arrs)
         cols = sum(a.shape[1] for a in arrs)
@@ -1495,6 +1563,7 @@ class BlockRepeatOp:
     n: int
 
     def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         a = np.asarray(A, dtype=float)
         out = np.zeros((self.n * a.shape[0], self.n * a.shape[1]))
         for i in range(self.n):
@@ -1504,10 +1573,10 @@ class BlockRepeatOp:
 
 @dataclass(frozen=True)
 class DynBlockRepeatOp:
-    """``n`` block-diagonal copies of ``A`` with a **runtime** count ``n`` —
-    ``kron(eye(int(n)), A)``."""
+    """Lay out ``n`` block-diagonal copies of ``A`` for a runtime count, as ``kron(eye(n), A)``."""
 
     def __call__(self, A: np.ndarray, n: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         a = np.asarray(A, dtype=float)
         count = int(np.asarray(n))
         out = np.zeros((count * a.shape[0], count * a.shape[1]))
@@ -1526,12 +1595,16 @@ class DynBlockRepeatOp:
 
 @dataclass(frozen=True)
 class DynEyeOp:
-    """A runtime identity sized by a reference array's axis (default the rank column at axis 1;
-    ``axis=k`` sizes ``np.eye`` off ``ref.shape[k]``)."""
+    """A runtime identity sized by a reference array's axis.
+
+    ``axis`` selects which axis of the reference sizes the identity; it defaults to the rank
+    column at axis 1.
+    """
 
     axis: int = 1
 
     def __call__(self, ref: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.eye(int(np.asarray(ref).shape[self.axis]))
 
 
@@ -1542,17 +1615,22 @@ class DynZerosOp:
     axes: tuple[int, ...]
 
     def __call__(self, *refs: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.zeros(tuple(int(np.asarray(refs[i]).shape[a]) for i, a in enumerate(self.axes)))
 
 
 @dataclass(frozen=True)
 class DynEyeTensorOp:
-    """``np.eye(∏dᵢ).reshape(∏dᵢ, d₀, d₁, …)`` — the vmap identity of a MULTI-axis DimVar binder
-    (a matrix/tensor seed ``ℝⁿ⊸ℝⁿ``); each ``dᵢ`` read from ``refs[i].shape[axes[i]]``."""
+    """The vmap identity of a multi-axis dimension binder, a matrix or tensor seed.
+
+    Emits ``np.eye(∏dᵢ).reshape(∏dᵢ, d₀, d₁, …)``, with each ``dᵢ`` read from
+    ``refs[i].shape[axes[i]]``.
+    """
 
     axes: tuple[int, ...]
 
     def __call__(self, *refs: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         dims = [int(np.asarray(refs[i]).shape[a]) for i, a in enumerate(self.axes)]
         prod = int(np.prod(dims)) if dims else 1
         return np.eye(prod).reshape(prod, *dims)
@@ -1566,6 +1644,7 @@ class ProdShapeOp:
     static: int = 1
 
     def __call__(self, *refs: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(int(self.static * int(np.prod(
             [int(np.asarray(refs[i]).shape[a]) for i, a in enumerate(self.axes)] or [1]))))
 
@@ -1578,6 +1657,7 @@ class SumShapeOp:
     static: int = 0
 
     def __call__(self, *refs: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(int(self.static + int(sum(
             int(np.asarray(refs[i]).shape[a]) for i, a in enumerate(self.axes)))))
 
@@ -1589,6 +1669,7 @@ class SumDimOp:
     axis: int = 0
 
     def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(sum(int(np.asarray(m).shape[self.axis]) for m in mats))
 
 
@@ -1599,6 +1680,7 @@ class ProdDimOp:
     axis: int = 0
 
     def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         out = 1
         for m in mats:
             out *= int(np.asarray(m).shape[self.axis])
@@ -1607,22 +1689,24 @@ class ProdDimOp:
 
 @dataclass(frozen=True)
 class ScaleAxisDimOp:
-    """``n · (mat's ``axis`` length)`` as a 0-d int — static count, runtime per-copy axis."""
+    """Return ``n`` times the length of ``mat``'s axis, as a 0-d int."""
 
     n: int
     axis: int = 0
 
     def __call__(self, mat: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(self.n * int(np.asarray(mat).shape[self.axis]))
 
 
 @dataclass(frozen=True)
 class MulAxisDimOp:
-    """``count · (mat's ``axis`` length)`` as a 0-d int — runtime count, runtime axis."""
+    """Return the runtime ``count`` times the length of ``mat``'s axis, as a 0-d int."""
 
     axis: int = 0
 
     def __call__(self, n: np.ndarray, mat: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(int(np.asarray(n)) * int(np.asarray(mat).shape[self.axis]))
 
 
@@ -1633,6 +1717,7 @@ class CompRankOp:
     ambient: int
 
     def __call__(self, rank: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(self.ambient - int(rank))
 
 
@@ -1641,6 +1726,7 @@ class HStackOp:
     """Horizontally stack matrices (columns side by side) — ``[A | B | …]``."""
 
     def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.hstack([np.asarray(m, dtype=float) for m in mats])
 
 
@@ -1649,6 +1735,7 @@ class ColStackOp:
     """Stack 1-D coordinate vectors as the columns of a matrix (the ``ListBasis`` matrix)."""
 
     def __call__(self, *cols: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.stack([np.asarray(c, dtype=float).reshape(-1) for c in cols], axis=1)
 
 
@@ -1659,6 +1746,7 @@ class ScaleOp:
     factor: float
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return self.factor * np.asarray(x, dtype=float)
 
 
@@ -1667,6 +1755,7 @@ class ScaleByOp:
     """``s · x`` — runtime-scalar multiply (the ``ScaleOp`` sibling)."""
 
     def __call__(self, x: np.ndarray, s: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(s, dtype=float) * np.asarray(x, dtype=float)
 
 
@@ -1677,6 +1766,7 @@ class AddOp:
     n: int
 
     def __call__(self, *xs: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         out = np.asarray(xs[0], dtype=float).copy()
         for x in xs[1:]:
             out = out + np.asarray(x, dtype=float)
@@ -1688,6 +1778,7 @@ class ConcatOp:
     """Flatten each operand then concatenate on axis 0."""
 
     def __call__(self, *xs: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.concatenate([np.asarray(x, dtype=float).reshape(-1) for x in xs])
 
 
@@ -1698,6 +1789,7 @@ class AxisLenOp:
     axis: int = 0
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(int(np.asarray(x).shape[self.axis]))
 
 
@@ -1708,6 +1800,7 @@ class ReshapeOp:
     shape: tuple[int, ...]
 
     def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(A, dtype=float).reshape(self.shape)
 
 
@@ -1721,6 +1814,7 @@ class ConstOp:
     dtype: str
 
     def __call__(self) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.frombuffer(self.data_bytes, dtype=self.dtype).reshape(self.shape).copy()
 
 
@@ -1731,6 +1825,7 @@ class EyeOp:
     n: int
 
     def __call__(self) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.eye(self.n)
 
 
@@ -1739,6 +1834,7 @@ class FirstColsOp:
     """``A[:, :int(rank)]`` — the leading (runtime-``rank``) columns."""
 
     def __call__(self, A: np.ndarray, rank: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(A)[:, : int(rank)]
 
 
@@ -1747,6 +1843,7 @@ class LastColsOp:
     """``A[:, int(rank):]`` — the complementary (trailing) columns."""
 
     def __call__(self, A: np.ndarray, rank: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(A)[:, int(rank):]
 
 
@@ -1767,6 +1864,7 @@ class ProjectOp:
     """
 
     def __call__(self, P: np.ndarray, v: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(P, dtype=float).T @ np.asarray(v, dtype=float).reshape(-1)
 
 
@@ -1781,6 +1879,7 @@ class EmbedOp:
     shape: tuple[int, ...] = ()
 
     def __call__(self, P: np.ndarray, vsub: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         out = np.asarray(P, dtype=float) @ np.asarray(vsub, dtype=float)
         return out.reshape(self.shape) if self.shape else out
 
@@ -1792,6 +1891,7 @@ class KronOp:
     n: int
 
     def __call__(self, *mats: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         out = np.asarray(mats[0], dtype=float)
         for m in mats[1:]:
             out = np.kron(out, np.asarray(m, dtype=float))
@@ -1811,6 +1911,7 @@ class KronFreeOp:
     ng_free: int
 
     def __call__(self, F: np.ndarray, G: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         F = np.asarray(F, dtype=float)
         G = np.asarray(G, dtype=float)
         df, cf, ff = F.shape[0], F.shape[1], F.shape[2:]
@@ -1825,6 +1926,7 @@ class InvTransposeOp:
     """``inv(A).T`` — the inverse-transpose (dual-basis change of coordinates)."""
 
     def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         return np.linalg.inv(np.asarray(A, dtype=float)).T
 
 
@@ -1833,15 +1935,19 @@ class ComposeViaStdOp:
     """``solve(R_to, R_from)`` — compose two changes-of-basis through the std rep."""
 
     def __call__(self, R_to: np.ndarray, R_from: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         return np.linalg.solve(np.asarray(R_to, dtype=float), np.asarray(R_from, dtype=float))
 
 
 @dataclass(frozen=True)
 class SqrtSpdOp:
-    """The symmetric-positive-definite operator square root ``S`` with ``S·S = G`` — via
-    eigendecomposition of the symmetrized matrix.  **Fails loudly** if ``G`` is not SPD."""
+    """The symmetric-positive-definite operator square root ``S``, with ``S·S = G``.
+
+    Computed by eigendecomposition of the symmetrized matrix. Raises if ``G`` is not SPD.
+    """
 
     def __call__(self, G: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         A = 0.5 * (np.asarray(G, dtype=float) + np.asarray(G, dtype=float).T)
         w, V = np.linalg.eigh(A)
         if w.min() <= 0:
@@ -1856,6 +1962,7 @@ class RankOp:
     tol: float = 1e-9
 
     def __call__(self, A: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         return np.asarray(int(np.linalg.matrix_rank(np.asarray(A, dtype=float), tol=self.tol)))
 
 
@@ -1864,6 +1971,7 @@ class MetricOrthonormalOp:
     """Orthonormalize columns w.r.t. a metric ``G``: ``A·L⁻ᵀ`` with ``LLᵀ = AᵀGA`` (Cholesky)."""
 
     def __call__(self, A: np.ndarray, G: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
         a = np.asarray(A, dtype=float)
         gram = a.T @ np.asarray(G, dtype=float) @ a
         L = np.linalg.cholesky(gram)
@@ -1877,7 +1985,7 @@ def _check(ok: bool, msg: str, detail: str = "") -> None:
 
 
 def _is_spd(A: np.ndarray) -> bool:
-    """True iff ``A`` is symmetric positive-definite (numerically)."""
+    """Report whether ``A`` is numerically symmetric positive-definite."""
     A = np.asarray(A, dtype=float)
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         return False
@@ -1891,7 +1999,7 @@ def _is_spd(A: np.ndarray) -> bool:
 
 
 def _full_rank(A: np.ndarray) -> bool:
-    """True iff ``A`` has full numerical rank (min of its two dims)."""
+    """Report whether ``A`` has full numerical rank, i.e. the smaller of its two dimensions."""
     A = np.asarray(A, dtype=float)
     if A.ndim != 2:
         return False
@@ -1976,7 +2084,8 @@ class TensordotOp:
     axes: Any = 2
 
     @classmethod
-    def from_axes(cls, axes: Any) -> TensordotOp:
+    def from_axes(cls, axes: int | Sequence[Sequence[int]]) -> TensordotOp:
+        """Build the op from ``np.tensordot``'s ``axes`` argument in any accepted form."""
         if isinstance(axes, (int, np.integer)):
             return cls(int(axes))
         a, b = axes
@@ -1987,6 +2096,7 @@ class TensordotOp:
         return cls(norm)
 
     def __call__(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.tensordot(np.asarray(a), np.asarray(b), axes=self.axes)
 
 
@@ -2003,8 +2113,9 @@ class MoveaxisOp:
     destination: Any
 
     @classmethod
-    def from_spec(cls, source: Any, destination: Any) -> MoveaxisOp:
-        def _norm(x: Any) -> Any:
+    def from_spec(cls, source: int | Sequence[int], destination: int | Sequence[int]) -> MoveaxisOp:
+        """Build the op from ``np.moveaxis``'s source and destination in any accepted form."""
+        def _norm(x: int | Sequence[int]) -> tuple[int, ...]:
             if isinstance(x, (int, np.integer)):
                 return int(x)
             return tuple(int(i) for i in x)
@@ -2012,6 +2123,7 @@ class MoveaxisOp:
         return cls(_norm(source), _norm(destination))
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         return np.moveaxis(np.asarray(x), self.source, self.destination)
 
 
@@ -2035,7 +2147,7 @@ class MoveaxisOp:
 # identity for the future ``fingerprint`` / partial-eval pass.
 
 
-def _invoke(fn: Callable[..., Any] | Program, args: Sequence[Any]) -> tuple:
+def _invoke(fn: StmtOp, args: Sequence[np.ndarray]) -> tuple[np.ndarray, ...]:
     """Run a callable / sub-:class:`Program` on ``args``; return a result tuple.
 
     A :class:`Program` is run with ``args`` mapped to its inputs by position;
@@ -2062,7 +2174,8 @@ class CallOp:
 
     fn: Callable[..., Any] | Program
 
-    def __call__(self, *operands: Any) -> Any:
+    def __call__(self, *operands: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Evaluate the op on concrete numeric operands."""
         outs = _invoke(self.fn, operands)
         return outs[0] if len(outs) == 1 else outs
 
@@ -2090,7 +2203,8 @@ class WhileOp:
     body: Callable[..., Any] | Program
     max_iters: int = 100_000
 
-    def __call__(self, *operands: Any) -> Any:
+    def __call__(self, *operands: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Evaluate the op on concrete numeric operands."""
         state: tuple = tuple(np.asarray(o) for o in operands)
         n = len(state)
         for _ in range(self.max_iters):
@@ -2189,8 +2303,7 @@ def runtime_einsum(
     out_shape: tuple,
     name: str = "einsum",
 ) -> np.ndarray | SymArray:
-    """Defer a symbolic ``einsum(spec, lhs, rhs)`` to a runtime
-    :class:`EinsumOp` Stmt.
+    """Defer a symbolic ``einsum(spec, lhs, rhs)`` to a runtime :class:`EinsumOp` statement.
 
     ``rhs`` must already be numeric.  Behaviour by ``lhs``:
 
@@ -2234,7 +2347,7 @@ def runtime_einsum(
     return np.asarray(intermediate.cells)
 
 
-def _cell_size(cell: Any) -> int:
+def _cell_size(cell: Cell) -> int:
     """Approximate symbolic-cost measure for a cell — total monomial count."""
     if not isinstance(cell, RationalFunction):
         return 0
@@ -2245,8 +2358,7 @@ def _cell_size(cell: Any) -> int:
 
 
 def cells_use_only_stmt_atoms(arr: np.ndarray, env: SymbolEnv) -> bool:
-    """True iff every symbolic cell of ``arr`` is built ONLY from
-    runtime (``stmt_out``) atoms.
+    """Report whether every symbolic cell of ``arr`` is built only from runtime atoms.
 
     Such cells are opaque at build time — their value exists only once
     the producing :class:`Stmt` runs — so deferring a computation over
@@ -2368,7 +2480,8 @@ class SwitchOp:
 
     n_branches: int
 
-    def __call__(self, *args: Any) -> np.ndarray:
+    def __call__(self, *args: np.ndarray) -> np.ndarray:
+        """Evaluate the op on concrete numeric operands."""
         if len(args) != 1 + self.n_branches:
             raise ValueError(
                 f"SwitchOp: expected 1 scrutinee + {self.n_branches} "
@@ -2387,26 +2500,20 @@ class SwitchOp:
 # The op union — polyarray's CLOSED ``Stmt.fn`` vocabulary
 # ---------------------------------------------------------------------------
 #
-# ``Stmt.fn`` itself is deliberately OPEN (``Callable | Program | None``): a front end
-# above polyarray may put its own op class, a ``vmap`` closure, or a plain callable
-# there, and a sub-:class:`Program` is not an op at all.  What IS closed is the set of
-# ops **polyarray owns** — the ~56 frozen dataclasses defined above.  :data:`StmtFn`
-# names that set so a pass over it can be written as an exhaustive ``match`` finished by
-# ``typing.assert_never``: an op added to the union but missing from a pass becomes a
-# *mypy error* instead of a silent capability gap.
+# ``Stmt.fn`` itself is deliberately OPEN (see :data:`StmtOp`): a front end above
+# polyarray may put its own op class, a ``vmap`` closure, or a plain callable there, and
+# a sub-:class:`Program` is not an op at all.  What IS closed is the set of ops
+# **polyarray owns** — the frozen dataclasses defined above.  :data:`StmtFn` names that
+# set so a pass over it can be written as an exhaustive ``match`` finished by
+# ``typing.assert_never``.
 #
-# This exists because omission-by-accident is polyarray's measured failure mode, not a
-# hypothetical one.  Three defects in one day, all "the op was simply not in the ladder":
-# ``KronOp``/``KronFreeOp`` missing from ``exact_fold._sym_apply`` froze the ``Λ²``
-# certificate at 0%; ``SwitchOp`` missing from ``exact_fold`` entirely froze every
-# ``select_x``; and a degree table keyed by class-NAME strings went stale across the
-# grassmann→polyarray op relocation (see ``degree.DEFAULT_DEGREE_KINDS``).  In every case
-# the op was opaque **by omission, never by decision**.
+# This is load-bearing: an op left out of a pass is opaque to it, which degrades
+# silently — a folded constant stays symbolic, a mask stays dense, a certificate stalls
+# at zero — rather than raising.  Naming the union makes the omission a mypy error.
 #
-# Rule for a new op (with `CLAUDE.md`'s "new ops are rare events"): add it to
-# :data:`StmtFn` here, then run mypy — it will name every pass that must now state a
-# decision.  A *deliberate* non-handling is fine, but it must be an explicit arm that
-# says why.
+# Rule for a new op: add it to :data:`StmtFn`, then run mypy — it will name every pass
+# that must now state a decision.  Deliberately not handling an op is fine, but it must
+# be an explicit arm that says why.
 StmtFn: TypeAlias = Union[
     # linalg / scalar deferrals
     DetOp, InvOp, PinvOp, SolveOp, SqrtOp, AbsOp, SignOp, SvdOp, GSvdOp, QrOp,
@@ -2428,19 +2535,34 @@ StmtFn: TypeAlias = Union[
 #: so the two can never drift.
 STMT_FN_OPS: tuple[type, ...] = get_args(StmtFn)
 
+#: Everything a :attr:`Stmt.fn` may hold: one of polyarray's own ops, a nested
+#: :class:`Program`, a front-end op or plain callable, or ``None`` for a statement that
+#: exists only to splice rational expressions.  Narrow it with :func:`is_builtin_op`.
+StmtOp: TypeAlias = Union[StmtFn, "Program", Callable[..., Any], None]
 
-def is_builtin_op(fn: object) -> TypeGuard[StmtFn]:
-    """Whether ``fn`` is one of polyarray's OWN ops (:data:`StmtFn`).
+
+def is_builtin_op(fn: StmtOp) -> TypeGuard[StmtFn]:
+    """Return whether ``fn`` is one of polyarray's own ops (:data:`StmtFn`).
 
     The narrowing gate in front of an exhaustive ``match``: everything else a
     ``Stmt.fn`` may hold — a sub-:class:`Program`, a ``vmap`` closure, a front-end op
     class, a plain callable, ``None`` — is genuinely open and must be handled *before*
     this check, not inside the match.
+
+    Parameters
+    ----------
+    fn
+        The value held by a statement's ``fn`` slot.
+
+    Returns
+    -------
+    bool
+        True when ``fn`` is a member of the closed :data:`StmtFn` union.
     """
     return isinstance(fn, STMT_FN_OPS)
 
 
-def _einsum_int_to_str(args: Sequence[Any]) -> tuple[str, list[np.ndarray]]:
+def _einsum_int_to_str(args: Sequence[np.ndarray | Sequence[int]]) -> tuple[str, list[np.ndarray]]:
     """Convert ``np.einsum`` integer-label form to ``(spec_string, operands)``.
 
     Mirror of ``np.einsum``'s signature: ``args`` is the alternating
@@ -2508,7 +2630,7 @@ def _einsum_parse_spec(spec: str) -> tuple[list[str], str | None]:
     return spec.split(","), None
 
 
-def _op_shape(o: Any) -> tuple[int, ...]:
+def _op_shape(o: SymArray | np.ndarray) -> tuple[int, ...]:
     """Operand shape without materialising a bulk SymArray (reads placeholder)."""
     if isinstance(o, SymArray):
         return tuple(o.shape)
@@ -2521,7 +2643,8 @@ def _einsum_label_dims(
     """Map each non-ellipsis label in the spec to the operand axis size it carries.
 
     Operands may be ``SymArray`` (including BULK ones): shapes are read through
-    :func:`_op_shape`, which answers from the placeholder and never materialises cells."""
+    :func:`_op_shape`, which answers from the placeholder and never materialises cells.
+    """
     label_dim: dict[str, int] = {}
     for part, arr in zip(input_parts, operands):
         shp = _op_shape(arr)
@@ -2618,7 +2741,7 @@ def _einsum_output_shape(
 
 
 def dispatch_einsum(
-    *args: Any,
+    *args: str | SymArray | np.ndarray,
     program: Program | None,
     name: str = "einsum",
     optimize: bool = True,
@@ -2850,7 +2973,7 @@ def freeze_array(
     return out
 
 
-def unpack(sa: Any, *, program: Program | None = None) -> Any:
+def unpack(sa: SymArray | np.ndarray, *, program: Program | None = None) -> SymArray:
     """Materialise a bulk :class:`SymArray` into per-cell atom RFs.
 
     A *bulk* SymArray (``_bulk`` set, produced by ``emit_stmt(bulk=True)``)
@@ -2886,7 +3009,7 @@ def unpack(sa: Any, *, program: Program | None = None) -> Any:
 # Cell-array helpers
 # ---------------------------------------------------------------------------
 
-def _to_cells(x: Any) -> np.ndarray:
+def _to_cells(x: SymArray | npt.ArrayLike) -> np.ndarray:
     """Coerce a SymArray / ndarray / RF / scalar to a cell ndarray."""
     if isinstance(x, SymArray):
         return x.cells
@@ -3112,6 +3235,7 @@ class Program:
     # Backward-compatible alias for callers that still want a bare ndarray.
     @property
     def input_cells(self) -> dict[str, np.ndarray]:
+        """Return each input's cell array, by input name."""
         return {k: sa.cells for k, sa in self.input_arrays.items()}
 
     def declare_int_atom(self, name: str, domain: range) -> IntAtom:
@@ -3135,7 +3259,7 @@ class Program:
         self.int_atoms[name] = atom
         return atom
 
-    def add_output(self, name: str, cells: Any) -> SymArray:
+    def add_output(self, name: str, cells: SymArray | np.ndarray) -> SymArray:
         """Register a named output and return the :class:`SymArray`."""
         if name in self.outputs:
             raise ValueError(f"output {name!r} already declared on {self.name!r}")
@@ -3173,7 +3297,8 @@ class Program:
         own input atoms relabeled onto ``self``, so ``self`` resolves their leaf generators (``V_0_0``…) by
         name when it lowers — a generator ``self`` cannot produce surfaces downstream as an unbound generator.
         A program-less ``foreign`` (numeric, or already inline on ``self``) needs no Stmts and is a plain
-        relabel. Idempotent on ``self``'s own arrays (``foreign.program is self`` ⇒ returned unchanged)."""
+        relabel. Idempotent on ``self``'s own arrays (``foreign.program is self`` ⇒ returned unchanged).
+        """
         src = foreign.program
         if src is self:
             return foreign
@@ -3203,7 +3328,7 @@ class Program:
 
     def emit_stmt(
         self,
-        fn: Callable[..., Any] | Program,
+        fn: StmtOp,
         in_refs: Sequence[Ref | SymArray],
         out_specs: Sequence[OutSpec],
         note: str = "",
@@ -3338,7 +3463,7 @@ class Program:
     # Execution
     # ------------------------------------------------------------------
 
-    def run(self, values: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    def run(self, values: Mapping[str, npt.ArrayLike]) -> dict[str, np.ndarray]:
         """Evaluate the program against numeric ``values``.
 
         ``values`` is keyed by input *name*; each entry is a numeric
@@ -3353,7 +3478,7 @@ class Program:
         return out
 
     def build_runtime_bindings(
-        self, values: Mapping[str, Any], *, only: Iterable[int] | None = None,
+        self, values: Mapping[str, npt.ArrayLike], *, only: Iterable[int] | None = None,
     ) -> dict[str, float]:
         """Run statements and return the full per-atom bindings dict.
 
@@ -3382,7 +3507,7 @@ class Program:
         # whole-program `_has_dynamic_shape` memo (a partial program would cache a stale
         # answer that the later full run then trusts) — and a cone can carry a dynamic
         # (DimAtom-sized) output regardless.
-        dim_bindings: dict[tuple[Any, ...], int] | None = (
+        dim_bindings: dict[DimSource, int] | None = (
             {} if (only is not None or self._has_dynamic_shape()) else None
         )
         # Stage C: before walking statements, bind each dynamic INPUT.  Read
@@ -3425,11 +3550,10 @@ class Program:
         return bindings
 
     def _has_dynamic_shape(self) -> bool:
-        """True iff any Stmt output is a dynamic (``DimAtom``-sized) bulk array.
+        """Report whether any statement output is a dynamic, ``DimAtom``-sized bulk array.
 
-        Such a program needs the run-time dim-binding table (B4); a purely
-        static program does not, and skipping the table keeps its execution
-        path byte-identical to the pre-dynamic-shapes behavior (B5).
+        Such a program needs the run-time dimension-binding table; a purely static program
+        does not, and skipping the table keeps its execution path free of that cost.
 
         Memoized: ``run`` (hence this) is called once per slice / sub-Program
         recursion, so the O(#stmts) scan must not repeat per call. Statements
@@ -3449,7 +3573,7 @@ class Program:
 
     # -- helpers --------------------------------------------------------
 
-    def _bindings_from_values(self, values: Mapping[str, Any]) -> dict[str, float]:
+    def _bindings_from_values(self, values: Mapping[str, npt.ArrayLike]) -> dict[str, float]:
         """Flatten input values into a generator-name → float dict.
 
         Each *declared* input is validated against its shape and bound
@@ -3520,7 +3644,7 @@ class Program:
         stmt_idx: int,
         stmt: Stmt,
         bindings: dict[str, float],
-        dim_bindings: dict[tuple[Any, ...], int] | None = None,
+        dim_bindings: dict[DimSource, int] | None = None,
     ) -> None:
         """Resolve refs, call fn, scatter returns into ``bindings``.
 
@@ -3558,7 +3682,7 @@ class Program:
         ref: Ref,
         stmt_idx: int,
         bindings: dict[str, float],
-    ) -> Any:
+    ) -> np.ndarray:
         if isinstance(ref, InputRef):
             cells = self.input_arrays[ref.name].cells
             if ref.indices:
@@ -3610,9 +3734,9 @@ class Program:
     def _bind_output(
         self,
         bound: SymArray,
-        value: Any,
+        value: np.ndarray,
         bindings: dict[str, float],
-        dim_bindings: dict[tuple[Any, ...], int] | None = None,
+        dim_bindings: dict[DimSource, int] | None = None,
     ) -> None:
         """Bind a Stmt output: whole-tensor for bulk, per-cell atoms otherwise.
 
@@ -3720,9 +3844,12 @@ _PROBE_DIRECT_EVAL = False
 
 
 @contextlib.contextmanager
-def probe_direct_eval():
-    """Scope in which the program runner uses no-``compile`` RF evaluation — for FEW-run
-    probes (the structural-mask). See :data:`_PROBE_DIRECT_EVAL`."""
+def probe_direct_eval() -> Iterator[None]:
+    """Make the program runner evaluate cells directly, without per-cell codegen.
+
+    For probes run only a handful of times, where compiling an evaluator costs more than it
+    saves. See :data:`_PROBE_DIRECT_EVAL`.
+    """
     global _PROBE_DIRECT_EVAL
     prev = _PROBE_DIRECT_EVAL
     _PROBE_DIRECT_EVAL = True
@@ -3807,7 +3934,7 @@ def vmap(
         raise ValueError("vmap: at least one input must be batched (axis ≠ None)")
     out_names = tuple(body.outputs.keys())
 
-    def fn(*args: np.ndarray) -> Any:
+    def fn(*args: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
         if len(args) != n_in:
             raise ValueError(
                 f"vmap({body.name}): expected {n_in} args; got {len(args)}"
@@ -3933,7 +4060,7 @@ def _rebuild_rf(rf: RationalFunction, mapping: Mapping[str, Cell]) -> Cell:
     return _safe_div(num_val, den_val)
 
 
-def _rebuild_poly(poly: Any, mapping: Mapping[str, Any]) -> Any:
+def _rebuild_poly(poly: Poly, mapping: Mapping[str, str]) -> Poly:
     """Reconstruct a sympy poly under a generator-name substitution."""
     from .rational import _ring_names
 
