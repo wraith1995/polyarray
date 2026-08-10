@@ -885,6 +885,10 @@ class _Lowerer:
         self.opts = opts
         self.input_exprs = dict(input_exprs)
         self.intatom_exprs = dict(intatom_exprs)
+        # The output SymArray tuple of the op currently being rendered — set at the top of
+        # `_render_op` so `try_small_qr` (and op-carried hooks that call it) can read the QR result shape
+        # without threading `out` through the hook signature.
+        self._current_out: tuple[SymArray, ...] = ()
         # Body statements accumulate here; sub-program / vmap helper defs
         # accumulate in ``self.defs`` (shared across nested lowerers).
         self.b = _builder_mod().StmtBuilder(
@@ -1045,6 +1049,7 @@ class _Lowerer:
         in_refs: Sequence[Ref] = ()
     ) -> tuple[str, PyExprs | list[PyExprs]]:
         c = self.core
+        self._current_out = out          # so try_small_qr / hooks can read this op's output shape
         # Front-end ops first (keyed by class name), then the builtin vocabulary.
         renderer = self.extra.get(type(fn).__name__)
         if renderer is not None:
@@ -1333,19 +1338,32 @@ class _Lowerer:
 
     # -- QR (small-Householder interception) ------------------------------
 
-    def _qr(self, fn: QrOp, args: list[PyExprs], out: tuple[SymArray, ...]) -> tuple[str, PyExprs]:
+    def try_small_qr(self, a_expr: PyExprs, mode: str = "reduced") -> tuple[PyExprs, PyExprs] | None:
+        """Inline unrolled Householder QR (arith/``where``/``stack`` only — NO ``linalg.qr`` call, so it
+        neither graph-breaks ``torch.compile`` nor calls LAPACK) of the CURRENTLY-rendered op's operand,
+        or ``None`` to fall back to a ``linalg.qr`` call.
+
+        Shared by :meth:`_qr` (``QrOp``) and op-carried ``__pyab_lower__`` hooks (chartlib's
+        ``QrSignFixOp``) so BOTH avoid the QR graph break. The operand shape is read off the current
+        output tuple (``self._current_out``); intercept iff it is statically small (``max(m, n) <=
+        small_qr.max_dim``, ``m >= n``) and small-QR is enabled."""
         sq = self.opts.small_qr
-        m, n = _static_matrix_shape(out)
+        m, n = _static_matrix_shape(self._current_out)
         if (
             sq.enabled
             and m is not None
             and n is not None
             and m >= n
             and max(m, n) <= sq.max_dim
-            and fn.mode in ("reduced", "complete")
+            and mode in ("reduced", "complete")
         ):
-            q_expr, r_expr = _emit_householder_qr(self, args[0], m, n, fn.mode)
-            return ("exprs", [q_expr, r_expr])
+            return _emit_householder_qr(self, a_expr, m, n, mode)
+        return None
+
+    def _qr(self, fn: QrOp, args: list[PyExprs], out: tuple[SymArray, ...]) -> tuple[str, PyExprs]:
+        inline = self.try_small_qr(args[0], fn.mode)
+        if inline is not None:
+            return ("exprs", [inline[0], inline[1]])
         kwargs = (self.core.KwArg(name="mode", value=self.core.StringLit(value=fn.mode)),)
         return ("tuple", self._ns_call("linalg.qr", args, kwargs))
 
