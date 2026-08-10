@@ -1,11 +1,9 @@
-"""EXACT (non-sampling) statement/entry folding for ``partial_eval_numeric``.
+"""Exact, non-sampling statement and entry folding for ``partial_eval_numeric``.
 
-``simplify._partial_eval_numeric`` historically certified "this output does not depend
-on the symbolic inputs" by PROBE-AND-FREEZE polynomial identity testing — random probe
-bindings + ``np.allclose`` — documented as probabilistic, NOT exact-by-construction.
-Since the ``P(T)=I`` affine-invariance certificate started riding on that fold
-(pointwise ``pti.affine_invariance``), a sound lane is required: this module is the
-EXACT lane behind ``mode="exact"`` / ``mode="hybrid"``.
+This is the sound lane behind ``mode="exact"`` / ``mode="hybrid"``. The alternative,
+probe-and-freeze polynomial identity testing — random probe bindings plus
+``np.allclose`` — is probabilistic, not exact by construction, and so cannot carry a
+certificate that a downstream invariance claim rides on.
 
 **Semantics.** The program's dependency graph is re-executed over EXACT values:
 
@@ -55,8 +53,9 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping, assert_never
+from typing import Any, assert_never
 
 import numpy as np
 
@@ -116,8 +115,10 @@ from .ir import (
     SolveOp,
     SqrtOp,
     SqrtSpdOp,
+    Ref,
     Stmt,
     StmtFn,
+    StmtOp,
     SumDimOp,
     SumShapeOp,
     SvdOp,
@@ -131,9 +132,25 @@ from .ir import (
 )
 from .rational import RationalFunction
 
-# Sentinel: a value the exact lane cannot resolve (opaque op / unresolved atom /
-# dynamic shape / timeout).  Never a valid array value.
-_OPAQUE = object()
+#: One exact cell: a Python float, or a rational function over the surviving feed atoms.
+type ExactCell = float | RationalFunction
+
+#: One exact operand: an array of :data:`ExactCell`, a bare cell, or the
+#: :data:`_OPAQUE` sentinel when the value could not be resolved exactly.
+type ExactValue = np.ndarray | ExactCell | _Opaque
+
+
+# Sentinel: a value the exact lane cannot resolve — an opaque op, an unresolved atom, a
+# dynamic shape, a timeout.  Never a valid array value.
+class _Opaque:
+    """Sentinel type for a value this lane could not resolve exactly."""
+
+    __slots__ = ()
+
+
+#: The single :class:`_Opaque` instance. A value equal to it, and everything downstream
+#: of it, is *unresolved* — never guessed.
+_OPAQUE = _Opaque()
 
 # Recursion ceiling for sub-Program descent (mirrors simplify._MAX_DESCENT_DEPTH).
 _MAX_DEPTH = 32
@@ -218,9 +235,18 @@ _WALL_BACKSTOP_SECONDS = 900.0
 
 
 def _wall_deadline(wall_backstop: float | None) -> float | None:
-    """The monotonic instant the backstop fires, or ``None`` when there is none.
+    """Return the monotonic instant the wall-clock backstop fires.
 
-    ``wall_backstop=None`` ⇒ the module default; ``math.inf`` ⇒ no backstop at all.
+    Parameters
+    ----------
+    wall_backstop
+        Seconds to allow. ``None`` takes the module default; ``math.inf`` disables the
+        backstop entirely.
+
+    Returns
+    -------
+    float or None
+        The deadline, or ``None`` when there is no backstop.
     """
     seconds = _WALL_BACKSTOP_SECONDS if wall_backstop is None else float(wall_backstop)
     return None if math.isinf(seconds) else time.monotonic() + seconds
@@ -278,11 +304,12 @@ class _Meter:
 
 
 def _exhausted_note(exc: _Exhausted, meter: _Meter) -> str:
-    """The ``unresolved`` reason for a budget exit — and the two exits read differently.
+    """Phrase the ``unresolved`` reason for a budget exit.
 
-    The ordinary one names the budget and what was spent, so the fix ("raise it") is legible
-    from the warning alone.  The backstop one SHOUTS, because it means the result depends on
-    the machine again and the cost model needs fixing, not the budget.
+    The two exits read differently on purpose. The ordinary one names the budget and what
+    was spent, so that raising it is the legible fix. The wall-clock one is emphatic,
+    because it means the result has become machine-dependent and the cost model, not the
+    budget, is what needs fixing.
     """
     if exc.wall:
         return (f"WALL-CLOCK BACKSTOP fired after {meter.spent} work units — this result is "
@@ -291,11 +318,11 @@ def _exhausted_note(exc: _Exhausted, meter: _Meter) -> str:
 
 
 def _resolve_work_budget(work_budget: int | None) -> int:
-    """The work budget for this pass: explicit argument, else the env knob, else the default.
+    """Resolve the work budget: explicit argument, else the environment knob, else the default.
 
-    The env knob is what makes the budget KEYABLE by pointwise's verdict cache — a certificate
-    produced under a different budget must not be served for this one (see
-    ``table_cache._VERDICT_ENV_KNOBS``).
+    Exposing the budget as an environment knob is load-bearing for consumers that cache
+    verdicts: it makes the budget part of the cache key, so a certificate produced under a
+    different budget is never served for this one.
     """
     if work_budget is not None:
         return int(work_budget)
@@ -309,12 +336,13 @@ def _resolve_work_budget(work_budget: int | None) -> int:
 
 
 class _Reason:
-    """Deepest-first record of WHY the current statement went opaque (for the
-    hybrid-mode warning): the first op that could not be executed symbolically
-    wins — e.g. the QR / front-end sign-fix inside a ``grass_dof`` sub-program,
-    not the outer ``Program`` wrapper.  One instance is created PER
-    :func:`exact_partial_eval` call and threaded explicitly (no module global —
-    thread-safe, and an escaping exception cannot leak a stale note).
+    """Deepest-first record of why the current statement went opaque.
+
+    The first op that could not be executed symbolically wins, so the note names the
+    innermost cause — an op inside a nested sub-program rather than the outer program
+    wrapper. One instance per :func:`exact_partial_eval` call, threaded explicitly rather
+    than held in a module global, so it is thread-safe and an escaping exception cannot
+    leak a stale note.
     """
 
     __slots__ = ("value",)
@@ -369,8 +397,8 @@ class ExactState:
 # Value helpers
 # ---------------------------------------------------------------------------
 
-def _as_numeric(val: Any) -> np.ndarray | None:
-    """``val`` as a float ndarray when it carries no symbolic cell, else ``None``."""
+def _as_numeric(val: ExactValue) -> np.ndarray | None:
+    """Return ``val`` as a float ndarray when it carries no symbolic cell, else ``None``."""
     arr = np.asarray(val)
     if arr.dtype.kind in "fiub":
         return arr.astype(float)
@@ -384,11 +412,16 @@ def _as_numeric(val: Any) -> np.ndarray | None:
 
 
 def _exact_eval_at(rf: RationalFunction, k: int) -> RationalFunction:
-    """``rf`` EXACTLY evaluated at deterministic generic point #``k`` (distinct per
-    generator; no RNG): every generator is composed with an exact DYADIC rational
-    constant (``0.5 + 0.25·m`` — float→fmpq conversion is exact), so the result is
-    an exact constant :class:`RationalFunction`, with no float rounding anywhere.
-    Raises when the point is singular (denominator vanishes there).
+    """Evaluate ``rf`` exactly at deterministic generic point ``k``.
+
+    Every generator is composed with a distinct dyadic rational constant, whose float to
+    ``fmpq`` conversion is exact, so the result is an exact constant
+    :class:`RationalFunction` with no float rounding anywhere. No RNG is involved.
+
+    Raises
+    ------
+    ZeroDivisionError
+        If the point is singular, i.e. the denominator vanishes there.
     """
     sub = {g: RationalFunction.constant(0.5 + 0.25 * ((7 * i + 3 * k + 1) % 11))
            for i, g in enumerate(sorted(rf.gens))}
@@ -400,10 +433,11 @@ def _rf_mass(rf: RationalFunction) -> int:
     return int(rf.num.n_terms()) + int(rf.den.n_terms())
 
 
-def _sym_mass(values: Any, cap: int) -> int:
-    """Total monomial mass of ``values`` (an operand / list of operands), counted
-    EARLY-EXIT: accumulation stops as soon as ``cap`` is exceeded, so an enormous
-    operand costs O(cap) to reject rather than O(size) to measure.
+def _sym_mass(values: ExactValue | list[ExactValue], cap: int) -> int:
+    """Measure the total monomial mass of one operand or a list of them.
+
+    Accumulation stops as soon as ``cap`` is exceeded, so an enormous operand costs
+    ``O(cap)`` to reject rather than ``O(size)`` to measure exactly.
     """
     total = 0
     stack = list(values) if isinstance(values, list) else [values]
@@ -438,15 +472,14 @@ def _charge(meter: _Meter | None, units: int) -> None:
 
 
 def _constant_value(rf: RationalFunction, meter: _Meter | None = None) -> float | None:
-    """The exact float value of ``rf`` when it is IDENTICALLY constant, else ``None``.
+    """Return the exact float value of ``rf`` when it is identically constant, else ``None``.
 
-    Constancy is decided by the exact rational normal form: gcd-cancel (flint exact
-    division) then total-degree-zero of numerator and denominator.  A sound EXACT
-    filter avoids paying the gcd on varying cells: ``rf`` is evaluated at two
-    deterministic points in EXACT fmpq arithmetic (:func:`_exact_eval_at` — never
-    float term-summation, whose rounding would falsely refute a constant like
-    ``(1/3)·p/p``); two exactly-different values prove non-constancy, while equal
-    values are only a hint — the ``clean`` normal form still decides.
+    Constancy is decided by the exact rational normal form: gcd-cancel by exact division,
+    then total degree zero of numerator and denominator. A sound exact filter avoids paying
+    the gcd on varying cells: ``rf`` is evaluated at two deterministic points in exact
+    rational arithmetic, never by float term summation, whose rounding would falsely refute
+    a constant such as ``(1/3)·p/p``. Two exactly different values prove non-constancy;
+    equal values are only a hint, and the normal form still decides.
 
     BUDGET-AWARE: every expensive step (each exact evaluation, the gcd) is CHARGED to the
     meter, which raises :class:`_Exhausted` when the budget is gone — a pathological cell (an
@@ -482,10 +515,13 @@ def _constant_value(rf: RationalFunction, meter: _Meter | None = None) -> float 
     return None
 
 
-def _cell_constant(cell: Any, meter: _Meter | None = None) -> float | None:
-    """Exact constant value of one cell (float / RF), else ``None``.
+def _cell_constant(cell: ExactCell, meter: _Meter | None = None) -> float | None:
+    """Return the exact constant value of one cell, or ``None`` if it is not constant.
 
-    Raises :class:`_Exhausted` (via :func:`_constant_value`) when the budget is gone.
+    Raises
+    ------
+    _Exhausted
+        Via :func:`_constant_value`, when the work budget is gone.
     """
     if isinstance(cell, (int, float, np.integer, np.floating)):
         return float(cell)
@@ -502,22 +538,22 @@ def _cell_constant(cell: Any, meter: _Meter | None = None) -> float | None:
 class _Env:
     """Per-program symbolic environment: exact values for atoms / bulks / stmt outs."""
 
-    atom: dict[str, Any] = field(default_factory=dict)      # name -> float | RF
-    bulk: dict[str, Any] = field(default_factory=dict)      # bulk name -> ndarray
-    outs: dict[tuple[int, int], Any] = field(default_factory=dict)
+    atom: dict[str, ExactCell] = field(default_factory=dict)
+    bulk: dict[str, np.ndarray] = field(default_factory=dict)
+    outs: dict[tuple[int, int], ExactValue] = field(default_factory=dict)
 
 
 def _resolve_rf(
     rf: RationalFunction, env: _Env, program: Program, max_sym_mass: int | None = None,
-) -> Any:
-    """``rf`` with every resolvable stmt-out atom substituted by its exact value.
+) -> ExactCell | _Opaque:
+    """Substitute every resolvable statement-out atom in ``rf`` by its exact value.
 
-    Feed atoms (vertex / point / coeff provenance) stay symbolic generators; a
-    stmt-out atom without an exact value makes the whole cell unresolvable.
+    Feed atoms — vertex, point and coefficient provenance — stay symbolic generators. A
+    statement-out atom with no exact value makes the whole cell unresolvable.
 
-    ``max_sym_mass`` (when given) caps the SUBSTITUTION's monomial mass: one
+    ``max_sym_mass``, when given, caps the substitution's monomial mass: one
     ``compose_multi`` runs uninterrupted, so an oversized replacement set is declared
-    unresolvable up front rather than blowing the time budget from inside.
+    unresolvable up front rather than exhausting the time budget from inside.
     """
     sub: dict[str, RationalFunction] = {}
     mass = _rf_mass(rf)
@@ -543,8 +579,8 @@ def _resolve_rf(
     return rf.compose_multi(sub) if sub else rf
 
 
-def _resolve_cells(cells: np.ndarray, env: _Env, program: Program) -> Any:
-    """Resolve an ndarray of cells to exact values (object ndarray), or ``_OPAQUE``."""
+def _resolve_cells(cells: np.ndarray, env: _Env, program: Program) -> np.ndarray | _Opaque:
+    """Resolve an ndarray of cells to exact values, or to :data:`_OPAQUE`."""
     cells = np.asarray(cells)
     if cells.dtype.kind == "f":
         return cells
@@ -564,8 +600,8 @@ def _resolve_cells(cells: np.ndarray, env: _Env, program: Program) -> Any:
     return out
 
 
-def _resolve_ref(ref: Any, env: _Env, program: Program) -> Any:
-    """Resolve one Stmt input ref to an exact value (ndarray), or ``_OPAQUE``."""
+def _resolve_ref(ref: Ref, env: _Env, program: Program) -> np.ndarray | _Opaque:
+    """Resolve one statement input ref to an exact value, or to :data:`_OPAQUE`."""
     if isinstance(ref, Const):
         return np.asarray(ref.value, dtype=float)
     if isinstance(ref, InputRef):
@@ -595,7 +631,8 @@ def _resolve_ref(ref: Any, env: _Env, program: Program) -> Any:
 
 # --- exact field arithmetic (Gauss) ----------------------------------------
 
-def _fe_is_zero(x: Any) -> bool:
+def _fe_is_zero(x: ExactCell) -> bool:
+    """Report whether an exact field element is zero."""
     return x.is_zero() if isinstance(x, RationalFunction) else float(x) == 0.0
 
 
@@ -647,7 +684,7 @@ def _exact_inv(a: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
     return m[:, n:]
 
 
-def _exact_det(a: np.ndarray, meter: _Meter | None = None) -> Any:
+def _exact_det(a: np.ndarray, meter: _Meter | None = None) -> ExactCell:
     """Exact determinant by fraction-free-ish Gauss elimination over the field."""
     a = np.asarray(a, dtype=object).copy()
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
@@ -682,19 +719,19 @@ def _exact_solve(a: np.ndarray, b: np.ndarray, meter: _Meter | None = None) -> n
 
 
 def _exact_pinv(a: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
-    """The GENERIC (full-rank) pseudo-inverse over the rational-function field.
+    """Compute the generic, full-rank pseudo-inverse over the rational-function field.
 
-    ``A⁺ = (AᵀA)⁻¹Aᵀ`` for a tall/square ``A``, ``Aᵀ(AAᵀ)⁻¹`` for a wide one — the
-    normal-equation form, which EQUALS the Moore–Penrose pseudo-inverse exactly where ``A``
-    has full rank.  This is the same *generic-inverse* semantics :func:`_exact_inv` /
-    :func:`_exact_solve` already carry (the identity holds identically wherever the Gram
-    determinant is non-zero); ``_exact_inv`` raises on a structurally singular Gram, so a
-    rank-deficient-by-construction ``A`` goes OPAQUE rather than being guessed.
+    ``A⁺ = (AᵀA)⁻¹Aᵀ`` for a tall or square ``A``, ``Aᵀ(AAᵀ)⁻¹`` for a wide one: the
+    normal-equation form, which equals the Moore-Penrose pseudo-inverse wherever ``A`` has
+    full rank. These are the same generic-inverse semantics :func:`_exact_inv` and
+    :func:`_exact_solve` carry — the identity holds identically wherever the Gram
+    determinant is non-zero — and :func:`_exact_inv` raises on a structurally singular
+    Gram, so a rank-deficient ``A`` goes opaque rather than being guessed.
 
-    NOT equal to ``np.linalg.pinv`` on a rank-DEFICIENT matrix: the Moore–Penrose inverse is
-    discontinuous at a rank drop and is *not* a rational function of the entries, so no exact
-    twin of it can exist.  The exact lane therefore certifies the generic branch only — and the
-    numeric lane (``PinvOp.__call__``) is unaffected.
+    This does **not** agree with ``np.linalg.pinv`` on a rank-deficient matrix. The
+    Moore-Penrose inverse is discontinuous at a rank drop and is not a rational function of
+    the entries, so no exact twin of it can exist; this lane certifies the generic branch
+    only, and the numeric lane is unaffected.
     """
     a = np.asarray(a, dtype=object)
     if a.ndim != 2:
@@ -708,12 +745,12 @@ def _exact_pinv(a: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
 
 
 def _exact_assert(fn: AssertOp, args: list[Any], meter: _Meter | None) -> list[Any]:
-    """The passthrough twin of :class:`~polyarray.AssertOp` over symbolic operands.
+    """Reproduce :class:`~polyarray.AssertOp` over symbolic operands.
 
-    ``AssertOp`` VALUE-wise returns its first input unchanged; the predicate is a guard.  This
-    twin reproduces the value and re-checks every predicate that is DECIDABLE over the
-    rational-function field, raising (⇒ opaque, never a silent pass) when a decidable check
-    fails:
+    ``AssertOp`` returns its first input unchanged; the predicate is a guard. This twin
+    reproduces the value and re-checks every predicate that is decidable over the
+    rational-function field, raising — hence going opaque, never silently passing — when a
+    decidable check fails:
 
     * ``shape_eq``          — structural, always decidable;
     * ``rank_eq``           — decidable when both operands resolve to exact constants; else
@@ -772,16 +809,16 @@ def _exact_assert(fn: AssertOp, args: list[Any], meter: _Meter | None) -> list[A
     return [x]
 
 
-def _obj(a: Any) -> np.ndarray:
-    """An operand as an object ndarray (einsum over mixed float/RF cells)."""
+def _obj(a: ExactValue) -> np.ndarray:
+    """Return an operand as an object ndarray, so einsum can mix float and rational cells."""
     arr = np.asarray(a)
     return arr if arr.dtype == object else arr.astype(object)
 
 
 # --- symbolic op twins ------------------------------------------------------
 
-def _opaque_name(fn: Any) -> str:
-    """The human name this lane reports for an op it will not execute symbolically."""
+def _opaque_name(fn: StmtOp) -> str:
+    """Name an op the way this lane reports it when refusing to execute it symbolically."""
     name = type(fn).__name__
     if isinstance(fn, CallOp):
         inner = fn.fn
@@ -791,11 +828,11 @@ def _opaque_name(fn: Any) -> str:
     return name
 
 
-def _const_int(val: Any) -> int | None:
-    """``val`` as a build-time constant int, else ``None``.
+def _const_int(val: ExactValue) -> int | None:
+    """Return ``val`` as a build-time constant int, else ``None``.
 
-    Several ops carry an integer operand — a rank, a block count — that SIZES the result
-    rather than contributing to it.  Such an operand is not something to approximate: if it
+    Several ops carry an integer operand — a rank, a block count — that sizes the result
+    rather than contributing to it. Such an operand is not something to approximate: if it
     has not resolved to a constant the statement is genuinely unresolved, so the twins bail
     rather than pick a value.
     """
@@ -805,9 +842,11 @@ def _const_int(val: Any) -> int | None:
     return int(num.reshape(-1)[0])
 
 
-def _exact_block_repeat(a: np.ndarray, count: int, reason: _Reason) -> list[Any] | None:
-    """``n`` block-diagonal copies of ``a`` over exact cells — the shared body of the static
-    (:class:`BlockRepeatOp`) and runtime-counted (:class:`DynBlockRepeatOp`) twins.
+def _exact_block_repeat(a: np.ndarray, count: int, reason: _Reason) -> list[ExactValue] | None:
+    """Lay out ``count`` block-diagonal copies of ``a`` over exact cells.
+
+    The shared body of the static :class:`BlockRepeatOp` twin and the runtime-counted
+    :class:`DynBlockRepeatOp` one.
     """
     if a.ndim != 2:
         reason.note("BlockRepeat: non-matrix operand")
@@ -822,22 +861,22 @@ def _exact_block_repeat(a: np.ndarray, count: int, reason: _Reason) -> list[Any]
     return [out]
 
 
-def _opaque(fn: Any, reason: _Reason) -> list[Any] | None:
-    """Record ``fn`` as opaque on the symbolic path; always ``None`` (never a guess)."""
+def _opaque(fn: StmtOp, reason: _Reason) -> None:
+    """Record ``fn`` as opaque on the symbolic path, and return ``None`` — never a guess."""
     reason.note(f"opaque op {_opaque_name(fn)} on the symbolic path")
     return None
 
 
 def _sym_apply(
-    fn: Any, args: list[Any], meter: _Meter, depth: int, reason: _Reason,
+    fn: StmtOp, args: list[ExactValue], meter: _Meter, depth: int, reason: _Reason,
     max_sym_mass: int,
-) -> list[Any] | None:
-    """Execute one op over exact symbolic operands; ``None`` = opaque (no guess).
+) -> list[ExactValue] | None:
+    """Execute one op over exact symbolic operands, returning ``None`` when it is opaque.
 
-    Two layers, because ``Stmt.fn`` is only *half* closed.  The OPEN half — a
-    sub-:class:`~polyarray.ir.Program`, a ``vmap`` closure, a front-end op class, a plain
+    Two layers, because ``Stmt.fn`` is only half closed. The open half — a nested
+    :class:`~polyarray.ir.Program`, a ``vmap`` closure, a front-end op class, a plain
     callable — is dispatched here; polyarray's own :data:`~polyarray.ir.StmtFn` vocabulary
-    is dispatched by :func:`_sym_apply_builtin`, exhaustively.
+    is dispatched exhaustively by :func:`_sym_apply_builtin`.
     """
     if isinstance(fn, Program):
         return _run_program(fn, args, meter, depth + 1, reason, max_sym_mass)
@@ -852,15 +891,14 @@ def _sym_apply(
 
 
 def _sym_apply_builtin(
-    fn: StmtFn, args: list[Any], meter: _Meter, reason: _Reason,
-) -> list[Any] | None:
-    """The EXACT twin of one polyarray-owned op; ``None`` = opaque (no guess).
+    fn: StmtFn, args: list[ExactValue], meter: _Meter, reason: _Reason,
+) -> list[ExactValue] | None:
+    """Apply the exact twin of one polyarray-owned op, or ``None`` when it is opaque.
 
-    EXHAUSTIVE over :data:`~polyarray.ir.StmtFn` — every op either has a rational twin or
-    an explicit arm **stating why it has none**.  ``assert_never`` at the bottom makes a
-    newly added op a mypy error here, which is the whole point: ``KronOp`` / ``KronFreeOp``
-    (``Λ²`` certified at 0%) and ``SwitchOp`` (every ``select_x`` frozen) were both
-    silently absent from the ladder this replaced, and nothing said so.
+    Exhaustive over :data:`~polyarray.ir.StmtFn`: every op either has a rational twin or an
+    explicit arm stating why it has none. The closing ``assert_never`` makes a newly added
+    op a mypy error here, which is load-bearing — an op silently missing from the ladder is
+    opaque, and opacity stalls a certificate rather than failing it.
     """
     match fn:
       case EinsumStmtOp():
@@ -1105,12 +1143,12 @@ def _sym_apply_builtin(
         assert_never(unreachable)
 
 
-def _vmap_closure(fn: Any) -> tuple[Program, tuple, tuple] | None:
-    """``(body, in_axes, out_axes)`` when ``fn`` is a REBUILDABLE vmap closure, else ``None``.
+def _vmap_closure(fn: StmtOp) -> tuple[Program, tuple[int | None, ...], tuple[int | None, ...]] | None:
+    """Return ``(body, in_axes, out_axes)`` when ``fn`` is a rebuildable vmap closure.
 
-    Mirrors ``simplify._is_rebuildable_vmap``: all three attributes must be present (a
-    front-end wrapper exposing only ``_vmap_body``, without the axis tuples, is NOT
-    descendable — the slicing would be a guess).  ``CallOp``-wrapped closures are unwrapped.
+    All three attributes must be present: a front-end wrapper exposing only the body,
+    without the axis tuples, is not descendable, because the slicing would be a guess.
+    ``CallOp``-wrapped closures are unwrapped first.
     """
     inner = fn.fn if isinstance(fn, CallOp) else fn
     body = getattr(inner, "_vmap_body", None)
