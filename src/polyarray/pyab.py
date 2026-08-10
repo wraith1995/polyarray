@@ -1087,9 +1087,18 @@ class _Lowerer:
         if isinstance(fn, TensordotOp):
             return ("single", c.TensorDotExpr(a=args[0], b=args[1], axes=fn.axes))
         if isinstance(fn, EinsumStmtOp):
+            shapes = [_ref_shape(r) for r in in_refs] if len(in_refs) == len(args) else [None] * len(args)
+            u = _unroll_einsum(self, fn.spec, tuple(args), shapes, self._out_shape())
+            if u is not None:
+                return ("single", u)
             return ("single", c.EinsumExpr(subscripts=fn.spec, operands=tuple(args)))
         if isinstance(fn, EinsumOp):
             rhs = self._const_expr(np.asarray(fn._rhs, dtype=float))
+            lhs_shape = _ref_shape(in_refs[0]) if in_refs else None
+            u = _unroll_einsum(self, fn.spec, (args[0], rhs),
+                               [lhs_shape, tuple(int(s) for s in fn.rhs_shape)], self._out_shape())
+            if u is not None:
+                return ("single", u)
             return ("single", c.EinsumExpr(subscripts=fn.spec, operands=(args[0], rhs)))
         if isinstance(fn, IdentityOp):
             return ("single", args[0])
@@ -1337,6 +1346,18 @@ class _Lowerer:
         return ("exprs", [c.AccessExpr(base=wv, index=(c.IntLit(value=i),)) for i in range(len(out))])
 
     # -- QR (small-Householder interception) ------------------------------
+
+    def _out_shape(self) -> tuple[int, ...] | None:
+        """Static shape of the single-output op currently being rendered (from ``self._current_out``); used by
+        the einsum unroll to infer index sizes the operands alone may not fix. ``None`` if multi-output or
+        not statically shaped."""
+        co = self._current_out
+        if not co or len(co) != 1:
+            return None
+        try:
+            return tuple(int(s) for s in co[0].cells.shape)
+        except Exception:
+            return None
 
     def try_small_qr(self, a_expr: PyExprs, mode: str = "reduced") -> tuple[PyExprs, PyExprs] | None:
         """Inline unrolled Householder QR (arith/``where``/``stack`` only — NO ``linalg.qr`` call, so it
@@ -1669,6 +1690,149 @@ def _static_matrix_shape(out: SymArray) -> tuple[int | None, int | None]:
     if len(q_shape) != 2 or len(r_shape) != 2:
         return (None, None)
     return (int(q_shape[0]), int(q_shape[1]))
+
+
+def _einsum_unroll_max() -> int:
+    """Max product of contracted-dim sizes for which a small einsum is unrolled into pointwise ops
+    (env `POLYARRAY_EINSUM_UNROLL_MAX`, default 64; `0` disables the unroll, keeping `torch.einsum`)."""
+    v = os.environ.get("POLYARRAY_EINSUM_UNROLL_MAX")
+    if v is not None:
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    return 64
+
+
+def _ref_shape(ref: object) -> tuple[int, ...] | None:
+    """Static shape of an einsum operand :class:`Ref` (a bulk or cell-array :class:`SymArrayRef`); ``None``
+    when not statically known (so the einsum unroll bails to a plain ``torch.einsum``)."""
+    b = getattr(ref, "_bulk", None)
+    if b is not None:
+        shp = getattr(b, "shape", None)
+        return None if shp is None else tuple(int(s) for s in shp)
+    cells = getattr(ref, "cells", None)
+    if cells is None:
+        return None
+    try:
+        return tuple(int(s) for s in np.asarray(cells).shape)
+    except Exception:
+        return None
+
+
+def _resolve_einsum_ellipsis(
+    in_subs: list[str], out_sub: str, shapes: Sequence[tuple[int, ...] | None]
+) -> tuple[list[list[str]], list[str]] | None:
+    """Replace ``...`` in an einsum spec with concrete fresh labels (``~0``, ``~1``, …) via operand ranks,
+    right-aligned (numpy broadcasting). Returns ``(in_subs_resolved, out_sub_resolved)`` or ``None`` if
+    unsupported (a repeated index within one operand, or a rank/shape mismatch)."""
+    ell_ranks: list[int] = []
+    for sub, shp in zip(in_subs, shapes):
+        explicit = sub.replace("...", "")
+        if len(set(explicit)) != len(explicit):
+            return None                                  # diagonal (repeated index in one operand)
+        if "..." in sub:
+            if shp is None:
+                return None
+            r = len(shp) - len(explicit)
+            if r < 0:
+                return None
+            ell_ranks.append(r)
+        else:
+            if shp is not None and len(explicit) != len(shp):
+                return None
+            ell_ranks.append(0)
+    maxr = max(ell_ranks) if ell_ranks else 0
+    labels = [f"~{i}" for i in range(maxr)]
+    def resolve(sub: str, r: int) -> list[str]:
+        if "..." not in sub:
+            return list(sub)
+        left, _, right = sub.partition("...")
+        return list(left) + labels[maxr - r:] + list(right)
+    in2 = [resolve(sub, r) for sub, r in zip(in_subs, ell_ranks)]
+    if "..." in out_sub:
+        left, _, right = out_sub.partition("...")
+        out2 = list(left) + labels + list(right)
+    else:
+        out2 = list(out_sub)
+    return in2, out2
+
+
+def _unroll_einsum(
+    low: _Lowerer, spec: str, exprs: Sequence[PyExprs],
+    shapes: Sequence[tuple[int, ...] | None], out_shape: tuple[int, ...] | None,
+) -> PyExprs | None:
+    """Lower a SMALL einsum to a broadcast-multiply + an UNROLLED contraction sum — pure pointwise ops that
+    Inductor fuses, instead of a ``torch.einsum`` (which it turns into an extern ``bmm`` and/or a ``Reduction``,
+    both hard fusion boundaries). Returns the expr, or ``None`` to fall back to ``EinsumExpr``.
+
+    Each operand is transposed + ``newaxis``-padded to a common ``[output dims, contracted dims]`` layout,
+    the operands are multiplied elementwise, and the trailing contracted axes are summed by EXPLICIT adds
+    over their (small, static) index ranges — no ``.sum``/reduction, no matmul. Gated on a statically-known
+    small contraction (``_einsum_unroll_max``)."""
+    c = low.core
+    umax = _einsum_unroll_max()
+    if umax <= 0 or "->" not in spec:
+        return None
+    inp, _, outp = spec.partition("->")
+    in_subs = [s.strip() for s in inp.split(",")]
+    if len(in_subs) != len(exprs):
+        return None
+    res = _resolve_einsum_ellipsis(in_subs, outp.strip(), list(shapes))
+    if res is None:
+        return None
+    in2, out2 = res
+    # infer every index size from the operand shapes AND the output shape (either can supply a size).
+    size: dict[str, int] = {}
+    def add(sub: list[str], shp: tuple[int, ...] | None) -> bool:
+        if shp is None:
+            return True
+        if len(sub) != len(shp):
+            return False
+        for ch, s in zip(sub, shp):
+            if ch in size and size[ch] != int(s):
+                return False
+            size[ch] = int(s)
+        return True
+    for sub, shp in zip(in2, shapes):
+        if not add(sub, shp):
+            return None
+    if not add(out2, out_shape):
+        return None
+    if any(ch not in size for ch in out2):
+        return None
+    contracted = [ch for ch in size if ch not in out2]
+    if any(ch not in size for ch in contracted):
+        return None
+    csz = 1
+    for ch in contracted:
+        csz *= size[ch]
+    if csz == 0 or csz > umax:
+        return None
+    union = list(out2) + contracted                      # output dims first, contracted trailing
+    aligned: list[PyExprs] = []
+    for expr, sub in zip(exprs, in2):
+        present = [ch for ch in union if ch in sub]
+        if present != list(sub):
+            axes = tuple(sub.index(ch) for ch in present)
+            expr = c.TransposeExpr(a=expr, axes=axes)
+        index = tuple(c.Slice() if ch in sub else c.NewAxisTok() for ch in union)
+        aligned.append(c.AccessExpr(base=expr, index=index))
+    prod = aligned[0]
+    for e in aligned[1:]:
+        prod = c.BinaryExpr(op=c.BinaryOp.MUL, lhs=prod, rhs=e)
+    if not contracted:
+        return prod
+    prod_var = low.b.assign_new(prod, base="einsum")     # bind so unrolled slices reference, not duplicate
+    n_out = len(out2)
+    import itertools
+    terms = [
+        c.AccessExpr(base=prod_var,
+                     index=tuple(c.Slice() for _ in range(n_out))
+                           + tuple(c.IntLit(value=int(i)) for i in combo))
+        for combo in itertools.product(*[range(size[ch]) for ch in contracted])
+    ]
+    return _balanced(c, terms, c.BinaryOp.ADD)
 
 
 def _poly_to_ir(core: ModuleType, poly: Poly, gens: Sequence[PyExprs]) -> PyExprs:
