@@ -2,7 +2,7 @@
 
 A :class:`RationalFunction` is a pair ``(num, den)`` of polynomials
 sharing the same ring.  The ring abstraction is provided by
-:mod:`chartlib._symbolic.poly_backend`, which has two implementations:
+:mod:`.poly_backend`, which has two implementations:
 
 * ``sympy`` (default) — :class:`sympy.polys.rings.PolyElement` over
   :data:`sympy.RR` (53-bit mpmath floats).
@@ -12,14 +12,14 @@ sharing the same ring.  The ring abstraction is provided by
 
 The backend is selected at import time via
 ``CHARTLIB_POLY_BACKEND={sympy,flint}`` and is opaque to the rest of
-chartlib — every call site here goes through ``Poly`` / ``Ring``
+the package — every call site here goes through ``Poly`` / ``Ring``
 methods that both backends provide.
 
 Cells of the symbolic interpreter's ``SymArray`` are
 ``RationalFunction | float``: numeric cells are plain Python floats,
 generator-bearing cells are rational functions.
 
-Per the plan:
+Design:
 
 * Each instance carries its own ring spanning the generators it
   actually uses.  Arithmetic combining two instances with different
@@ -31,8 +31,8 @@ Per the plan:
   during a hot loop; the only simplification is in :meth:`clean`,
   which is reserved for boundary calls.
 * On the sympy backend ``num/den`` are over ``sympy.RR`` (mpmath
-  floats); on flint they are over ``QQ`` (exact rationals).  Chartlib
-  samples numerically and the ring exists to carry generator
+  floats); on flint they are over ``QQ`` (exact rationals).  Callers
+  sample numerically and the ring exists to carry generator
   structure, not to recover exact rationals from floats — converting
   floats to exact rationals only where needed.  Structural-zero
   detection (:func:`coeff_zero`, :func:`simple_zero`) on the sympy
@@ -297,8 +297,8 @@ class RationalFunction:
         """Build the rational function ``x`` for a fresh single-generator ring named ``name``.
 
         Convenience wrapper around :meth:`generator` that allocates the
-        ring for you — matches the per-cell-ring convention used by
-        :func:`chartlib._symbolic.ir.allocate_input`.
+        ring for you — matches the per-cell-ring convention used for
+        input allocation.
         """
         return cls.generator(_make_ring([name]), name)
 
@@ -344,7 +344,7 @@ class RationalFunction:
 
         A *numeric* magnitude for a tolerance-based sparsity test: a cell whose numerator
         coefficients are all negligible (``≤ tol·scale``) is an identically-zero rational function
-        up to float roundoff (e.g. chartLib QR / Orthopoly's irrational normalization) — a structural
+        up to float roundoff (e.g. QR / orthonormal-basis irrational normalization) — a structural
         zero that exact :meth:`is_zero` misses. Distinct from ``is_zero`` (which is exact).
         """
         m = 0.0

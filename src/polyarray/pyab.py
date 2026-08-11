@@ -15,7 +15,7 @@ program:
   :func:`compile_torch` / :func:`compile_numpy` are one-call conveniences.
 
 * **Embedded** — the program is a *per-element kernel* you want to invoke from
-  inside a **larger PyAB program** (e.g. a grassmann-lowered element kernel
+  inside a **larger PyAB program** (e.g. a lowered element kernel
   called by an assembly program).  :func:`call_lowered` emits the callable once
   and a *placed* call at the current build point.  The call site chooses:
 
@@ -1297,8 +1297,7 @@ class _Lowerer:
           This is the safe default whenever the scrutinee is NOT a static ``Const``:
           pyab cannot know if the caller will vmap, and the one-hot is universally
           correct (it inherently needs the uniform branch shape that the vmap case has).
-          Branch order matches the ``select_x`` scrutinee domain (chartlib
-          ``SymbolicInterpreter.select_x``).
+          Branch order matches the ``select_x`` scrutinee domain.
         """
         c = self.core
         if isinstance(scrutinee_ref, Const):
@@ -1379,7 +1378,7 @@ class _Lowerer:
 
     def _gsvd(self, fn: GSvdOp, args: list[PyExprs], out: tuple[SymArray, ...],
               in_refs: Sequence[Ref]) -> list[PyExprs]:
-        """Metric-aware GSVD as a composite of cholesky / svd / solve + FFS split.
+        """Metric-aware GSVD as a composite of cholesky / svd / solve + rank split.
 
         Mirrors :meth:`polyarray.ir.GSvdOp.__call__` exactly: whiten ``A`` by the
         Cholesky factors of the two metrics, SVD, threshold the rank, de-whiten,
@@ -1502,7 +1501,7 @@ class _Lowerer:
         Arith/``where``/``stack`` only — NO ``linalg.qr`` call, so it neither graph-breaks
         ``torch.compile`` nor calls LAPACK. Returns ``None`` to fall back to a ``linalg.qr`` call.
 
-        Shared by :meth:`_qr` (``QrOp``) and op-carried ``__pyab_lower__`` hooks (chartlib's
+        Shared by :meth:`_qr` (``QrOp``) and op-carried ``__pyab_lower__`` hooks (e.g.
         ``QrSignFixOp``) so BOTH avoid the QR graph break. The operand shape is read off the current
         output tuple (``self._current_out``); intercept iff it is statically small (``max(m, n) <=
         small_qr.max_dim``, ``m >= n``) and small-QR is enabled.
@@ -1553,7 +1552,7 @@ class _Lowerer:
     def scalar_grid(self, grid: np.ndarray) -> _ScalarGrid:
         """Wrap an ``np.ndarray`` of scalar exprs as a scalarized output.
 
-        For op-carried ``__pyab_lower__`` hooks — e.g. chartlib's ``QrSignFixOp`` — to return without
+        For op-carried ``__pyab_lower__`` hooks — e.g. ``QrSignFixOp`` — to return without
         importing pyab internals.
         """
         return _ScalarGrid(grid)

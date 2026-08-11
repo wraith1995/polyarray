@@ -77,7 +77,6 @@
       MetricOrthonormalOp
       MoveaxisOp
       MulAxisDimOp
-      NestedVmapClosure
       OutSpec
       OutputRef
       PinvOp
@@ -110,6 +109,5 @@
       SymbolicBudget
       TensordotOp
       TransposeOp
-      VmapClosure
       WhileOp
    

@@ -83,17 +83,25 @@ html_title = "polyarray"
 autodoc_mock_imports: list[str] = []
 
 
+# Internal structural-typing Protocols used only for isinstance dispatch — not
+# part of the documented surface.
+_INTERNAL_PROTOCOLS = {"VmapClosure", "NestedVmapClosure"}
+
+
 def _skip_member(app, what, name, obj, skip, options):
     """Keep the reference to the public surface.
 
-    Private members (leading underscore) are internal; and a module-level type
-    alias (e.g. ``Monom = tuple[int, ...]``) renders as a class whose ``tuple``
+    Private members (leading underscore) are internal; a module-level type alias
+    (e.g. ``Monom = tuple[int, ...]``) renders as a class whose ``tuple``
     signature autodoc cannot format, so it belongs inline in the module
-    docstring rather than as its own stub.
+    docstring rather than as its own stub; and the internal dispatch Protocols
+    are implementation detail.
     """
     import types
 
     if name.startswith("_"):
+        return True
+    if name in _INTERNAL_PROTOCOLS:
         return True
     if isinstance(obj, types.GenericAlias):
         return True

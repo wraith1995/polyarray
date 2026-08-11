@@ -1,6 +1,6 @@
 """Staged compile observability: measure a stage's IR, log it, warn on it, dump it.
 
-The consumers (pointwise / savo / oracle) drive a multi-stage compile — enumerate, sample,
+The consumer packages drive a multi-stage compile — enumerate, sample,
 represent, integrate, lower, torch-compile — and every hard bug in this stack has been "some
 stage blew the IR up and we could not see which".  This module is the instrument: a consumer
 calls :meth:`CompileTrace.stage` at a boundary with whatever that boundary produced (a
@@ -15,8 +15,8 @@ Everything is measured with the analysis polyarray already owns
 
 **Layering.**  This lives in polyarray because polyarray owns those primitives *and* the
 pyab→torch dump hand-off, and because polyarray is a dependency of every layer that wants to
-be observed — so instrumentation never inverts the stack.  grassmann and chartLib are
-deliberately NOT instrumented and must not import this.
+be observed — so instrumentation never inverts the stack.  The lower algebra and geometry
+layers are deliberately NOT instrumented and must not import this.
 
 **Levels** (``FEM_OBSERVE``, default ``warn``)::
 
@@ -321,7 +321,7 @@ def _degree_of(program: Program, seed: Mapping[str, float] | None) -> float | No
 
     The default scores every declared input AND every stray generator as degree 1, which makes
     the number a consistent monotone signal across stages without this module needing any
-    finite-element domain knowledge (that seeding lives in pointwise's ``estimate_degree``, where
+    finite-element domain knowledge (that seeding lives in the front end's degree estimation, where
     it belongs).  A caller with a sharper seed — vertices only, say — passes one.
 
     Scoring the *generators* (``gen_deg``), not only the input names, is load-bearing: a stage
@@ -922,8 +922,8 @@ class CompileTrace:
         """Write the stage's polyarray IR as readable source — "what is the output in polyarray".
 
         Uses :func:`polyarray.numpy_source.to_numpy_source`, the renderer polyarray already owns,
-        so a stage directory shows the ACTUAL program, not just its size.  Front-end ops (grassmann,
-        chartlib) render through their own hooks; anything the renderer cannot express is written as
+        so a stage directory shows the ACTUAL program, not just its size.  Front-end ops
+        render through their own hooks; anything the renderer cannot express is written as
         a note rather than raising, because a dump must never break a compile.
 
         A staged :class:`~polyarray.ir.SymArray` is rendered as the program's RESULT
@@ -1269,8 +1269,8 @@ def off_path(name: str, why: str = "") -> None:
 def scope(name: str, **kw: object) -> Iterator[CompileTrace]:
     """Open a trace for this block **unless one is already open**, in which case reuse it.
 
-    This is what a library entry point uses (savo's ``generic_assembly``, pointwise's
-    ``single_compile``): calling it makes the entry point observable on its own, while a caller
+    This is what a library entry point uses (a top-level assembly or compile routine):
+    calling it makes the entry point observable on its own, while a caller
     who wrapped a larger region in :func:`observe_compile` still gets ONE trace spanning
     everything rather than an inner trace that shadows theirs and reports half the compile.
     """

@@ -201,9 +201,9 @@ def _array_mask(sa: SymArray) -> Mask:
 
 
 def block_zero_mask(symarray_or_cells: SymArray | np.ndarray) -> np.ndarray:
-    """Read the structural-zero pattern of a (Vandermonde) matrix.
+    """Read the structural-zero pattern of a matrix.
 
-    The convenience the oracle M3 Schur inverse calls to choose the ``(p, q)``
+    The convenience a Schur-inverse caller uses to choose the ``(p, q)``
     split that maximises the zero block: ``True`` where the cell is structurally
     zero (``simple_zero`` / literal ``0.0``).
 

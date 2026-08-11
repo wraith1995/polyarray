@@ -1,6 +1,6 @@
 """Emit a standalone, runnable numpy ``.py`` source string from a :class:`Program`.
 
-A :class:`polyarray.Program` (built e.g. by grassmann's ``G.compile(term)``)
+A :class:`polyarray.Program`
 can be *run* (:meth:`Program.run`) but not serialised to a readable numpy
 module.  :func:`to_numpy_source` walks the program and emits a self-contained
 function — one parameter per program input (named by the input name) and one
@@ -28,7 +28,7 @@ Free feed atoms become parameters
 ---------------------------------
 A cell's :class:`RationalFunction` generators are normally bound either by a
 declared program input or by an earlier statement's output.  A program may also
-be *open* over generators that are neither: a free FEED atom, such as savo's
+be *open* over generators that are neither: a free FEED atom, such as
 per-cell vertex atoms ``V_j_k``, carried symbolically through a mid-pipeline
 program that has not yet declared them.  These are exactly the program's free
 variables, and they render as further **parameters** of the generated function,
@@ -213,9 +213,8 @@ class DeadOpKeyWarning(UserWarning):
 
     polyarray cannot validate a genuine front-end name (it deliberately cannot see that
     namespace). It CAN catch the specific spelling that caused every instance so far: a private
-    ``_Name`` for an op that now lives in polyarray as ``Name``. Ops were relocated here from
-    grassmann's lowering layer, so every such key was correct before the move and silently dead
-    after it — and the fallback kept the results right, which is precisely why nobody noticed.
+    ``_Name`` for an op that lives in polyarray as ``Name``. Such a key is silently dead —
+    and the fallback kept the results right, which is precisely why nobody noticed.
     """
 
 

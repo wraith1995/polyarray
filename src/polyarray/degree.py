@@ -3,8 +3,7 @@
 :func:`program_degree` walks a :class:`~polyarray.ir.Program`'s statement graph and
 propagates a polynomial degree per value from a per-input ``seed``, answering "what
 polynomial degree is the program's output in the seeded variables?" — the question a
-quadrature-order chooser asks. Consumers seed their domain knowledge (pointwise seeds
-field inputs with ``FE degree − derivative order`` and affine geometry with 0) and get
+quadrature-order chooser asks. Consumers seed their domain knowledge and get
 back a single float, ``inf`` meaning "not a polynomial of the seeds" (rational /
 algebraic / unknown — the caller supplies its own order there).
 
@@ -27,7 +26,7 @@ only UNDER-estimation is a correctness bug):
 
 The categories are keyed by op CLASS NAME and extendable per call (the
 ``to_numpy_source(op_renderers=)`` pattern): front ends pass their own op names —
-pointwise/grassmann's ``_ProjectOp``/``_AddOp``/… — without polyarray importing them.
+their own ``_ProjectOp``/``_AddOp``/… — without polyarray importing them.
 
 Leaf cells that are :class:`~polyarray.rational.RationalFunction`s (a ``RationalRef``
 splice, or an object-dtype ref the walk did not produce) are scored with

@@ -1,6 +1,6 @@
 """Polynomial-arithmetic backend abstraction.
 
-The chartlib symbolic interpreter stores rational functions as
+The symbolic interpreter stores rational functions as
 ``num / den`` where ``num`` and ``den`` are sparse multivariate
 polynomials over a coefficient field.  Two backends are wired here:
 

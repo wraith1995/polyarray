@@ -150,12 +150,12 @@ def _fold_cells(cells: np.ndarray, known: Mapping[str, float]) -> np.ndarray:
     STRUCTURE-TRANSPARENT no-op: when no cell references a folded (``known``) generator
     the fold changes nothing, so the ORIGINAL ``cells`` object is returned unchanged —
     never a fresh copy.  This keeps ``id(cells)`` stable across the fold, which a
-    downstream identity-based structural read depends on: the pointwise/grassmann
+    downstream identity-based structural read depends on: a downstream
     quadrature-degree walker (``polyarray.program_degree``) links a Stmt's producer to its
     consumer by ``id(ref._cells) == id(out._cells)`` and, on a miss, falls back to scoring
     the cells' generators by NAME — a fallback that knows FIELD degrees but not the
     geometry/position generators, so a broken link silently drops the position's degree
-    (the Koszul ``κ = x·`` factor) and under-integrates the drop-Vandermonde.  A fold
+    (the Koszul ``κ = x·`` factor) and under-integrates the result.  A fold
     that substitutes nothing must therefore leave the cell array's identity intact.
     """
     if cells.dtype.kind == "f":
@@ -187,9 +187,9 @@ def _numify_constant_cells(cells: np.ndarray) -> np.ndarray:
     fully-constant array then has float dtype, so :meth:`SymArray.evaluate` reads it directly
     (``dtype.kind == 'f'``) WITHOUT requiring the program's now-unused input bindings — the
     ``partial_eval_numeric`` intent that "unused inputs simply go unread". A cell that still
-    carries a live generator (genuinely vertex-dependent) is left as an ``RF``, so a
-    cell-dependent array stays object-dtype and ``evaluate({})`` still raises — which the
-    ``affine_invariance`` / ``P(T)`` gates read as "does not fold to a constant".
+    carries a live generator is left as an ``RF``, so a cell-dependent array stays object-dtype
+    and ``evaluate({})`` still raises — which a downstream constancy check reads as "does not
+    fold to a constant".
     """
     if cells.dtype.kind == "f":
         return cells
@@ -550,12 +550,12 @@ def _vmap_closure_of(fn: StmtOp) -> tuple[StmtOp, Callable[[StmtOp], StmtOp]] | 
 
 
 def _drop_unread_inputs(prog: Program) -> Program:
-    """``prog`` with every input NO statement and NO output references removed (`frame-probe`).
+    """``prog`` with every input NO statement and NO output references removed.
 
-    A DEAD input is not a small thing here: it is the only reason a higher-form DOF body is not
-    recognised as a build-time constant. grassmann declares a sub-input for every Term-var that
-    the binder's BASIS mentions — for a wedge slot that is ``J_face``, which NAMES the
-    transported frame but is read through the constant inclusion ``ι`` alone — so the closure
+    A DEAD input is not a small thing here: it is the only reason a higher-order DOF body is not
+    recognised as a build-time constant. A consumer declares a sub-input for every variable that
+    the binder's BASIS mentions — one of which NAMES a transported frame but is read through a
+    constant inclusion alone — so the closure
     carries an input it never touches, and the enclosing Stmt therefore has a non-numeric operand
     and cannot be folded. Dropping it is value-preserving by definition: nothing reads it.
 
@@ -602,13 +602,13 @@ def _fold_vmap_body(
     unchanged whenever nothing folds or anything looks off — always a sound no-op degrade
     (identity/sharing preserved when there is nothing to gain).
 
-    ``operand_values`` (`frame-probe`) — the caller's already-resolved Stmt operands, ``None``
+    ``operand_values`` — the caller's already-resolved Stmt operands, ``None``
     where an operand is not build-time numeric. An operand whose ``in_axes`` entry is ``None`` is
     **not batched**: the very same array is handed to every slice of the body, so substituting its
     value INTO the body is value-preserving by the definition of ``vmap``, and the batched
     (``in_axes`` integer) operands are untouched. Doing so is what lets the floor-fold see a
-    closed-over operand that the body does not actually read — the higher-form case, where the
-    binder's basis NAMES a frame map (``J_face``) that only the constant inclusion ``ι`` is read
+    closed-over operand that the body does not actually read — the higher-order case, where the
+    binder's basis NAMES a frame map that only a constant inclusion is read
     through, so the whole DOF is a build-time constant hidden behind a closure.
 
     Returns ``(fn', keep)``: ``keep`` is ``None`` when the operand list is unchanged, else a
@@ -861,7 +861,7 @@ class NonDeterministicFoldWarning(NonExactFoldWarning):
     the work budget exists to provide is gone: re-run on a faster box and more may certify.
 
     It is a :class:`NonExactFoldWarning` subclass so that every existing consumer of
-    fold provenance (notably pointwise's certificate cache, which decides the ``exact`` bit by
+    fold provenance (notably a certificate cache that decides the ``exact`` bit by
     walking this hierarchy) treats it as non-exact without changes.  Seeing it means the cost
     model needs fixing, not the budget raising.
     """
@@ -874,8 +874,8 @@ def _resolve_legacy_time_budget(time_budget: float | None) -> float | None:
     """Translate a legacy ``time_budget=`` into a wall-clock BACKSTOP, loudly.
 
     ``time_budget`` used to decide what the exact lane folded, in seconds — which is exactly
-    the machine dependence the work budget removed.  It stays ACCEPTED because polyarray's
-    committed surface carries it and pointwise has external consumers, but it no longer
+    the machine dependence the work budget removed.  It stays ACCEPTED because the
+    committed surface carries it and it has external consumers, but it no longer
     selects certificates: it now sizes the backstop, i.e. it still guarantees the call
     terminates, which is the reason callers passed it.  Because the meaning genuinely changed,
     passing it warns rather than silently doing something else than it used to.

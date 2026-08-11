@@ -7,7 +7,7 @@ per-element torch function, and ``torch.vmap`` batches it over the leading axis 
 IR concept and torch is reached only through ``pyab`` (torch/pyarraybackend are OPTIONAL deps, imported
 lazily; the core stack never imports torch).
 
-On a GPU or large batch this can beat the numpy path; on tiny CPU arrays (the FEEC per-point residual) it is
+On a GPU or large batch this can beat the numpy path; on tiny CPU arrays (a small per-point residual) it is
 roughly on par with :func:`batched_run`. ``pyab``'s torch backend bootstraps a ``torch.distributed`` process
 group from mpi4py at module load; :func:`ensure_torch_pg` pre-initializes a 1-rank ``gloo`` group so that
 bootstrap short-circuits (no mpi4py / MPI dependency for single-process use).
@@ -62,10 +62,10 @@ def switch_vmap_op_lowerings() -> dict[str, OpLowering]:
 
 
 def feec_op_lowerings() -> dict[str, OpLowering]:
-    """Return an empty op-lowering table for the FEEC front-end ops.
+    """Return an empty op-lowering table for the front-end ops.
 
     Those ops carry their own ``__pyab_lower__`` hooks, so plain ``LowerOpts()`` lowers the whole
-    FEEC residual with no override.
+    residual with no override.
     """
     return {}
 

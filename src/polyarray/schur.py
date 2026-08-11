@@ -19,8 +19,7 @@ special-cased only to *skip* the wasted symbolic work, not for correctness.
 
 SymArray-native: blocks are SymArray slices, so the owning ``Program`` rides on the carrier — Stmt deferrals
 emit into it, numerics mixed into symbolic arithmetic are coerced by ``RationalFunction`` itself, and a
-float-cell (numeric) block short-circuits to numpy arithmetic. (Ported from oracle ``vandermonde/schur.py`` —
-pure SymArray algebra, so its home is polyarray; element drivers consume it from here.)
+float-cell (numeric) block short-circuits to numpy arithmetic.
 
 Driver structure:
 
@@ -271,14 +270,14 @@ def _approx_zero(cell: Cell) -> bool:
 
     A cell is zero iff it is a SYNTACTIC (coefficient) zero, OR it is a CONSTANT (a number, or a
     total-degree-0 ``RationalFunction``) whose magnitude is ``< _MASK_TOL`` — a true zero landed as float
-    ROUNDOFF (a numeric ``Vref⁻¹`` over the irrational normalized basis makes the P(T) value rows ``~1e-17``,
+    ROUNDOFF (a numeric inverse over an irrational normalized basis makes some value rows ``~1e-17``,
     not exact ``0``).
 
     Roundoff is applied ONLY to CONSTANTS: a constant does not vary, so ``|const| < tol`` is genuinely a
     rounded zero. This is the crucial soundness distinction from the retired numeric probe, which read a
     SYMBOLIC cell's magnitude at a few generic points — where a tiny-but-nonzero cell gave a WRONG inverse
-    (the 5e20 wrong-inverse bug). A vertex-dependent ``RationalFunction`` stays EXACT (``simple_zero``, no
-    roundoff, no sampling). Guarded end-to-end by the numeric-vs-symbolic P(T) backstop.
+    (the 5e20 wrong-inverse bug). A parameter-dependent ``RationalFunction`` stays EXACT (``simple_zero``, no
+    roundoff, no sampling). Guarded end-to-end by the numeric-vs-symbolic backstop.
     """
     if simple_zero(cell):
         return True
@@ -430,11 +429,11 @@ def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
 
     The numeric probe ``_structural_mask`` is UNSOUND and NO LONGER the default: it marks a cell zero when
     it is merely SMALL (< ``_MASK_TOL``) at a few sample points, so a *tiny-but-nonzero* cell is dropped
-    and the Schur split silently returns a WRONG inverse (demonstrated on degree-5 elements — the
-    symbolic ``P(T)`` came out ``5e20`` off the true ``inv(C)``; adding sample points does not help, the cells are tiny at
+    and the Schur split silently returns a WRONG inverse (demonstrated on a degree-5 case — the
+    symbolic inverse came out ``5e20`` off the true ``inv(C)``; adding sample points does not help, the cells are tiny at
     every point). It survives only behind an explicit, self-labelled-unsound opt-in
-    (``POLYARRAY_SCHUR_UNSOUND_PROBE_MASK``) for a large element whose cancellation-sparsity a sound exact
-    fold cannot yet recover — and only ever with the numeric-vs-symbolic ``P(T)`` backstop watching it.
+    (``POLYARRAY_SCHUR_UNSOUND_PROBE_MASK``) for a large matrix whose cancellation-sparsity a sound exact
+    fold cannot yet recover — and only ever with the numeric-vs-symbolic backstop watching it.
     """
     if mask is not None:
         return mask
@@ -642,18 +641,18 @@ def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None =
     makes the split less aggressive, never wrong.
 
     ``program`` (GROUNDED SYMBOLIC): the SHARED ``Program`` the block-triangular inverse should be GROUNDED
-    onto — so a symbolic ``P(T)`` lowers through a value kernel compiled from that shared program (savo's
-    block program) rather than leaving Stmts stranded on an ephemeral by-product program. When ``matrix``
+    onto — so a symbolic inverse lowers through a value kernel compiled from that shared program
+    rather than leaving Stmts stranded on an ephemeral by-product program. When ``matrix``
     already rides ``program`` (or ``program`` is ``None``, or ``matrix`` is numeric / program-less) this is a
     no-op and the Stmts emit into ``matrix``'s own program as before (backward compatible). Otherwise the
     block-split mask is resolved on ``matrix``'s OWN program FIRST — its inputs are the clean generic-cell
     generators the deterministic structural probe needs — and only then is ``matrix`` GRAFTED onto
     ``program`` (:meth:`Program.graft`): ``matrix``'s cells may reference not only shared input atoms but
-    also *its program's own producing Stmts* (e.g. the world-Vandermonde's grassmann-lowered derivative-DOF
-    ``grass_dof`` Stmts), so a bare relabel would strand those; the graft emits ``matrix``'s program as a
+    also *its program's own producing Stmts* (e.g. Stmts produced upstream in that program), so a bare
+    relabel would strand those; the graft emits ``matrix``'s program as a
     sub-Program Stmt of ``program`` (fresh dedup'd outputs). The recursion's own deferred leaf-inverse /
     Schur-combine Stmts (``schur_inverse``/``schur_matmul``) then emit natively onto ``program`` (mask
-    threaded so it never re-probes on the shared program), and several elements' ``P(T)`` matrices grounded
+    threaded so it never re-probes on the shared program), and several matrices grounded
     on one shared program do not collide.
     """
     M = matrix if isinstance(matrix, SymArray) else SymArray(matrix)

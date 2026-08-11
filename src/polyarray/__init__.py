@@ -1,7 +1,6 @@
 """polyarray — the standalone symbolic-numeric array IR.
 
-Extracted faithfully from chartlib's ``_symbolic`` core (see
-``VENDORED.md``).  This package is the single source of truth for the
+This package is the single source of truth for the
 ``Program`` / ``Stmt`` / ``SymArray`` / ``RationalFunction`` IR plus all
 polynomial backends (sympy / native_py / native_value / cython cpp) and
 the analyze / partial_eval IR passes.
