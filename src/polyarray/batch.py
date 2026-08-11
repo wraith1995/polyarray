@@ -22,9 +22,8 @@ general.  ``EinsumStmtOp`` batches by rewriting the spec with an ellipsis and pa
 numpy may choose a different contraction ORDER than the unbatched call; ``np.linalg`` likewise takes a
 stacked path rather than a per-matrix one.  Both re-associate floating-point arithmetic.
 
-Measured on a high-degree interpolation residual: 2D agrees exactly; 3D differs by max|Δ| =
-1.0e-13 on values of magnitude ~1.4e2, i.e. ~1 ulp relative. Agreement is therefore to
-rounding, not to the bit — a claim of bit-identity holds only for the exact ops above.
+Agreement is therefore to rounding, not to the bit — a claim of bit-identity holds only for
+the exact ops above.
 
 Raises :class:`NotImplementedError` for any op without a batch rule (or a sub-Program / dynamic
 construct it does not handle) so the caller can fall back to the per-element loop.

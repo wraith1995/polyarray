@@ -1,12 +1,11 @@
-"""Structural-zero sparsity propagation over a Program (P4 of the `simplify` plan).
+"""Structural-zero sparsity propagation over a Program.
 
-This is the *additive* sparsity pass
-§"Sparsity rules" and §P4.  It threads a structural-zero boolean mask (``True``
+This is the *additive* sparsity pass.  It threads a structural-zero boolean mask (``True``
 = structurally zero) through ``program.statements`` in run order, computing a
 mask for every :class:`SymArray` — program inputs, each :class:`Stmt` output,
 and each program output.
 
-Hard rules (obeyed exactly, see the plan):
+Hard rules (obeyed exactly):
 
 * **Structural, never numeric.**  A mask bit is set only when the *algebra*
   guarantees zero — ``simple_zero`` (rational lane) or a literal ``0.0`` (float

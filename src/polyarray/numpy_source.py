@@ -209,12 +209,12 @@ class DeadOpKeyWarning(UserWarning):
     ``pyab.LowerOpts.op_lowerings``) exist so a front end can render ITS ops without polyarray
     importing it. The price is that a key naming nothing is INVISIBLE: the lookup simply misses
     and the caller gets the fallback — which is usually correct, so nothing fails and nothing
-    warns. Seven such keys survived a year in ``batch.py``.
+    warns.
 
     polyarray cannot validate a genuine front-end name (it deliberately cannot see that
-    namespace). It CAN catch the specific spelling that caused every instance so far: a private
+    namespace). It CAN catch the one spelling that can never match: a private
     ``_Name`` for an op that lives in polyarray as ``Name``. Such a key is silently dead —
-    and the fallback kept the results right, which is precisely why nobody noticed.
+    the fallback keeps the results right, so nothing flags the miss.
     """
 
 

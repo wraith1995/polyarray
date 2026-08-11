@@ -37,16 +37,16 @@ without any statement being frozen.
 charged BETWEEN operations) bounds the pass as a whole, and ``max_sym_mass``
 (:data:`_MAX_SYM_MASS`) caps the monomial mass of ONE symbolic op's operands BEFORE it runs.
 The global budget alone is not enough: a single ``np.einsum`` / Gauss pass over object-dtype
-cells runs to completion once started, so a degree-5 element could spend an hour inside one
-uninterrupted op while nominally under budget.  Rejected-by-size and out-of-budget statements
+cells runs to completion once started, so a high-degree program could spend a long time inside
+one uninterrupted op while nominally under budget.  Rejected-by-size and out-of-budget statements
 both degrade to *unresolved* ⇒ the (loud) probe fallback — never a hang, never a guess.
 
-**The budget is DETERMINISTIC — that is the point.**  It used to be wall-clock seconds, which
-made the certificate a property of the machine rather than of the mathematics: the same program
-certified exactly on a quiet box and probe-backed on a loaded one.  Work units are a function
-of the program alone, so a certificate means the same thing everywhere.  A generous wall-clock
-*backstop* survives only to catch a mis-calibrated cost model, and it is loud when it fires
-(:attr:`ExactState.hit_wall_clock`) precisely because it reintroduces machine dependence.
+**The budget is DETERMINISTIC — work units, a function of the program alone, not wall-clock
+seconds, so a certificate is a property of the mathematics rather than the machine.**  The same
+program spends the same units on any box under any load, so a certificate means the same thing
+everywhere.  A generous wall-clock *backstop* exists only to catch a mis-calibrated cost model,
+and it is loud when it fires (:attr:`ExactState.hit_wall_clock`) precisely because it
+reintroduces machine dependence.
 """
 from __future__ import annotations
 
@@ -270,12 +270,10 @@ class _Exhausted(Exception):
 class _Meter:
     """Deterministic work accounting for ONE exact pass.
 
-    The unit is a monomial touched.  `charge` is called where the old code read the clock — at
-    each statement, each exact evaluation/gcd, each Gauss column, each vmap slice, each folded
-    cell — so the granularity of the bound is unchanged; only its currency is.  As before, one
-    already-started flint operation can still overrun: the budget bounds the work *started*,
-    which is why `_MAX_SYM_MASS` (per-op, checked BEFORE the op runs) remains the other half of
-    the cost story and is not replaced by this.
+    The unit is a monomial touched.  `charge` is called at each statement, each exact
+    evaluation/gcd, each Gauss column, each vmap slice, each folded cell.  One already-started
+    flint operation can still overrun: the budget bounds the work *started*, which is why
+    `_MAX_SYM_MASS` (per-op, checked BEFORE the op runs) is the other half of the cost story.
 
     `limit <= 0` means unbounded (used by the calibration harness to measure a full pass).
     """
@@ -464,8 +462,7 @@ def _charge(meter: _Meter | None, units: int) -> None:
 
     The granularity is PER OPERATION: the charge lands before each exact evaluation / gcd /
     Gauss column / vmap slice, so one already-started flint operation can still overrun —
-    accepted; the budget bounds the work *started*, exactly as the wall-clock check it
-    replaces did.  What changed is the currency, not the granularity.
+    accepted; the budget bounds the work *started*.
     """
     if meter is not None:
         meter.charge(units)
@@ -483,7 +480,7 @@ def _constant_value(rf: RationalFunction, meter: _Meter | None = None) -> float 
 
     BUDGET-AWARE: every expensive step (each exact evaluation, the gcd) is CHARGED to the
     meter, which raises :class:`_Exhausted` when the budget is gone — a pathological cell (an
-    enormous uncancelled quintic — the degree-5 regime) must degrade to *unresolved* (⇒ the
+    enormous uncancelled high-degree normal form) must degrade to *unresolved* (⇒ the
     warned probe fallback), never hang the gate.  The charge is this cell's own monomial mass,
     because that is what both the evaluation and the gcd scale with.
     """
@@ -1366,7 +1363,7 @@ def _run_vmap(
 
     Reproduces ``ir.vmap``'s own semantics exactly (slice each batched operand along its
     ``in_axes`` entry, run the body per slice, ``np.stack`` on ``out_axes``), but over exact
-    values, so the certificate no longer stops at the closure boundary.
+    values, so the certificate extends through the closure boundary.
 
     COST IS BOUNDED BEFORE THE LOOP STARTS (the stall rule — an uninterruptible flint op
     ignores any budget): the batched operands' total monomial mass must fit ``max_sym_mass``

@@ -653,8 +653,7 @@ def clear_ring_caches() -> dict[str, int]:
     Because :data:`_FLINT_RING_CACHE`'s key space is unbounded across
     builds (every fresh generator name spawns a fresh context), that
     intern table grows without bound, and each cached context pins its
-    polynomial arena — the multi-GB live data the IR's per-statement
-    ``SymArray.cells`` once referenced.  Dropping only :data:`_FLINT_RING_CACHE`
+    polynomial arena.  Dropping only :data:`_FLINT_RING_CACHE`
     frees nothing: flint's ``_ctx_cache`` keeps every context (hence every
     ring and its polys) alive on its own.  We therefore clear it here too.
     Live polynomials keep their context alive directly, so this stays safe

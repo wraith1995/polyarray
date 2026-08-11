@@ -13,8 +13,8 @@ Live values
     ``RationalFunction | float`` cells plus a back-reference to its
     owning :class:`Program`.  Quacks like a numpy ndarray for read
     access; knows how to extend its program by emitting a :class:`Stmt`.
-    Replaces the former ``SymArray`` / ``Output`` /
-    ``BoundOutput`` triple — there is exactly one type now.
+    It is the single value type: a live symbolic array is always a
+    :class:`SymArray`.
 
 IR structure
     :class:`InputRef`, :class:`OutputRef`, :class:`Const`,
@@ -316,8 +316,8 @@ class SymbolicBudget:
 
     The **deferral gates** below default to full deferral — i.e.
     ``SymbolicBudget()`` (== :meth:`legacy`) fully defers, and
-    that path is a *preserved, first-class budget choice*, not an accident of
-    defaults.  :meth:`build_big_symbols` is the opposite end (budget zero):
+    that path is a *first-class budget choice*.
+    :meth:`build_big_symbols` is the opposite end (budget zero):
     every modeled op stays symbolic so a sampler produces big-symbol IR over
     its vertex / DoF inputs instead of collapsing to numeric Stmts.
 
@@ -425,7 +425,7 @@ class SymbolicBudget:
         structure, this forces every modeled op to
         emit an imperative :class:`Stmt` (no closed-form rational lane), so
         symbolic inputs flow through as deferred Stmts that are
-        simplified afterward (the build-then-simplify novelty).
+        simplified afterward.
 
         * ``naive_inverse_max_size=0`` / ``inverse_max_degree=0`` — every
           ``det`` / ``inverse`` is over-budget ⇒ emits a Stmt.
@@ -597,9 +597,8 @@ class DimAtom:
       - ``("in", input_name, axis)`` — an axis of a dynamic :class:`SymInput`;
         resolved from the provided array's actual shape.
 
-    Backward-compat shim: a bare 2-tuple ``(stmt_idx, out_idx)`` is
-    normalised to ``("stmt", stmt_idx, out_idx)`` so old
-    callers keep working and the key still matches the binder.
+    A bare 2-tuple ``(stmt_idx, out_idx)`` is normalised to
+    ``("stmt", stmt_idx, out_idx)`` so the key matches the binder.
 
     Frozen so it hashes by value (usable as a dict key and in a shape
     tuple alongside concrete ints).
@@ -693,8 +692,8 @@ class OutSpec:
 class SymArray:
     """Cell ndarray attached to a :class:`Program`.
 
-    Unifies the previous ``SymArray`` / ``Output`` / ``BoundOutput``
-    triple into one type.  Cells are ``RationalFunction | float``;
+    The single value type for a symbolic array.  Cells are
+    ``RationalFunction | float``;
     ``program`` is the owning Program (``None`` for standalone literals).
     ``name`` is set when the array is registered as a program output or
     a Stmt-bound output.
@@ -957,7 +956,6 @@ class SymArray:
         A reshape wants no cell VALUES — only a shape. But ``.cells`` auto-unpacks a bulk array
         (one ``unpack`` Stmt materialising every per-cell atom), so ``SymArray(sa.cells.reshape(...))``
         forces the whole tensor to answer a question about its layout.
-        `ReshapeOp` has been in the IR (and rendered by pyab, and degree-transparent) all along.
 
         Bulk in, bulk out: emits one ``ReshapeOp`` Stmt so the chain stays deferred. Non-bulk goes
         through ``_cells`` directly, which is already materialised, so nothing is forced there either.
@@ -1196,8 +1194,7 @@ class SymArray:
     def sqrt(self) -> SymArray:
         """Element-wise sqrt; numeric eager, symbolic emits a 0-d Stmt per cell.
 
-        Restricted to 0-d (scalar) SymArrays — broader
-        broadcasting comes later.
+        Restricted to 0-d (scalar) SymArrays.
         """
         return self._scalar_op(SqrtOp(), "sqrt", float_fn=np.sqrt)
 
@@ -2013,7 +2010,7 @@ def _full_rank(A: np.ndarray) -> bool:
 
 @dataclass(frozen=True)
 class AssertOp:
-    """Passthrough predicate check over bound inputs (the D-scope asserts).
+    """Passthrough predicate check over bound inputs.
 
     Validates ``kind`` against the bound inputs and **returns the first
     input unchanged**, so a downstream consumer data-depends on the assert
@@ -2318,7 +2315,7 @@ def runtime_einsum(
       input and a **bulk** output, returned as a bulk :class:`SymArray`.
       The ``×M`` chain never materialises.
     * materialised symbolic ``lhs`` (RF cells, e.g. geometry atoms) →
-      offload to a per-cell-atom Stmt and return the ndarray, as before
+      offload to a per-cell-atom Stmt and return the ndarray
       (consumed-per-cell intermediates like the φ-jet stay materialised).
     """
     rhs = np.asarray(rhs)
@@ -2869,9 +2866,8 @@ def freeze_array_bulk(
     """Bulk variant: emit a single :class:`Stmt` for the whole tensor.
 
     Equivalent in run-time semantics to :func:`freeze_array` but
-    amortises emit-stmt overhead — for tensors with many cells (e.g.
-    a Lagrange ``source_ref[k]`` shape ``(M, N, d, d)`` with
-    ``N=125``), per-cell freeze costs ~1 ms × N cells in Python
+    amortises emit-stmt overhead — for tensors with many cells,
+    per-cell freeze costs ~1 ms × N cells in Python
     overhead.  ``freeze_array_bulk`` allocates a single Stmt whose
     output is a SymArray of fresh atoms with the same shape; at
     :meth:`Program.run` time the whole tensor is evaluated in one
@@ -3746,7 +3742,7 @@ class Program:
 
         For a *dynamic* bulk output (an axis sized by a :class:`DimAtom`),
         the declared ``_bulk.shape`` is resolved against ``dim_bindings``
-        before validating the produced tensor's shape (B4).
+        before validating the produced tensor's shape.
         """
         if bound._bulk is not None:
             arr = np.asarray(value)

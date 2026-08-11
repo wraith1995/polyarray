@@ -125,7 +125,7 @@ def _coeff_to_float(coeff: CoeffLike) -> float:
     mpf (sympy ``RR``), PythonMPQ / sympy ``Rational`` (sympy ``QQ``
     without python-flint), and ``flint.fmpq`` (sympy ``QQ`` *with*
     python-flint installed — sympy auto-promotes the ground domain in
-    that case, so legacy ``QQ`` callers and the new ``RR`` callers both
+    that case, so ``QQ`` callers and ``RR`` callers both
     converge here).
     """
     if isinstance(coeff, float):
@@ -144,9 +144,8 @@ def _to_qq(coeff: NumericLike | sp.Expr) -> float:
 
     Both backends accept ``float`` in :meth:`Ring.ground_new` /
     :meth:`Ring.from_dict` and coerce it internally to their native
-    ground type (``mpf`` for sympy ``RR``; ``fmpq`` for flint).  We
-    keep the historical name ``_to_qq`` for grep continuity but
-    otherwise the return type is just ``float`` now.
+    ground type (``mpf`` for sympy ``RR``; ``fmpq`` for flint).
+    Returns a plain ``float``.
     """
     if isinstance(coeff, float):
         return coeff
@@ -1042,10 +1041,10 @@ def _compose_poly(
 
     COEFFICIENT EXACTNESS: the source coefficient is passed to the target ring
     NATIVELY (``ground_new`` / ``from_dict`` accept each backend's own ground
-    type — fmpq / RR — unchanged), never round-tripped through ``float``.  The
-    old float round-trip silently rounded any non-double-representable
-    coefficient (e.g. the ``c·0.5625`` produced by a previous compose in a
-    ``compose_multi`` chain), which broke the exact-fold soundness contract:
+    type — fmpq / RR — unchanged), never round-tripped through ``float``.  A
+    float round-trip would silently round a non-double-representable
+    coefficient (e.g. a ``c·0.5625`` produced by an earlier compose in a
+    ``compose_multi`` chain) and break exactness:
     a chained substitution must be exact on exact backends.
     """
     target_names = target.names

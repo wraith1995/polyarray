@@ -274,10 +274,10 @@ def _approx_zero(cell: Cell) -> bool:
     not exact ``0``).
 
     Roundoff is applied ONLY to CONSTANTS: a constant does not vary, so ``|const| < tol`` is genuinely a
-    rounded zero. This is the crucial soundness distinction from the retired numeric probe, which read a
-    SYMBOLIC cell's magnitude at a few generic points — where a tiny-but-nonzero cell gave a WRONG inverse
-    (the 5e20 wrong-inverse bug). A parameter-dependent ``RationalFunction`` stays EXACT (``simple_zero``, no
-    roundoff, no sampling). Guarded end-to-end by the numeric-vs-symbolic backstop.
+    rounded zero. Reading a SYMBOLIC cell's magnitude at a few generic points would be unsound — a
+    tiny-but-nonzero cell would test as zero and give a WRONG inverse — so a parameter-dependent
+    ``RationalFunction`` stays EXACT (``simple_zero``, no roundoff, no sampling). Guarded end-to-end by the
+    numeric-vs-symbolic backstop.
     """
     if simple_zero(cell):
         return True
@@ -426,11 +426,10 @@ def _resolve_mask(matrix: SymArray, mask: np.ndarray | None) -> np.ndarray:
     nonzero cell (at worst it is conservative — dense — when it cannot prove a cell zero, which is always
     safe: a denser mask only makes the block split less aggressive, never wrong).
 
-    The numeric probe ``_structural_mask`` is UNSOUND and NO LONGER the default: it marks a cell zero when
+    The numeric probe ``_structural_mask`` is UNSOUND and is NOT the default: it marks a cell zero when
     it is merely SMALL (< ``_MASK_TOL``) at a few sample points, so a *tiny-but-nonzero* cell is dropped
-    and the Schur split silently returns a WRONG inverse (demonstrated on a degree-5 case — the
-    symbolic inverse came out ``5e20`` off the true ``inv(C)``; adding sample points does not help, the cells are tiny at
-    every point). It survives only behind an explicit, self-labelled-unsound opt-in
+    and the Schur split silently returns a WRONG inverse (adding sample points does not help — the cells
+    are tiny at every point). It is available only behind an explicit, self-labelled-unsound opt-in
     (``POLYARRAY_SCHUR_UNSOUND_PROBE_MASK``) for a large matrix whose cancellation-sparsity a sound exact
     fold cannot yet recover — and only ever with the numeric-vs-symbolic backstop watching it.
     """
@@ -472,7 +471,7 @@ def sound_sparsity_mask(matrix: SymArray) -> np.ndarray:
     VISIBLE and used at a point where they are not. :meth:`~polyarray.ir.Program.graft` re-homes a
     matrix by emitting its producing program as one Stmt whose outputs are FRESH ATOMS, one per cell —
     values preserved, but a provably-zero cell becomes an opaque atom that no later reader can prove
-    zero, so the mask of an 18×18 derivative-DOF block goes from 42 nonzeros to a dense 324/324.
+    zero, so a sparse block's mask comes back fully dense.
     Grafting preserves values, so a mask proved before it is still a valid mask of the same matrix
     after; reading it early and passing it forward is how the sparsity survives.
     """
@@ -643,7 +642,7 @@ def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None =
     onto — so a symbolic inverse lowers through a value kernel compiled from that shared program
     rather than leaving Stmts stranded on an ephemeral by-product program. When ``matrix``
     already rides ``program`` (or ``program`` is ``None``, or ``matrix`` is numeric / program-less) this is a
-    no-op and the Stmts emit into ``matrix``'s own program as before (backward compatible). Otherwise the
+    no-op and the Stmts emit into ``matrix``'s own program. Otherwise the
     block-split mask is resolved on ``matrix``'s OWN program FIRST — its inputs are the clean generic-cell
     generators the deterministic structural probe needs — and only then is ``matrix`` GRAFTED onto
     ``program`` (:meth:`Program.graft`): ``matrix``'s cells may reference not only shared input atoms but

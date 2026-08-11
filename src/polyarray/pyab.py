@@ -1296,7 +1296,7 @@ class _Lowerer:
           This is the safe default whenever the scrutinee is NOT a static ``Const``:
           pyab cannot know if the caller will vmap, and the one-hot is universally
           correct (it inherently needs the uniform branch shape that the vmap case has).
-          Branch order matches the ``select_x`` scrutinee domain.
+          Branch order matches the scrutinee domain.
         """
         c = self.core
         if isinstance(scrutinee_ref, Const):
@@ -1500,8 +1500,8 @@ class _Lowerer:
         Arith/``where``/``stack`` only — NO ``linalg.qr`` call, so it neither graph-breaks
         ``torch.compile`` nor calls LAPACK. Returns ``None`` to fall back to a ``linalg.qr`` call.
 
-        Shared by :meth:`_qr` (``QrOp``) and op-carried ``__pyab_lower__`` hooks (e.g.
-        ``QrSignFixOp``) so BOTH avoid the QR graph break. The operand shape is read off the current
+        Shared by :meth:`_qr` (``QrOp``) and op-carried ``__pyab_lower__`` hooks so BOTH avoid
+        the QR graph break. The operand shape is read off the current
         output tuple (``self._current_out``); intercept iff it is statically small (``max(m, n) <=
         small_qr.max_dim``, ``m >= n``) and small-QR is enabled.
         """
@@ -1535,7 +1535,7 @@ class _Lowerer:
 
         A bulk output is read as a WHOLE tensor by its consumers (via ``bulkmap``), so scalarizing it would
         only force an immediate re-stack — no fewer buffers, and it splits what Inductor would otherwise keep
-        as one clean output loop (measured: scalarizing the value kernel's final bulk fold went 2 → 13 loops).
+        as one clean output loop.
         Scalarize only outputs whose consumers read cells (→ scalar Vars) so the tensor never forms.
         """
         if self._scalarize_max <= 0 or shape is None:
@@ -1551,8 +1551,7 @@ class _Lowerer:
     def scalar_grid(self, grid: np.ndarray) -> _ScalarGrid:
         """Wrap an ``np.ndarray`` of scalar exprs as a scalarized output.
 
-        For op-carried ``__pyab_lower__`` hooks — e.g. ``QrSignFixOp`` — to return without
-        importing pyab internals.
+        For op-carried ``__pyab_lower__`` hooks to return without importing pyab internals.
         """
         return _ScalarGrid(grid)
 
@@ -1770,14 +1769,12 @@ class _Lowerer:
         time rather than re-scattered element-wise (nested ``stack`` of per-cell ``_poly_to_ir``
         trees) at every consumption site — the dominant non-bulk codegen blow-up.
 
-        Float arrays go through the same Var now.  They used to fall through ("not worth
-        a Var") because each was a unique object and a cheap single expression; neither
-        holds any more.  ``ConstArrayExpr`` makes the operand one node carrying the whole
-        table, and pyab's CSE only dedupes an expression that is an assignment RHS — an
-        inline operand is re-emitted in full at every use site.  Binding the Var turns
-        those uses into references; pyab's content-addressed CSE then collapses the
-        bindings themselves, so an id-keyed memo here still lands on distinct-by-content.
-        Empty arrays keep falling through (nothing to share).
+        Float arrays go through the same Var.  ``ConstArrayExpr`` makes the operand one
+        node carrying the whole table, and pyab's CSE only dedupes an expression that is an
+        assignment RHS — an inline operand is re-emitted in full at every use site.  Binding
+        the Var turns those uses into references; pyab's content-addressed CSE then collapses
+        the bindings themselves, so an id-keyed memo here still lands on distinct-by-content.
+        Empty arrays fall through (nothing to share).
         """
         arr = np.asarray(cells)
         if arr.size == 0:
@@ -1836,13 +1833,13 @@ class _Lowerer:
         SCALAR leaves when ``cells`` is exactly a natural-order arrangement of existing tensor ``Var``(s).
 
         The scalar-stack form otherwise realises one buffer PER ELEMENT (under ``vmap`` → one copy loop per
-        cell), which dominates the generated code (e.g. the geometry Jacobian is rebuilt element-by-element).
+        cell), which dominates the generated code (the whole array rebuilt element-by-element).
         A view is a single op Inductor folds away. Provably semantics-preserving — every element emitted IS
         the same tensor element. Returns the view expr, or ``None`` to fall back to the scalar stack.
         Two shapes are recognised (else bail):
           (1) every cell is the IDENTITY access of ONE base ``X`` (``cell[idx] == X[idx]``) → ``X[:s0, :s1, …]``.
           (2) 2-D where each COLUMN ``j`` is a whole 1-D base ``X_j`` at indices ``0..m-1`` (symmetrically each
-              ROW) → ``stack([X_0[:m], …], axis=1)`` — the vertex/Jacobian transpose that begins every kernel.
+              ROW) → ``stack([X_0[:m], …], axis=1)``.
         """
         c = self.core
         cells = np.asarray(cells, dtype=object)
@@ -1967,8 +1964,7 @@ def _const_array_expr(core: ModuleType, value: npt.ArrayLike) -> PyExprs:
 
     The element-wise spelling (``ArrayExpr`` over a nested ``TupleExpr`` of
     ``FloatLit``) costs one IR node per entry, which large constant tables make the
-    dominant term in everything downstream: at high degree in 3D it was 96% of the nodes
-    handed to the pyab passes and 84% of the emitted source text. ``ConstArray``
+    dominant term in everything downstream. ``ConstArray``
     carries the raw buffer instead — exact, content-addressed, one node.
     """
     return core.ConstArrayExpr(
@@ -2170,11 +2166,11 @@ def _fold_weighted_einsum(
     component-wise as SCALARS (never stacked into an ``(n_cells, K)`` tensor) and the table sliced at each
     contracted index so the free axes stay ONE tensor.
 
-    This is the fold ``'qab,q->ab'`` at the end of every element-matrix assembly. Stacking the weight into an
+    This is the common ``'qab,q->ab'`` fold. Stacking the weight into an
     ``(n_cells, K)`` buffer forces Inductor to realise it — a fusion boundary that splits the per-cell body
-    into a second loop over cells (measured). Reading it as scalars keeps the whole body in ONE loop. Returns
+    into a second loop over cells. Reading it as scalars keeps the whole body in ONE loop. Returns
     the tensor expr, or ``None`` (no all-contracted operand, or the single-table shape assumption fails) to
-    fall back to :func:`_unroll_einsum`. Handles exactly ONE table operand (the common assembly shape).
+    fall back to :func:`_unroll_einsum`. Handles exactly ONE table operand (the common single-table shape).
     """
     import itertools
     c = low.core

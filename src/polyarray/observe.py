@@ -1,8 +1,8 @@
 """Staged compile observability: measure a stage's IR, log it, warn on it, dump it.
 
 The consumer packages drive a multi-stage compile — enumerate, sample,
-represent, integrate, lower, torch-compile — and every hard bug in this stack has been "some
-stage blew the IR up and we could not see which".  This module is the instrument: a consumer
+represent, integrate, lower, torch-compile — where a stage can blow the IR up without it being
+visible which one did.  This module is the instrument: a consumer
 calls :meth:`CompileTrace.stage` at a boundary with whatever that boundary produced (a
 :class:`~polyarray.ir.Program`, a :class:`~polyarray.ir.SymArray`, an array), and gets a
 :class:`Snapshot` recorded — symbolic mass, operand mass, cell counts, provenance histogram,
@@ -739,8 +739,8 @@ class CompileTrace:
         instrumented boundaries sit inside hot loops: a high-degree element calls `bind-field` ~1000
         times, each
         against a program that has GROWN since the last call, so the analysis cache cannot help
-        and measuring every occurrence made the default level **3.3× slower than no
-        instrumentation at all** (37s → 122s). That is not a tool anyone would leave on.
+        and measuring every occurrence would make the default level far slower than no
+        instrumentation at all.
 
         So below :attr:`Level.DEBUG` the occurrences are sampled geometrically — 1, 2, 4, 8, … —
         giving O(log n) measurements instead of O(n) while keeping FULL fidelity for the small
@@ -1059,8 +1059,7 @@ class CompileTrace:
     def rational_stage(self) -> Snapshot | None:
         """Return the first stage whose degree went infinite — where the IR stopped being polynomial.
 
-        This is the epic's stage-4/stage-6 signature (the pullback ξ going rational, the Faà di
-        Bruno transport).  It is *reported*, never warned about: downstream of a curved geometry
+        It is *reported*, never warned about: downstream of a curved geometry
         it is the expected state, and only its POSITION is informative — a value kernel going
         rational is routine, a reference basis jet going rational is a bug.
         """

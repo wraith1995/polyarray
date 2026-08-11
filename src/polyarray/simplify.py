@@ -1,7 +1,7 @@
 """Post-build partial evaluation of a Program (the `simplify` pass).
 
-First cut: ``fold_numeric`` / ``bind_inputs`` — the numeric-propagation floor
-of "fold_numeric, precisely".
+``fold_numeric`` / ``bind_inputs`` are the numeric-propagation floor of the
+pass.
 
 The pass re-interprets a Program against a *partial* numeric environment,
 seeded by ``bind`` (empty for a bare ``fold_numeric``).  It maintains a growing
@@ -23,7 +23,7 @@ place.  Exactness: ``fold_numeric(p, bind=b).run(rest) == p.run({**b, **rest})``
 Conservative by construction — anything not confidently foldable (bulk / dynamic
 outputs, control-flow ops) is kept symbolic, so the worst case degrades to
 ``copy()``.  A partially-numeric sub-Program / ``CallOp`` Stmt is *descended*
-into (P6): its body is recursively specialized with the numeric operands bound,
+into: its body is recursively specialized with the numeric operands bound,
 shrinking the Stmt to the still-symbolic operands.
 """
 from __future__ import annotations
@@ -151,11 +151,10 @@ def _fold_cells(cells: np.ndarray, known: Mapping[str, float]) -> np.ndarray:
     the fold changes nothing, so the ORIGINAL ``cells`` object is returned unchanged —
     never a fresh copy.  This keeps ``id(cells)`` stable across the fold, which a
     downstream identity-based structural read depends on: a downstream
-    quadrature-degree walker (``polyarray.program_degree``) links a Stmt's producer to its
+    degree walker (``polyarray.program_degree``) links a Stmt's producer to its
     consumer by ``id(ref._cells) == id(out._cells)`` and, on a miss, falls back to scoring
-    the cells' generators by NAME — a fallback that knows FIELD degrees but not the
-    geometry/position generators, so a broken link silently drops the position's degree
-    (the Koszul ``κ = x·`` factor) and under-integrates the result.  A fold
+    the cells' generators by NAME — a fallback that can silently drop a generator's
+    degree and mis-score the result.  A fold
     that substitutes nothing must therefore leave the cell array's identity intact.
     """
     if cells.dtype.kind == "f":
@@ -356,8 +355,8 @@ def _subst_shape(
 ) -> tuple[tuple[Any, ...], bool]:
     """Replace every resolved ``DimAtom`` in ``shape`` with its concrete int.
 
-    Returns ``(new_shape, changed)``.  A ``DimAtom`` not in ``dim_subst`` (a δ
-    from a Stmt that did *not* fold — genuinely data-dependent) passes through
+    Returns ``(new_shape, changed)``.  A ``DimAtom`` not in ``dim_subst`` (from
+    a Stmt that did *not* fold — genuinely data-dependent) passes through
     untouched; concrete entries are unchanged.  ``changed`` lets callers avoid
     rebuilding shared frozen objects when nothing was substituted.
     """
@@ -380,7 +379,7 @@ def _subst_bulk_symarray(
     """Return a fresh SymArray with its bulk shape's resolved dimensions substituted.
 
     Returns ``sa`` unchanged when there is nothing to substitute. Never mutates in place,
-    since the old bulk handle may be shared.
+    since the existing bulk handle may be shared.
     """
     if sa._bulk is None:
         return sa
@@ -484,7 +483,7 @@ def _try_descend(
     Returns ``(new_fn, new_in)`` when ``s`` has a descendable body, SOME (not
     all, not none) of its operands resolve numeric, and the specialized body
     drops exactly those operands' inputs.  Returns ``None`` to fall back to the
-    plain symbolic ref-fold (today's behaviour) in every other case.
+    plain symbolic ref-fold in every other case.
     """
     info = _descent_body(s.fn)
     if info is None:
@@ -552,12 +551,10 @@ def _vmap_closure_of(fn: StmtOp) -> tuple[StmtOp, Callable[[StmtOp], StmtOp]] | 
 def _drop_unread_inputs(prog: Program) -> Program:
     """``prog`` with every input NO statement and NO output references removed.
 
-    A DEAD input is not a small thing here: it is the only reason a higher-order DOF body is not
-    recognised as a build-time constant. A consumer declares a sub-input for every variable that
-    the binder's BASIS mentions — one of which NAMES a transported frame but is read through a
-    constant inclusion alone — so the closure
-    carries an input it never touches, and the enclosing Stmt therefore has a non-numeric operand
-    and cannot be folded. Dropping it is value-preserving by definition: nothing reads it.
+    A DEAD input can be the only reason an enclosing Stmt does not fold: a closure that
+    declares an input it never reads has a non-numeric operand, so the whole Stmt is kept
+    symbolic even though the input is unused. Dropping it is value-preserving by definition:
+    nothing reads it.
 
     Referencing is decided on ATOMS (:func:`symarray_atoms` over every Stmt operand and every
     output), not on a syntactic scan, so an input reached through a folded cell still counts.
@@ -595,8 +592,8 @@ def _fold_vmap_body(
 
     :func:`_descent_body` deliberately refuses to descend a vmap closure, because swapping the
     closure for the bare body would drop the per-point batching. But the body's INTERNAL Stmts
-    whose inputs are all build-time-numeric — e.g. a QR/SVD frame orthonormalization on a FIXED
-    reference basis, data-INDEPENDENT of the per-point vmap args — can still be folded to
+    whose inputs are all build-time-numeric — e.g. a QR/SVD on a FIXED constant operand,
+    data-INDEPENDENT of the per-point vmap args — can still be folded to
     constants without touching the batching. Recurse the floor-fold into the body; if it folded
     anything away, rewrap the folded body in an equivalent vmap closure. Falls back to ``fn``
     unchanged whenever nothing folds or anything looks off — always a sound no-op degrade
@@ -607,9 +604,8 @@ def _fold_vmap_body(
     **not batched**: the very same array is handed to every slice of the body, so substituting its
     value INTO the body is value-preserving by the definition of ``vmap``, and the batched
     (``in_axes`` integer) operands are untouched. Doing so is what lets the floor-fold see a
-    closed-over operand that the body does not actually read — the higher-order case, where the
-    binder's basis NAMES a frame map that only a constant inclusion is read
-    through, so the whole DOF is a build-time constant hidden behind a closure.
+    closed-over operand that the body does not actually read, so that operand becomes a
+    build-time constant hidden behind a closure.
 
     Returns ``(fn', keep)``: ``keep`` is ``None`` when the operand list is unchanged, else a
     per-operand mask the caller applies (a bound operand is no longer an input of the body, so it
@@ -871,14 +867,13 @@ _PARTIAL_EVAL_MODES = ("exact", "hybrid", "probe")
 
 
 def _resolve_legacy_time_budget(time_budget: float | None) -> float | None:
-    """Translate a legacy ``time_budget=`` into a wall-clock BACKSTOP, loudly.
+    """Translate a ``time_budget=`` into a wall-clock BACKSTOP, loudly.
 
-    ``time_budget`` used to decide what the exact lane folded, in seconds — which is exactly
-    the machine dependence the work budget removed.  It stays ACCEPTED because the
-    committed surface carries it and it has external consumers, but it no longer
-    selects certificates: it now sizes the backstop, i.e. it still guarantees the call
-    terminates, which is the reason callers passed it.  Because the meaning genuinely changed,
-    passing it warns rather than silently doing something else than it used to.
+    ``time_budget`` is ACCEPTED because the committed surface carries it and it has external
+    consumers, but it no longer selects what the exact lane folds — that is ``work_budget``,
+    in deterministic work units.  It sizes the backstop instead: it still guarantees the call
+    terminates, which is the reason callers pass it.  Passing it warns, because it no longer
+    bounds what folds.
     """
     if time_budget is None:
         return None                            # `None` = exact_fold's default backstop
@@ -967,14 +962,14 @@ def _partial_eval_numeric(
       exact-by-construction). Entries that cannot be normalized (opaque ops on the
       symbolic path) are simply NOT folded.
     * ``"hybrid"`` — exact first; statements the exact lane left *unresolved* fall
-      back to the legacy probe pass, and every such non-exact freeze raises one
+      back to the probe pass, and every such non-exact freeze raises one
       aggregated :class:`NonExactFoldWarning`. Statements the exact lane REFUTED
       (provably non-constant) are never probed — this is what closes the
       colluding-probe false-freeze hole.
-    * ``"probe"``  — the legacy behavior, unchanged and silent: ``probes`` random
+    * ``"probe"``  — silent probe-and-freeze: ``probes`` random
       input bindings over ``[0.6, 1.6]``, freeze every Stmt output bit-finite and
       equal (``rtol``/``atol``) across runs. Probabilistic (measure-zero false
-      freezes), NOT exact-by-construction — kept for diagnostic / performance
+      freezes), NOT exact-by-construction — for diagnostic / performance
       call sites that don't need exactness.
 
     Folding is at statement granularity: an intermediate that genuinely varies stays
@@ -1101,11 +1096,11 @@ def partial_eval_numeric(
 
     * ``"exact"``  — exact rational normal form only (:mod:`polyarray.exact_fold`;
       exact-by-construction). Non-normalizable statements are left symbolic.
-    * ``"hybrid"`` (the default) — exact where possible; the legacy probe pass is
+    * ``"hybrid"`` (the default) — exact where possible; the probe pass is
       the fallback for opaque/unresolved statements ONLY, and every probe-based
       freeze raises an aggregated :class:`NonExactFoldWarning` naming the sites.
       Statements the exact lane proved NON-constant are never probe-frozen.
-    * ``"probe"``  — the legacy probe-and-freeze, unchanged and silent
+    * ``"probe"``  — silent probe-and-freeze
       (probabilistic; for diagnostic/performance sites that don't need exactness).
 
     ``mode=None`` reads the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default (else
