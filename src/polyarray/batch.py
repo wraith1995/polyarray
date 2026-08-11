@@ -3,7 +3,7 @@
 ``batched_run(program, values)`` evaluates ``program`` for a whole BATCH of inputs at once — each entry of
 ``values`` carries a leading batch axis of length ``B`` — reproducing ``[program.run(values[b]) for b in
 range(B)]`` in ONE vectorized pass, but without the Python-per-call / per-Stmt interpreter overhead that
-dominates when a program is tiny and run many times (a per-quadrature-point loop).
+dominates when a program is tiny and run many times (a per-sample-point loop).
 
 Two lanes, mirroring :meth:`Program.run`:
 

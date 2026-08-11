@@ -129,7 +129,7 @@ class Provenance:
 
     ``kind`` is one of ``"vertex"``, ``"point"``, ``"coeff"``,
     ``"stmt_out"``.  ``origin`` identifies the source object
-    (a :class:`Geometry`, a basis vector, a :class:`Stmt`, …).
+    (an input source, a basis vector, a :class:`Stmt`, …).
     ``index`` is the position inside that origin (vertex j, query
     point row, coefficient n, output cell index, …).  ``label`` is
     the human-readable name attached to the generator.
@@ -318,8 +318,8 @@ class SymbolicBudget:
     ``SymbolicBudget()`` (== :meth:`legacy`) fully defers, and
     that path is a *first-class budget choice*.
     :meth:`build_big_symbols` is the opposite end (budget zero):
-    every modeled op stays symbolic so a sampler produces big-symbol IR over
-    its vertex / DoF inputs instead of collapsing to numeric Stmts.
+    every modeled op stays symbolic so a front end produces big-symbol IR over
+    its vertex / parameter inputs instead of collapsing to numeric Stmts.
 
     Deferral gates (all default to "defer", == legacy):
 
@@ -327,13 +327,13 @@ class SymbolicBudget:
       multi-operand symbolic einsum offloads to a numeric Stmt.  ``None`` means
       "use the module / ``CHARTLIB_EINSUM_BAG_THRESHOLD`` default" (64) — the
       legacy, env-aware behaviour.  Budget-zero sets it huge (never offload).
-    * ``defer_phi_jet`` — when True (legacy) the single-operand φ-jet einsum
-      (``runtime_einsum``) offloads its object-dtype LHS to a numeric Stmt.
+    * ``defer_phi_jet`` — when True (legacy) the single-operand derivative-expansion
+      einsum (``runtime_einsum``) offloads its object-dtype LHS to a numeric Stmt.
       False keeps the contraction symbolic, so the **parameterization built
-      from the vertex / DoF atoms comes through**.
-    * ``defer_covariant`` — when True (legacy) the order-≥1 covariant chain
-      (``covariant.defer_covariant``) becomes one numeric Stmt.  False keeps it
-      symbolic — heavier (the 3-D high-order blow-up), so it is
+      from the vertex / parameter atoms comes through**.
+    * ``defer_covariant`` — when True (legacy) the order-≥1 derivative chain
+      becomes one numeric Stmt.  False keeps it
+      symbolic — heavier (the high-order blow-up), so it is
       opt-in even at budget zero (``build_big_symbols(retain_covariant=...)``).
     * ``freeze`` — when True (legacy) :func:`freeze_array` caps cell complexity
       by capturing big cells as fresh atoms.  False disables it (retain).
@@ -390,18 +390,18 @@ class SymbolicBudget:
         surface_frame: bool | None = None,
         **overrides: int | bool | None,
     ) -> SymbolicBudget:
-        """Budget-zero: retain the parameterization (chart φ) built from vertices.
+        """Budget-zero: retain the parameterization built from vertices.
 
-        Turns off the φ-jet single-operand offload, raises the multi-operand
+        Turns off the single-operand offload, raises the multi-operand
         einsum threshold so contractions stay symbolic, and disables
         :func:`freeze_array` — so the parameterization comes through as big
-        symbols over the vertex / DoF inputs.
+        symbols over the vertex / parameter inputs.
 
         ``retain_covariant`` (default False) additionally keeps the order-≥1
-        covariant chain symbolic.  It is **not** required merely to see the
+        derivative chain symbolic.  It is **not** required merely to see the
         parameterization, and it is prone to the 3-D high-order blow-up, so it
         is opt-in.  ``surface_frame`` defaults to track
-        ``retain_covariant`` (surface the frame only when the covariant chain is
+        ``retain_covariant`` (surface the frame only when the derivative chain is
         retained).  Extra ``overrides`` are forwarded to the constructor.
         """
         if surface_frame is None:
@@ -2314,9 +2314,9 @@ def runtime_einsum(
       bulk: emit one :class:`EinsumOp` Stmt that takes the whole tensor as
       input and a **bulk** output, returned as a bulk :class:`SymArray`.
       The ``×M`` chain never materialises.
-    * materialised symbolic ``lhs`` (RF cells, e.g. geometry atoms) →
+    * materialised symbolic ``lhs`` (RF cells, e.g. model-input atoms) →
       offload to a per-cell-atom Stmt and return the ndarray
-      (consumed-per-cell intermediates like the φ-jet stay materialised).
+      (consumed-per-cell intermediates like the single-operand einsum stay materialised).
     """
     rhs = np.asarray(rhs)
     if isinstance(lhs, SymArray) and lhs._bulk is not None:
@@ -2466,8 +2466,8 @@ class SwitchOp:
     The Stmt's inputs are ``(scrutinee_int, branch_0, branch_1, …)``;
     at run time the op returns ``branch[int(scrutinee_int)]``.
 
-    Used to lower :meth:`SymbolicInterpreter.select_x` over an
-    :class:`IntAtom` scrutinee: when ``select_x`` is called with an
+    Used to lower a front-end select over an
+    :class:`IntAtom` scrutinee: when the front-end select is called with an
     IntAtom, it eagerly evaluates each branch (so any RF arithmetic
     happens up-front), then emits a single :class:`Stmt` whose ``fn``
     is this op.  The output is a fresh :class:`SymArray` of atoms
@@ -2475,7 +2475,7 @@ class SwitchOp:
 
     Hashable / frozen so :class:`Program.fingerprint` can
     cache compiled forms.  Stateless — the branch ordering matches
-    the canonical orientation order of the entity type at the call
+    the canonical order of the selector's domain at the call
     site.
     """
 
@@ -2939,7 +2939,7 @@ def freeze_array(
 
     The freeze keeps subsequent symbolic arithmetic small.  At
     evaluation time, the captured cell is computed once (against the
-    bound vertex/DoF inputs) and substituted for the atom — same final
+    bound vertex/parameter inputs) and substituted for the atom — same final
     answer, much smaller intermediate expressions.
 
     Returns the (possibly modified) ndarray; the original is not
@@ -3178,7 +3178,7 @@ class Program:
 
     :meth:`copy` returns an independent copy of the program (deep-clones
     state, rebinds back-references on internal SymArrays) so that a
-    sub-:class:`SymbolicInterpreter` can extend without disturbing the
+    sub-front end can extend without disturbing the
     original.
     """
 
@@ -3243,8 +3243,8 @@ class Program:
 
         Re-declaring the same name with the same domain is a no-op
         (returns the existing atom).  A clash with a different domain
-        raises ``ValueError`` — orientation atoms allocated by
-        :meth:`SymbolicInterpreter.int_atom` get a deterministic
+        raises ``ValueError`` — selector atoms allocated by
+        a front-end integer-atom allocation get a deterministic
         domain per cell-type, so a clash indicates a real bug.
         """
         existing = self.int_atoms.get(name)
@@ -3287,13 +3287,13 @@ class Program:
         ``SymArray(foreign.cells, program=self)`` relabel carries the CELLS but strands those producing
         Stmts on the by-product program, so a later lowering of ``self`` references generators ``self``
         never produces ("no binding"). :meth:`graft` instead emits ``foreign.program`` as ONE sub-Program
-        :class:`Stmt` of ``self`` (the same mechanism a lowered DOF body uses to compose onto the
+        :class:`Stmt` of ``self`` (the same mechanism a lowered sub-program body uses to compose onto the
         shared sampling program), whose fresh atom outputs carry ``foreign``'s value on ``self`` — so the
         whole foreign Stmt DAG runs when ``self`` runs/lowers, and the fresh outputs are dedup'd by
         ``self``'s env (several grafts of like-named by-product programs do not collide).
 
         ``foreign.program`` and ``self`` must be built over the SAME shared symbolic inputs (e.g. the
-        cell-vertex atoms of one ``make_symbolic_geometry`` reference): the sub-Program is fed ``foreign``'s
+        cell-vertex atoms of one shared input source): the sub-Program is fed ``foreign``'s
         own input atoms relabeled onto ``self``, so ``self`` resolves their leaf generators (``V_0_0``…) by
         name when it lowers — a generator ``self`` cannot produce surfaces downstream as an unbound generator.
         A program-less ``foreign`` (numeric, or already inline on ``self``) needs no Stmts and is a plain
@@ -3580,8 +3580,8 @@ class Program:
         via the cells' actual generator names (so atom names assigned
         by ``allocate_input``'s fresh suffixing are respected).  Any
         *extra* entry in ``values`` that doesn't match a declared input
-        is treated as a "geometry-side" input (typically a
-        :attr:`Geometry.sym_inputs` entry that flowed in through a
+        is treated as a "model-side" input (typically a
+        symbolic-input entry that flowed in through a
         :class:`SymArrayRef`); those entries are flattened by
         ``f"{name}_{k}"`` per cell of the value, matching the
         convention used by :meth:`SymArray.evaluate`.

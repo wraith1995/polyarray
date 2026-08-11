@@ -713,7 +713,7 @@ class RationalFunction:
 
         Trivial shapes — a ring-one denominator over a numerator that is constant, a pure
         atom, or a scaled atom — cover the dominant majority of cells produced by
-        :meth:`atom`, statement outputs, and constant DOF entries. For those the
+        :meth:`atom`, statement outputs, and constant parameter entries. For those the
         ``compile`` + ``exec`` round-trip is pure overhead, and a plain closure runs at the
         same speed once built.
 

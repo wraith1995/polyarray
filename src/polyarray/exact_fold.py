@@ -9,7 +9,7 @@ certificate that a downstream invariance claim rides on.
 
 * a statement whose resolved operands are all NUMERIC runs its real ``fn`` — the same
   deterministic evaluation ``Program.run`` would perform (the ``fold_numeric``
-  exactness contract), so QR/SVD frame preps on constant reference data stay foldable;
+  exactness contract), so QR/SVD on constant reference data stay foldable;
 * a statement with symbolic operands is executed over exact
   :class:`~polyarray.rational.RationalFunction` cells (flint ``fmpq`` coefficients —
   exact rational arithmetic) through a closed set of RATIONAL op twins: einsum /

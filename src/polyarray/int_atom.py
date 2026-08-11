@@ -5,9 +5,9 @@ from :class:`RationalFunction`, which carries real rational polynomials.
 Its only operation is to be the scrutinee of a :func:`Interpreter.select_x`
 typed switch.
 
-Used by the orientation-aware sampler API so that a symbolic orientation value
-can branch the emitted IR over the canonical orientation order of an
-entity type at run time, without participating in any rational arithmetic.
+Used by a selector-driven API so that a symbolic integer selector value
+can branch the emitted IR over the canonical order of the selector's domain
+at run time, without participating in any rational arithmetic.
 """
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ class IntAtom:
 
     ``name`` is the binding key the runtime uses to look up the atom's
     concrete integer value at evaluation time.  ``domain`` is the range
-    of admissible values — typically ``range(len(automorphism_group))``
-    for an orientation atom.  The dataclass is frozen so it hashes by
+    of admissible values — typically ``range(n)`` for an integer selector
+    over ``n`` cases.  The dataclass is frozen so it hashes by
     value, making it usable as a dictionary key alongside concrete ints.
     """
 

@@ -321,7 +321,7 @@ def _degree_of(program: Program, seed: Mapping[str, float] | None) -> float | No
 
     The default scores every declared input AND every stray generator as degree 1, which makes
     the number a consistent monotone signal across stages without this module needing any
-    finite-element domain knowledge (that seeding lives in the front end's degree estimation, where
+    domain knowledge (that seeding lives in the front end's degree estimation, where
     it belongs).  A caller with a sharper seed — vertices only, say — passes one.
 
     Scoring the *generators* (``gen_deg``), not only the input names, is load-bearing: a stage
@@ -1059,9 +1059,9 @@ class CompileTrace:
     def rational_stage(self) -> Snapshot | None:
         """Return the first stage whose degree went infinite — where the IR stopped being polynomial.
 
-        It is *reported*, never warned about: downstream of a curved geometry
+        It is *reported*, never warned about: downstream of curved model inputs
         it is the expected state, and only its POSITION is informative — a value kernel going
-        rational is routine, a reference basis jet going rational is a bug.
+        rational is routine, a reference-basis derivative expansion going rational is a bug.
         """
         prev_finite = True
         for s in self.snapshots:
@@ -1152,7 +1152,7 @@ def _short(v: object, limit: int = 72) -> str:
     """Render an identifying attribute on one bounded line.
 
     Falls back to ``ClassName(name=…)`` rather than a truncated repr when the repr is long: a
-    clipped repr of a finite element is neither readable nor informative, whereas its class and
+    clipped repr of a program is neither readable nor informative, whereas its class and
     name are exactly what the reader needs.
     """
     text = str(v)

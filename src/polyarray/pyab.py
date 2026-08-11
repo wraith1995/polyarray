@@ -14,8 +14,8 @@ program:
   ``pyarraybackend.backends.torch_backend.compile`` and call ``module.f(...)``.
   :func:`compile_torch` / :func:`compile_numpy` are one-call conveniences.
 
-* **Embedded** — the program is a *per-element kernel* you want to invoke from
-  inside a **larger PyAB program** (e.g. a lowered element kernel
+* **Embedded** — the program is a *per-cell kernel* you want to invoke from
+  inside a **larger PyAB program** (e.g. a lowered kernel
   called by an assembly program).  :func:`call_lowered` emits the callable once
   and a *placed* call at the current build point.  The call site chooses:
 
@@ -1286,7 +1286,7 @@ class _Lowerer:
           exact shape AND dtype (heterogeneous branches are fine; no f64 cast).
 
         * **One-hot vmap-safe default** — for a dynamic/batched scrutinee (an
-          :class:`~polyarray.ir.IntAtomRef` — the per-cell orientation id, a BATCHED
+          :class:`~polyarray.ir.IntAtomRef` — the per-cell selector id, a BATCHED
           integer tensor under ``torch.vmap``) the direct pick's ``int(scrutinee)`` /
           advanced index is illegal (it ``.item()``s a batched tensor). Instead stack
           the ``N`` branches → ``(N, *S)``, build a one-hot ``arange(N) == scrutinee``

@@ -3,7 +3,7 @@
 :func:`program_degree` walks a :class:`~polyarray.ir.Program`'s statement graph and
 propagates a polynomial degree per value from a per-input ``seed``, answering "what
 polynomial degree is the program's output in the seeded variables?" — the question a
-quadrature-order chooser asks. Consumers seed their domain knowledge and get
+degree chooser asks. Consumers seed their domain knowledge and get
 back a single float, ``inf`` meaning "not a polynomial of the seeds" (rational /
 algebraic / unknown — the caller supplies its own order there).
 
@@ -12,7 +12,7 @@ only UNDER-estimation is a correctness bug):
 
 * the AFFINE-CONSTANT short-circuit — if EVERY operand is degree 0 the output is a
   constant function of constants ⇒ degree 0, WHATEVER the op (this is what makes a
-  constant geometry chain — SVD/QR/pinv fed by a constant Jacobian — degree 0 for free);
+  constant-input chain — SVD/QR/pinv fed by a constant matrix — degree 0 for free);
 * ``zero_ops`` — output depends on SHAPES/structure, not values ⇒ 0;
 * ``passthrough_ops`` — reorder / select / additive / scale-by-constant ⇒ MAX(operands);
 * ``multilinear_ops`` — products / contractions ⇒ SUM(operands);

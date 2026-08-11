@@ -186,8 +186,8 @@ def _prov_kind(program: Program, gen: str) -> str:
     """Return the provenance kind of a generator as seen by this program's env.
 
     A generator not declared in ``program.env`` reports ``"extern"``: a free symbol the
-    program receives a binding for at run time, typically a geometry vertex or DoF atom
-    living in the geometry's own env. ``"extern"`` therefore reads as "still symbolic
+    program receives a binding for at run time, typically a vertex or parameter atom
+    living in the input's own env. ``"extern"`` therefore reads as "still symbolic
     over an outside input", the opposite of ``"stmt_out"``.
     """
     p = program.env._provenance.get(gen)

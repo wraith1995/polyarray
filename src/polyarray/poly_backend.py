@@ -634,7 +634,7 @@ def clear_ring_caches() -> dict[str, int]:
     are keyed by generator-name tuple and provide heavy within-build
     reuse (a single symbolic sample re-requests the same union rings
     hundreds of times).  But the key space is unbounded across distinct
-    builds: every new cell / degree / frame / derivative-order combination
+    builds: every new cell / degree / basis / derivative-order combination
     introduces fresh generator names, so a long-lived process that runs
     many distinct builds accumulates one cached ring (plus its pinned
     flint context and cached one/zero/gens wrappers) per distinct key.
