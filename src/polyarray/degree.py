@@ -46,7 +46,7 @@ _INF = float("inf")
 
 # polyarray's native op degree categories, keyed by the class OBJECT rather than its
 # name: a renamed or relocated builtin then breaks loudly at import instead of falling
-# through to "unknown op" ⇒ `inf` degree ⇒ a wrong quadrature order.
+# through to "unknown op" ⇒ `inf` degree ⇒ a wrong sample-point order.
 # Every Stmt.fn op class in `ir` must appear here (guarded by tests/test_degree_coverage.py).
 #   zero        — output depends on SHAPES/structure, not values      ⇒ 0
 #   passthrough — reorder / select / additive / scale-by-constant     ⇒ MAX(operands)

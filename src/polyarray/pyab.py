@@ -1089,7 +1089,7 @@ class _Lowerer:
         if bound._bulk is not None:
             # A whole-tensor (bulk) output is read via ``bulkmap`` (not per-cell atoms), so assemble the grid
             # into one stacked tensor there. This is the single unavoidable materialisation of a scalarized
-            # output that flows on as a bulk tensor (e.g. the value kernel's final block).
+            # output that flows on as a bulk tensor (e.g. the kernel's final block).
             self.bulkmap[bound._bulk.name] = self.b.assign_new(self._stack_grid(gvars), base=f"{base}_bulk")
             return
         for idx in (np.ndindex(*cells.shape) if cells.shape else [()]):
@@ -1642,9 +1642,9 @@ class _Lowerer:
         self.helpers[key] = name  # reserve before recursing
         # Params = the sub-program's own inputs, THEN its `int_atoms` (switch scrutinees) as trailing
         # params — mirroring the top-level lowering (`as_function_def`: inputs then int_atoms). Without
-        # this a grafted sub-Program carrying an `o_<flat_id>` σ scrutinee lowers with an empty
+        # this a grafted sub-Program carrying an `o_<flat_id>` selector scrutinee lowers with an empty
         # `intatom_exprs` and its `IntAtomRef` KeyErrors; the caller threads the scrutinee in
-        # (`_call_subprogram`), so a merged value kernel can carry per-DOF orientation switches.
+        # (`_call_subprogram`), so a merged kernel can carry per-parameter selector switches.
         params = tuple(c.Param(name=_safe(inp.name)) for inp in prog.inputs)
         params += tuple(c.Param(name=_safe(a)) for a in prog.int_atoms)
         input_exprs = {

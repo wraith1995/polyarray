@@ -252,10 +252,10 @@ class RationalFunction:
         # Canonicalise structural zero: ``0/d == 0/1`` for any nonzero
         # ``d``.  Without this the denominator accumulates dead weight
         # through chains of multiplications that produce a zero
-        # numerator (e.g. Faà di Bruno on an affine chart, where
+        # numerator (e.g. a derivative expansion over the parameterization, where
         # ``D²f == 0`` but the contraction's denominator inherits a
-        # ``det(J)``-like polynomial).  Observed on
-        # ``Lagrange(orthonormal)/tetrahedron/n_derivs=2``: 36 cells
+        # constant-matrix-like polynomial).  Observed on a degree-2
+        # derivative expansion of one kernel: 36 cells
         # carrying ``num=0`` and ``den`` with 10147 terms each — pure
         # eval-time waste since the cell is identically zero.
         if coeff_zero(num):
@@ -413,14 +413,15 @@ class RationalFunction:
     def __add__(self, other: Operand) -> RationalFunction:
         # Short-circuit on either operand being zero — saves the
         # ``_coerce`` / ``_aligned`` / ring-arithmetic cost in the
-        # ``Σ ... + ...`` accumulators that drive ``compose_jets`` and
+        # ``Σ ... + ...`` accumulators that drive the single-operand
+        # (derivative-expansion) einsum and
         # ``np.einsum`` over object dtype.  Same algebraic identity as
         # ``a + 0 = a`` and ``0 + b = b``; no backend dispatch.
         if coeff_zero(self._num):
             # ``0 + other = other``.  Return ``other`` in its *own* ring
             # rather than lifting it into ``join(self, other)``: the lift
             # (``_flint_lift`` rebuilding monomial-by-monomial) is the
-            # dominant cost in order-3 covariant accumulators, where most
+            # dominant cost in order-3 higher-order-derivative accumulators, where most
             # addends are structurally zero (sparse Christoffel / derivative
             # tensors).  Mirrors the ``0 * other`` short-circuit below.
             # Ring mixing is resolved lazily by the next non-zero operation.

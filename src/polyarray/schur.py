@@ -147,7 +147,7 @@ def _deferred_matmul(*arrs: SymArray, masks: tuple[np.ndarray, ...] | None = Non
         if program is not None and big and not numeric:
             # A TYPED matmul op (2-D einsum `ij,jk->ik`), NOT an opaque ``lambda a, b: a @ b``: the typed op
             # lowers through EVERY backend — ``Program.run`` (numeric), ``to_numpy_source``, AND
-            # ``pyab``/torch (a grounded-symbolic matrix compiled into a vmapped value kernel) — where
+            # ``pyab``/torch (a grounded-symbolic matrix compiled into a vmapped kernel) — where
             # an opaque python callable raises "no lowering for op 'function'".
             (out,) = program.emit_stmt(
                 EinsumStmtOp(spec="ij,jk->ik"),
@@ -181,7 +181,7 @@ def _base_inverse(arr: SymArray) -> SymArray:
     if program is not None and not arr.is_numeric and n >= _defer_thresholds()[1]:
         # A TYPED ``InvOp`` (the SAME op :meth:`SymArray.inverse` defers to), NOT an opaque
         # ``lambda a: np.linalg.inv(a)``: lowers through Program.run / to_numpy_source / pyab-torch alike,
-        # so a grounded-symbolic matrix compiles into a vmapped value kernel (an opaque callable cannot).
+        # so a grounded-symbolic matrix compiles into a vmapped kernel (an opaque callable cannot).
         (out,) = program.emit_stmt(
             InvOp(),
             [arr],

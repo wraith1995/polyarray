@@ -86,9 +86,9 @@ type Index = int | slice | np.ndarray | Sequence[int] | tuple[int | slice | np.n
 # Ambient budget override
 # ---------------------------------------------------------------------------
 # A `Program` built with no explicit `budget=` consults this context. It lets a
-# caller (e.g. a sparsity mask) request the non-deferred, inline-covariant
-# symbolic lane for the SHARED sampling program — so the covariant/φ-jet chain is
-# built inline over the vertices (not deferred to `out_cov`/`phi_jet` Stmts) — without
+# caller (e.g. a sparsity mask) request the non-deferred, inline higher-order
+# symbolic lane for the SHARED sampling program — so the derivative chain / single-operand
+# einsum is built inline over the vertices (not deferred to `out_cov`/`phi_jet` Stmts) — without
 # threading a budget through every builder (a front end never references it).
 _BUDGET_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
     "_pa_budget_override", default=None
@@ -343,11 +343,11 @@ class SymbolicBudget:
     inverse_max_degree: int | None = None
     cancel_num_dom: bool = False
     iszero_tol: float = 0.0
-    # Retention knob: when True, the covariant frame conversion (orthonormal /
+    # Retention knob: when True, the higher-order derivative chain frame conversion (orthonormal /
     # euclidean) is applied OUTSIDE the deferred numeric Stmt, so Q / R / R⁻¹
     # come through as visible QrSignFixOp atoms (the frame conversion is the
     # last step).  Default False keeps the full-deferral (cheap; the whole
-    # covariant chain incl. frame is one numeric Stmt).  Surfacing the frame
+    # derivative chain incl. frame is one numeric Stmt).  Surfacing the frame
     # reintroduces order-≥2 symbolic cost on 3-D cells, so it is opt-in — the
     # knob the budget-zero "build big symbols" mode flips on.
     surface_frame: bool = False
@@ -1259,19 +1259,17 @@ def _program_budget(program: Program | None) -> SymbolicBudget:
 #
 # Each op is a frozen, hashable dataclass with a ``__call__`` that runs the
 # modeled numpy operation on the bound *numeric* operands at ``Program.run``
-# time — the same shape as the pre-existing :class:`EinsumOp` / :class:`SwitchOp`
-# / :class:`covariant.QrSignFixOp`.  Promoting the linalg / scalar deferrals from
-# bare ``np.linalg.*`` callables (which the SymArray methods previously stored as
-# ``Stmt.fn``) to these typed ops is behaviour-preserving — the numeric result is
-# identical — but gives the IR typed, inspectable nodes with a stable hashable
-# identity (the hook the future ``fingerprint`` / partial-eval transform needs to
-# recognise a linalg / structural node without ``is np.linalg.det`` sniffing).
+# time — the same shape as :class:`EinsumOp` / :class:`SwitchOp`.  Modeling the
+# linalg / scalar deferrals as typed ops rather than bare ``np.linalg.*``
+# callables in ``Stmt.fn`` gives the IR typed, inspectable nodes with a stable
+# hashable identity (the hook a partial-eval transform needs to recognise a
+# linalg / structural node without ``is np.linalg.det`` sniffing).
 #
 # ``TensordotOp`` / ``MoveaxisOp`` are the contraction / structural surface the
-# covariant frame conversion applies to symbolic data today (``covariant.py``
-# ``_apply_per_slot`` runs them *inline on object cells* — the rational lane).
+# higher-order derivative chain frame conversion applies to symbolic data (run
+# *inline on object cells* — the rational lane).
 # They are added here as round-trip-tested vocabulary but are NOT yet emitted by
-# any sampler: turning those inline contractions into deferred numeric Stmts is a
+# any front end: turning those inline contractions into deferred numeric Stmts is a
 # symbolic→numeric deferral decision, deferred (budget-zero) and
 # gated on flagging it first.
 
@@ -2140,7 +2138,7 @@ class MoveaxisOp:
 # run on the bound *numeric* operands at :meth:`Program.run` time (the same
 # contract as every other Stmt fn), so the wrapped functions see floats, not
 # symbolic cells.  Like ``TensordotOp`` / ``MoveaxisOp`` they are round-trip-
-# tested vocabulary — not yet emitted by any sampler; Plan C's Monte-Carlo demo
+# tested vocabulary — not yet emitted by any front end; Plan C's Monte-Carlo demo
 # is the intended first exerciser.
 #
 # Note: a sub-:class:`Program` can already be a ``Stmt.fn`` directly (``_run_stmt``
@@ -2331,9 +2329,9 @@ def runtime_einsum(
     lhs = np.asarray(lhs)
     if program is None or lhs.dtype != object:
         return np.einsum(spec, lhs, rhs)
-    # Budget-zero retention: keep the φ-jet contraction symbolic over its object
-    # cells (vertex / DoF atoms) so the parameterization comes through built from
-    # vertices, instead of offloading the LHS to a numeric Stmt.
+    # Budget-zero retention: keep the single-operand (derivative-expansion) einsum
+    # contraction symbolic over its object cells (vertex / parameter atoms) so the
+    # parameterization comes through built from vertices, instead of offloading the LHS to a numeric Stmt.
     if not program.budget.defer_phi_jet:
         return np.einsum(spec, lhs, rhs)
     sa = SymArray(lhs, program=program)
@@ -3211,7 +3209,7 @@ class Program:
         self.statements: list[Stmt] = []
         self.outputs: dict[str, SymArray] = {}
         # An explicit `budget=` always wins; otherwise consult the ambient `budget_override`
-        # context (a sparsity mask requests the inline-covariant lane), else the default.
+        # context (a sparsity mask requests the inline higher-order-derivative lane), else the default.
         self.budget: SymbolicBudget = (
             budget if budget is not None
             else (_BUDGET_OVERRIDE.get() or SymbolicBudget())
@@ -3317,7 +3315,7 @@ class Program:
         view.outputs = {"grafted": SymArray(foreign.cells, program=view, name="grafted")}
         # Operands feeding the sub-Program's inputs (by position): each is `src`'s own input atoms RELABELED
         # onto `self`. The two programs are BUILT OVER THE SAME shared symbolic inputs (e.g. the cell-vertex
-        # atoms of one ``make_symbolic_geometry`` reference), so `src`'s input generators (``V_0_0``…) are the
+        # atoms of one shared input source), so `src`'s input generators (``V_0_0``…) are the
         # SAME names `self` produces — `self` resolves them by name when it lowers, without `self` needing to
         # DECLARE those inputs itself (its own value kernel binds them at compile). A `src` input whose
         # generators `self` cannot produce is a genuine mismatch, caught downstream as an unbound generator.
@@ -3594,7 +3592,7 @@ class Program:
                 raise KeyError(f"missing value for input {inp.name!r}")
             # Dynamic (DimAtom-sized) inputs are bulk; their whole-tensor value
             # and DimAtom axis sizes are bound in build_runtime_bindings (C3),
-            # not per-cell here.  Mark declared so the geometry-side fallthrough
+            # not per-cell here.  Mark declared so the model-inputs-side fallthrough
             # below leaves them alone, and skip the static per-cell binding.
             if is_dynamic(inp.shape):
                 continue

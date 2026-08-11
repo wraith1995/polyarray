@@ -73,7 +73,7 @@ _ENV_CELLS = "FEM_OBSERVE_CELLS_CEILING"
 _ENV_DEGREE = "FEM_OBSERVE_DEGREE_CEILING"
 
 # Warning thresholds.  Generous on purpose: a warning must be signal, not noise.  These are the
-# "this stage is already pathological" marks, not "this stage is big" — a high-degree value kernel
+# "this stage is already pathological" marks, not "this stage is big" — a high-degree kernel
 # legitimately carries tens of thousands of monomials.  Tunable per run via the env vars above.
 _MASS_CEILING = 250_000        # Σ monomials over symbolic OUTPUT cells
 _OPERAND_CEILING = 1_000_000   # Σ monomials over non-bulk RF OPERAND cells (the real lowering cost)
@@ -81,8 +81,8 @@ _CELLS_CEILING = 16_384        # symbolic output cells (the eager per-cell scatt
 _DEGREE_CEILING = 24.0         # polynomial degree in the program's inputs
 
 # A stage whose operand mass multiplies by more than this over its parent is a *jump* — the
-# blow-up signature the epic is built to surface (pullback ξ going rational, Faà di Bruno
-# transport).  Growth is normal; an order of magnitude in one stage is not.
+# blow-up signature this module is built to surface (an operation going rational, a
+# higher-order derivative chain).  Growth is normal; an order of magnitude in one stage is not.
 _JUMP_FACTOR = 10.0
 _JUMP_FLOOR = 10_000           # below this absolute mass a jump is uninteresting
 
@@ -439,7 +439,7 @@ def _measure(obj: Observable, degree_seed: Mapping[str, float] | None) -> Measur
         )
     if isinstance(obj, np.ndarray):
         if obj.dtype == object:
-            # An object array of RationalFunctions — the pre-SymArray shape a sampler hands
+            # An object array of RationalFunctions — the pre-SymArray shape a front end hands
             # back.  Weigh the cells directly; this is the same accounting `_symarray_cells`
             # does, without a program to attribute it to.
             from .ir import _cell_size
@@ -457,10 +457,10 @@ def _measure(obj: Observable, degree_seed: Mapping[str, float] | None) -> Measur
                                symbolic_cells=sym, max_cell=mx, shape=tuple(obj.shape))
         return Measurement(kind="array", n_output_cells=int(obj.size), shape=tuple(obj.shape))
     if isinstance(obj, (list, tuple)):
-        # A stage that produced several artefacts (a front end's `entries`, a jet's per-order arrays).
+        # A stage that produced several artefacts (a front end's `entries`, a derivative-expansion's per-order arrays).
         # Sum the parts so the stage still reports one honest total.
         parts = [_measure(o, degree_seed) for o in obj]
-        # Propagate the program identity when every part came off the SAME program (a jet's
+        # Propagate the program identity when every part came off the SAME program (a derivative-expansion's
         # per-order arrays do), so the roll-up can still tell that repeated occurrences are
         # views of one growing program rather than independent work.
         pids = {p.program_id for p in parts if p.program_id is not None}
@@ -863,10 +863,10 @@ class CompileTrace:
                 f"{m.symbolic_cells} symbolic cells > {_int_env(_ENV_CELLS, _CELLS_CEILING)} "
                 "(eager per-cell scatter?)")
         # A FINITE degree above the ceiling is a real signal.  An INFINITE one is not: the degree
-        # walk returns inf for any rational/algebraic op on a seed, and a non-affine value kernel
-        # legitimately contains both (the measure's sqrt, the 1/det of an inverse pullback).  So
+        # walk returns inf for any rational/algebraic op on a seed, and a non-affine kernel
+        # legitimately contains both (a sqrt, the 1/det of an inverse).  So
         # `inf` here means "not a polynomial in the inputs", which is the normal state of affairs
-        # downstream of geometry — warning on it would fire on every curved compile and train the
+        # downstream of the model inputs — warning on it would fire on every curved compile and train the
         # reader to ignore the warnings.  It is reported in the table instead
         # (:meth:`rational_stage` names where it first happened, which IS the interesting part).
         if (m.degree is not None and m.degree != _INF
@@ -936,7 +936,7 @@ class CompileTrace:
         """
         if obj is None or key in self._program_text:
             return
-        # A stage may hand over a SEQUENCE of artefacts (a front end's per-match outputs, a jet's
+        # A stage may hand over a SEQUENCE of artefacts (a front end's per-match outputs, a derivative-expansion's
         # per-order arrays). Render the first one that carries a program and say how many there
         # were, rather than silently writing nothing.
         note = ""
@@ -1138,7 +1138,7 @@ def describe_value(x: object, *, _depth: int = 0) -> str:
     for attr in ("element", "degree", "order"):
         v = getattr(x, attr, None)
         if v is not None and not isinstance(v, np.ndarray) and not callable(v):
-            # BOUNDED. A finite element's repr carries its whole Σ (every DOF functional's PTEM),
+            # BOUNDED. A kernel's repr carries its whole Σ (every coefficient functional's PTEM),
             # which runs to thousands of characters and buries the rest of the line — the same
             # failure as dumping a numeric matrix. Identify it, don't transcribe it.
             bits.append(f"{attr}={_short(v)}")

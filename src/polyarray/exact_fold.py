@@ -1161,8 +1161,8 @@ def _sym_apply_builtin(
         # `f(select_x(a,[x,y]), c)` → `select_x(a,[f(x,c), f(y,c)])` — is a program REWRITE, not
         # something a per-op twin can do, and is deliberately left out of this pass.
         #
-        # Why it matters: an orientation-sign switch can be moved from the folded OUTPUT to the geometry
-        # INPUTS, i.e. UPSTREAM of the whole body. Without (a), every orientation-carrying expression would meet
+        # Why it matters: a selector-sign switch can be moved from the folded OUTPUT to the model
+        # INPUTS, i.e. UPSTREAM of the whole body. Without (a), every selector-carrying expression would meet
         # an unfoldable node first and degrade to probes — trading a `QrOp` removed from the
         # dependency path for a `SwitchOp`.
         branches = args[1:]
