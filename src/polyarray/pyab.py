@@ -2678,7 +2678,7 @@ def lower_program_into(
 
     ``arg_exprs`` are the PyAB exprs bound to the program inputs (in
     declaration order).  Statements are emitted into ``builder``; any
-    sub-program / vmap helper ``def``s are returned separately (they must be
+    sub-program / vmap helper ``def`` blocks are returned separately (they must be
     placed at an enclosing scope, before the statements that use them).
 
     Returns ``(helper_defs, output_exprs)`` — one expr per program output.

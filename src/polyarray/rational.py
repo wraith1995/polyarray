@@ -1229,16 +1229,20 @@ def _as_rf(value: Operand) -> RationalFunction:
 def schur_inverse(matrix: np.ndarray, top_left: int) -> np.ndarray:
     """Block-``2x2`` Schur-complement inverse with ``top_left`` rows in the upper block.
 
-    For
-    ``M = [[A, B], [C, D]]`` with ``A`` square of size ``top_left``,
+    For ``M = [[A, B], [C, D]]`` with ``A`` square of size ``top_left``.
 
     Returns
     -------
-    ``M^{-1}`` via
-    ``S = D - C A^{-1} B``,
-    ``[[A^{-1} + A^{-1} B S^{-1} C A^{-1}, -A^{-1} B S^{-1}],
-       [-S^{-1} C A^{-1}, S^{-1}]]``.
-    Raises ``ZeroDivisionError`` if ``A`` is structurally singular.
+    np.ndarray
+        ``M^{-1}`` via ``S = D - C A^{-1} B``::
+
+            [[A^{-1} + A^{-1} B S^{-1} C A^{-1}, -A^{-1} B S^{-1}],
+             [-S^{-1} C A^{-1},                  S^{-1}]]
+
+    Raises
+    ------
+    ZeroDivisionError
+        If ``A`` is structurally singular.
     """
     arr = np.asarray(matrix, dtype=object)
     n, m = arr.shape

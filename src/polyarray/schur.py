@@ -4,7 +4,7 @@ The dense :meth:`SymArray.inverse` (cofactor ≤ ``naive_inverse_max_size``, els
 blows up on a *structurally sparse* symbolic matrix — a 6×6 whose off-diagonal block is structurally zero
 still pays the 720-term cofactor determinant, and a larger one falls to a numeric Stmt instead of a
 ``RationalFunction`` inverse. This module exploits the sparsity: when the matrix is (after a row reordering)
-block lower-triangular, the Schur recursion
+block lower-triangular, the Schur recursion::
 
     [A 0; C D]⁻¹ = [A⁻¹ 0; −D⁻¹·C·A⁻¹  D⁻¹]
 
@@ -23,6 +23,7 @@ float-cell (numeric) block short-circuits to numpy arithmetic. (Ported from orac
 pure SymArray algebra, so its home is polyarray; element drivers consume it from here.)
 
 Driver structure:
+
 1. diagonal / ≤ ``BASE`` → direct (reciprocal / ``cofactor_inverse``);
 2. else reorder rows by support (``_by_row_zeros``), choose the split maximizing the zero block
    (``_choose_split``), recurse on the two diagonal blocks, combine, and undo the reordering.
@@ -652,8 +653,8 @@ def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None =
     ``grass_dof`` Stmts), so a bare relabel would strand those; the graft emits ``matrix``'s program as a
     sub-Program Stmt of ``program`` (fresh dedup'd outputs). The recursion's own deferred leaf-inverse /
     Schur-combine Stmts (``schur_inverse``/``schur_matmul``) then emit natively onto ``program`` (mask
-    threaded so it never re-probes on the shared program), and several elements' ``P(T)``s grounded on one
-    shared program do not collide.
+    threaded so it never re-probes on the shared program), and several elements' ``P(T)`` matrices grounded
+    on one shared program do not collide.
     """
     M = matrix if isinstance(matrix, SymArray) else SymArray(matrix)
     if program is not None and M.program is not None and M.program is not program:

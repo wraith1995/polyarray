@@ -91,24 +91,26 @@ Exploiting structure: a symbolic inverse
 ----------------------------------------
 
 ``symbolic_inverse`` is the sparsity-aware inverse. Given a matrix that is
-structurally block-triangular -- here the top-right entry is a structural zero --
-it inverts block by block with a Schur procedure, so the result is a small
-rational function in each cell and the zero block is preserved rather than filled
-in. (In a real pipeline these matrices come from the algebra layers above
-polyarray; the array is built by hand here only to keep the example short.)
+structurally block-triangular, it inverts block by block with a Schur procedure,
+so the result is a small rational function in each cell and the zero block is
+preserved rather than filled in. Here the matrix is a symbolic input with its
+top-right entry marked a structural zero by ``mask_zeros`` -- the same sparsity
+the inverse then exploits.
 
 .. doctest::
 
    >>> import numpy as np
-   >>> from polyarray import RationalFunction, SymArray, symbolic_inverse
-   >>> x = RationalFunction.atom("x")
-   >>> one, zero = RationalFunction.constant(1.0), RationalFunction.constant(0.0)
-   >>> M = SymArray(np.array([[x + one, zero], [x, one + one]], dtype=object))
-   >>> inv = symbolic_inverse(M)
+   >>> from polyarray import Program, SymInput, Provenance, mask_zeros, symbolic_inverse
+   >>> prog = Program("m", inputs=[SymInput("A", (2, 2), Provenance("vertex", "A", (), "A"))])
+   >>> mask = np.array([[True, False], [True, True]])   # the top-right entry is zero
+   >>> tri = mask_zeros(prog.input("A"), mask)
+   >>> inv = symbolic_inverse(tri)
    >>> print(inv.cells[0, 0])
-   1/(x + 1)
+   1/A_0_0
    >>> print(inv.cells[0, 1])
    0
+   >>> print(inv.cells[1, 0])
+   -A_1_0/(A_0_0*A_1_1)
 
 Partial evaluation
 ------------------

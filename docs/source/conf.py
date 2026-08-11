@@ -48,6 +48,11 @@ autodoc_default_options = {
     "member-order": "bysource",
 }
 autodoc_typehints = "description"
+
+# A frozen dataclass with several fields (e.g. SimplifyBudget) renders as one
+# long signature line; wrap any signature past this width to one parameter per
+# line so the reference stays readable.
+python_maximum_signature_line_length = 72
 autodoc_type_aliases = {
     "Cell": "polyarray.ir.Cell",
     "Ref": "polyarray.ir.Ref",
@@ -76,3 +81,24 @@ html_title = "polyarray"
 # Nothing is mocked: the workspace venv holds the whole stack, and mocking a
 # module sympy probes for at import time breaks the build rather than helping.
 autodoc_mock_imports: list[str] = []
+
+
+def _skip_member(app, what, name, obj, skip, options):
+    """Keep the reference to the public surface.
+
+    Private members (leading underscore) are internal; and a module-level type
+    alias (e.g. ``Monom = tuple[int, ...]``) renders as a class whose ``tuple``
+    signature autodoc cannot format, so it belongs inline in the module
+    docstring rather than as its own stub.
+    """
+    import types
+
+    if name.startswith("_"):
+        return True
+    if isinstance(obj, types.GenericAlias):
+        return True
+    return skip
+
+
+def setup(app):
+    app.connect("autodoc-skip-member", _skip_member)

@@ -1389,19 +1389,30 @@ class GSvdOp:
     the four-fundamental-subspace (FFS) blocks at the numerical ``rank``
     (``δ_f``), exactly as in `50 §A1`/`§A5`:
 
-    =======  ===============================  ========================
-    output   columns                          FFS block / property
-    =======  ===============================  ========================
-    ``U``    first ``rank`` cols of the        **image** basis of ``A`` in
-             codomain factor                   ``W``; ``Uᵀ M_W U = I``
-    ``UI``   remaining ``|W|−rank`` cols        **coker** basis (``M_W``-⊥
-                                               complement of the image)
-    ``V``    first ``rank`` cols of the        **coimg** basis of ``A`` in
-             domain factor                     ``V``; ``Vᵀ M_V V = I``
-    ``VI``   remaining ``|V|−rank`` cols        **ker** basis (``A·VI ≈ 0``)
-    ``S``    descending singular values        the ``rank`` nonzero ones lead
-    ``rank`` 0-d int ndarray                   numerical rank ``δ_f``
-    =======  ===============================  ========================
+    .. list-table::
+       :header-rows: 1
+
+       * - output
+         - columns
+         - FFS block / property
+       * - ``U``
+         - first ``rank`` cols of the codomain factor
+         - **image** basis of ``A`` in ``W``; ``Uᵀ M_W U = I``
+       * - ``UI``
+         - remaining ``|W|−rank`` cols
+         - **coker** basis (``M_W``-⊥ complement of the image)
+       * - ``V``
+         - first ``rank`` cols of the domain factor
+         - **coimg** basis of ``A`` in ``V``; ``Vᵀ M_V V = I``
+       * - ``VI``
+         - remaining ``|V|−rank`` cols
+         - **ker** basis (``A·VI ≈ 0``)
+       * - ``S``
+         - descending singular values
+         - the ``rank`` nonzero ones lead
+       * - ``rank``
+         - 0-d int ndarray
+         - numerical rank ``δ_f``
 
     Both ``U`` (``=[U|UI]``) and ``V`` (``=[V|VI]``) are returned as the
     leading (image / coimg) blocks only; ``UI`` / ``VI`` carry the
@@ -3126,10 +3137,10 @@ class Stmt:
     used purely to splice rational expressions — *this is rare*) or a
     sub-:class:`Program`.
 
-    ``in_`` is a list of :class:`Ref`s describing where this Stmt's
+    ``in_`` is a list of :class:`Ref` objects describing where this Stmt's
     inputs come from.
 
-    ``out`` is a tuple of :class:`SymArray`s — one per fn return, in
+    ``out`` is a tuple of :class:`SymArray` objects — one per fn return, in
     fn-return order.  Each SymArray's cells are fresh atom RFs
     allocated on the program's :class:`SymbolEnv`.
 
@@ -3340,13 +3351,13 @@ class Program:
         Allocates one fresh atom RF per cell of every declared output
         shape on ``self.env`` (provenance ``"stmt_out"``), builds the
         Stmt, appends it to :attr:`statements`, and returns a tuple of
-        :class:`SymArray`s back-referenced to ``self``.  Downstream
+        :class:`SymArray` objects back-referenced to ``self``.  Downstream
         rational arithmetic uses the returned cells as ordinary
         RationalFunction generators — that is how rational-valued code
         *after* an imperative statement keeps being rational.
 
-        Inputs that are bare :class:`SymArray`s are auto-wrapped in
-        :class:`SymArrayRef`.  Inputs that are already :class:`Ref`s
+        Inputs that are bare :class:`SymArray` objects are auto-wrapped in
+        :class:`SymArrayRef`.  Inputs that are already :class:`Ref` objects
         flow through verbatim.
 
         Raises :class:`ValueError` if ``fn`` is ``None`` (use

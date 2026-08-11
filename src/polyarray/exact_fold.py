@@ -365,22 +365,21 @@ class _Reason:
 class ExactState:
     """Result of one exact pass over a program.
 
-    ``known``     — atom / bulk name → exact-constant value (float or float ndarray),
-                    exactly the shape ``simplify._record_known`` produces;
-    ``sym``       — atom name → exact but NON-constant :class:`RationalFunction` over
-                    the feed atoms (statement-level exact values, used by the
-                    entry-level cell fold);
-    ``sym_bulk``  — bulk name → object ndarray of exact cells (float / RF);
-    ``folded``    — statement indices folded exactly (every output entry constant);
-    ``refuted``   — statement indices whose outputs are PROVABLY non-constant
-                    (excluded from any probe fallback);
-    ``unresolved``— statement index → short reason (opaque op name, "work budget", …);
-    ``spent`` / ``limit`` — work units consumed and allowed.  ``spent`` is a DETERMINISTIC
-                    function of the program: two runs of the same pass spend the same amount,
-                    which is what makes the certificate reproducible and is worth asserting
-                    directly in a test;
-    ``hit_wall_clock`` — the loud backstop fired, so this result is NOT reproducible and the
-                    cost model under-counted this program.  Never expected; `simplify` warns.
+    * ``known`` — atom / bulk name → exact-constant value (float or float ndarray),
+      exactly the shape ``simplify._record_known`` produces.
+    * ``sym`` — atom name → exact but NON-constant :class:`RationalFunction` over
+      the feed atoms (statement-level exact values, used by the entry-level cell fold).
+    * ``sym_bulk`` — bulk name → object ndarray of exact cells (float / RF).
+    * ``folded`` — statement indices folded exactly (every output entry constant).
+    * ``refuted`` — statement indices whose outputs are PROVABLY non-constant
+      (excluded from any probe fallback).
+    * ``unresolved`` — statement index → short reason (opaque op name, "work budget", …).
+    * ``spent`` / ``limit`` — work units consumed and allowed.  ``spent`` is a DETERMINISTIC
+      function of the program: two runs of the same pass spend the same amount,
+      which is what makes the certificate reproducible and is worth asserting
+      directly in a test.
+    * ``hit_wall_clock`` — the loud backstop fired, so this result is NOT reproducible and the
+      cost model under-counted this program.  Never expected; ``simplify`` warns.
     """
 
     known: dict[str, Any] = field(default_factory=dict)
