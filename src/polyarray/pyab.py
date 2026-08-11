@@ -863,6 +863,42 @@ class _FpTooLarge(_FpRefuse):
 
 
 # ---------------------------------------------------------------------------
+# Scalarization — represent a small per-cell intermediate as a GRID of scalar
+# exprs (SoA) instead of one stacked tensor Var, so ``torch.vmap`` lifts every
+# scalar to a ``(n_cells,)`` array and Inductor fuses the whole per-cell body
+# into ONE loop over cells (differently-shaped inner tensors are the only fusion
+# boundary once ``bmm``/reduction are gone). Off by default; a Stmt's output is
+# scalarized only when ``POLYARRAY_SCALARIZE_MAX`` is set and the output is that
+# small (guards the code-size blow-up at high polynomial degree).
+# ---------------------------------------------------------------------------
+
+
+class _ScalarGrid:
+    """A statement output emitted as an ``np.ndarray`` of scalar exprs (one per cell), NOT a stacked tensor.
+
+    Returned in a ``_render_op`` payload (``"single"``/``"exprs"``) and recognised by
+    :meth:`_Lowerer._bind_payload`, which binds each scalar to its own ``Var`` and points that cell's
+    generator at it — so no ``(n_cells, *S)`` buffer is realised and downstream reads are scalar."""
+
+    __slots__ = ("grid",)
+
+    def __init__(self, grid: np.ndarray) -> None:
+        self.grid = np.asarray(grid, dtype=object)
+
+
+def _scalarize_max() -> int:
+    """Max product of a Stmt output's static shape for which it is emitted as a scalar grid rather than a
+    stacked tensor (env ``POLYARRAY_SCALARIZE_MAX``; default ``0`` = never scalarize, keep tensor form)."""
+    v = os.environ.get("POLYARRAY_SCALARIZE_MAX")
+    if v is not None:
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # The lowerer — a structural mirror of numpy_source._Emitter that produces PyAB
 # IR nodes (via a StmtBuilder) instead of Python source strings.
 # ---------------------------------------------------------------------------
@@ -910,6 +946,11 @@ class _Lowerer:
         self.bulkmap: dict[str, Any] = {}
         # (stmt_idx, out_idx) -> PyAB Var for the produced output.
         self.outvar: dict[tuple[int, int], Any] = {}
+        # (stmt_idx, out_idx) -> np.ndarray of scalar exprs for a SCALARIZED output (see ``_ScalarGrid``).
+        # Consulted by ``_operand_grid`` (so a scalarized producer feeds a scalarized consumer scalar-wise)
+        # and by ``_ref_expr`` (which lazily stacks only if a NON-scalar consumer indexes the whole tensor).
+        self.grid_out: dict[tuple[int, int], np.ndarray] = {}
+        self._scalarize_max = _scalarize_max()
         # CSE for non-bulk object-dtype operands: id(cells) -> the Var its nested
         # per-cell ``stack`` was assembled into once, so a SymArray reused as an
         # operand across many Stmts is materialised ONCE (a single Var) instead of
@@ -987,8 +1028,7 @@ class _Lowerer:
         out = stmt.out
         base = f"t{stmt_idx}"
         if kind == "single":
-            var = self.b.assign_new(payload, base=base)
-            self._bind_output(stmt_idx, 0, out[0], var)
+            self._bind_payload(stmt_idx, 0, out[0], payload, base)
         elif kind == "tuple":
             tvars = [self.b.fresh_var(base=f"{base}_{k}") for k in range(len(out))]
             self.b.assign(self.core.TupleExpr(elts=tuple(tvars)), payload)
@@ -996,10 +1036,19 @@ class _Lowerer:
                 self._bind_output(stmt_idx, k, bound, tvars[k])
         elif kind == "exprs":
             for k, (bound, expr) in enumerate(zip(out, payload)):
-                var = self.b.assign_new(expr, base=f"{base}_{k}")
-                self._bind_output(stmt_idx, k, bound, var)
+                self._bind_payload(stmt_idx, k, bound, expr, f"{base}_{k}")
         else:  # pragma: no cover - defensive
             raise AssertionError(kind)
+
+    def _bind_payload(self, stmt_idx: int, out_idx: int, bound: SymArray,
+                      payload: PyExprs, base: str) -> None:
+        """Bind one statement output — a stacked tensor Var, or (``_ScalarGrid``) a grid of per-cell scalar
+        Vars with no tensor buffer."""
+        if isinstance(payload, _ScalarGrid):
+            self._bind_grid(stmt_idx, out_idx, bound, payload.grid, base)
+        else:
+            var = self.b.assign_new(payload, base=base)
+            self._bind_output(stmt_idx, out_idx, bound, var)
 
     def _bind_output(self, stmt_idx: int, out_idx: int, bound: SymArray, var: PyExprs) -> None:
         """Record the expression a statement output binds to, per cell or as a whole tensor."""
@@ -1014,13 +1063,56 @@ class _Lowerer:
             if isinstance(cell, RationalFunction):
                 self.genmap[cell.gens[0]] = self._index(var, idx)
 
+    def _bind_grid(self, stmt_idx: int, out_idx: int, bound: SymArray,
+                   grid: np.ndarray, base: str) -> None:
+        """Bind a SCALARIZED output: assign each grid element to its own scalar Var, record the grid (so a
+        scalarized consumer reads it component-wise), and point each output cell's generator at its Var — so
+        NO ``(n_cells, *S)`` buffer is realised. A tensor consumer (rare) triggers a lazy stack in
+        :meth:`_ref_expr`."""
+        cells = bound.cells
+        if grid.shape != cells.shape:
+            raise AssertionError(
+                f"pyab: scalar-grid shape {grid.shape} != output cells shape {cells.shape}"
+            )
+        gvars = np.empty(grid.shape, dtype=object)
+        for idx in (np.ndindex(*grid.shape) if grid.shape else [()]):
+            e = grid[idx] if grid.shape else grid[()]
+            gvars[idx] = self.b.assign_new(e, base=f"{base}_s")
+        self.grid_out[(stmt_idx, out_idx)] = gvars
+        if bound._bulk is not None:
+            # A whole-tensor (bulk) output is read via ``bulkmap`` (not per-cell atoms), so assemble the grid
+            # into one stacked tensor there. This is the single unavoidable materialisation of a scalarized
+            # output that flows on as a bulk tensor (e.g. the value kernel's final block).
+            self.bulkmap[bound._bulk.name] = self.b.assign_new(self._stack_grid(gvars), base=f"{base}_bulk")
+            return
+        for idx in (np.ndindex(*cells.shape) if cells.shape else [()]):
+            cell = cells[idx] if cells.shape else cells[()]
+            if isinstance(cell, RationalFunction):
+                self.genmap[cell.gens[0]] = gvars[idx]
+
+    def _stack_grid(self, g: np.ndarray) -> PyExprs:
+        """Assemble a scalar grid into a stacked backend tensor (only when a tensor consumer needs it)."""
+        c = self.core
+        if g.ndim == 0:
+            return _as_tensor(self, g[()])
+        if g.ndim == 1:
+            return c.StackExpr(arrays=tuple(_as_tensor(self, g[i]) for i in range(g.shape[0])), axis=0)
+        return c.StackExpr(arrays=tuple(self._stack_grid(g[i]) for i in range(g.shape[0])), axis=0)
+
     # -- ref resolution (mirrors Program._resolve_ref) --------------------
 
     def _ref_expr(self, ref: Ref) -> PyExprs:
         if isinstance(ref, InputRef):
             return self._index(self.input_exprs[ref.name], ref.indices)
         if isinstance(ref, OutputRef):
-            return self._index(self.outvar[(ref.stmt_idx, ref.out_idx)], ref.indices)
+            key = (ref.stmt_idx, ref.out_idx)
+            g = self.grid_out.get(key)
+            if g is not None:
+                if len(ref.indices) == g.ndim:
+                    return g[ref.indices]                     # fully indexed → the scalar Var directly
+                if key not in self.outvar:                    # a tensor consumer: stack the grid once, lazily
+                    self.outvar[key] = self.b.assign_new(self._stack_grid(g), base=f"t{ref.stmt_idx}_stk")
+            return self._index(self.outvar[key], ref.indices)
         if isinstance(ref, Const):
             return self._const_expr(ref.value)
         if isinstance(ref, RationalRef):
@@ -1050,6 +1142,7 @@ class _Lowerer:
     ) -> tuple[str, PyExprs | list[PyExprs]]:
         c = self.core
         self._current_out = out          # so try_small_qr / hooks can read this op's output shape
+        self._cur_in_refs = in_refs      # so hooks (QrSignFix) / the scalar-einsum can read operand refs
         # Front-end ops first (keyed by class name), then the builtin vocabulary.
         renderer = self.extra.get(type(fn).__name__)
         if renderer is not None:
@@ -1088,13 +1181,29 @@ class _Lowerer:
             return ("single", c.TensorDotExpr(a=args[0], b=args[1], axes=fn.axes))
         if isinstance(fn, EinsumStmtOp):
             shapes = [_ref_shape(r) for r in in_refs] if len(in_refs) == len(args) else [None] * len(args)
+            if self._scalarize_max > 0 and len(in_refs) == len(args):
+                # Assembly fold ``table·weight``: read the weight scalar-wise (no stack) so the per-cell body
+                # stays ONE loop. Tried before scalarize/unroll; keeps the (bulk) output a tensor.
+                fw = _fold_weighted_einsum(self, fn.spec, in_refs, self._out_shape())
+                if fw is not None:
+                    return ("single", fw)
+            if self._want_scalarize(self._out_shape()) and len(in_refs) == len(args):
+                g = _scalar_einsum(self, fn.spec, [self._operand_grid(r) for r in in_refs], self._out_shape())
+                if g is not None:
+                    return ("single", g)
             u = _unroll_einsum(self, fn.spec, tuple(args), shapes, self._out_shape())
             if u is not None:
                 return ("single", u)
             return ("single", c.EinsumExpr(subscripts=fn.spec, operands=tuple(args)))
         if isinstance(fn, EinsumOp):
-            rhs = self._const_expr(np.asarray(fn._rhs, dtype=float))
+            rhs_arr = np.asarray(fn._rhs, dtype=float)
             lhs_shape = _ref_shape(in_refs[0]) if in_refs else None
+            if self._want_scalarize(self._out_shape()) and in_refs:
+                g = _scalar_einsum(self, fn.spec,
+                                   [self._operand_grid(in_refs[0]), _const_grid(c, rhs_arr)], self._out_shape())
+                if g is not None:
+                    return ("single", g)
+            rhs = self._const_expr(rhs_arr)
             u = _unroll_einsum(self, fn.spec, (args[0], rhs),
                                [lhs_shape, tuple(int(s) for s in fn.rhs_shape)], self._out_shape())
             if u is not None:
@@ -1194,6 +1303,24 @@ class _Lowerer:
         scrutinee = self._unwrap_int_call(args[0])
         branch_exprs = tuple(args[1:])
         n = fn.n_branches
+        if self._scalarize_max > 0:
+            # UNROLLED one-hot select ``Σ_k (k == scrutinee)·branch_k`` — pure arithmetic, no ``stack`` and no
+            # ``einsum('n,n...->...')``. The einsum path stacks the branches into an ``(N, *S)`` tensor and
+            # contracts, which Inductor turns into an extern ``bmm`` (a fusion boundary that splits the per-cell
+            # body). Each ``(k == scrutinee)`` is a batched 0-d bool → f64 scalar that broadcasts over its
+            # branch; summed, it is the same value the one-hot contraction produces (vmap-safe, unbatched too).
+            terms = [
+                c.BinaryExpr(
+                    op=c.BinaryOp.MUL,
+                    lhs=branch_exprs[k],
+                    rhs=c.ArrayExpr(
+                        obj=c.BinaryExpr(op=c.BinaryOp.EQ, lhs=c.IntLit(value=k), rhs=scrutinee),
+                        dtype=self._dtype_f64(),
+                    ),
+                )
+                for k in range(n)
+            ]
+            return _balanced(c, terms, c.BinaryOp.ADD)
         stacked = c.StackExpr(arrays=branch_exprs, axis=0)                         # (N, *S)
         idx = c.ArangeExpr(start=c.IntLit(value=0), stop=c.IntLit(value=int(n)),
                            step=c.IntLit(value=1), dtype=None)                     # (N,) int
@@ -1387,6 +1514,92 @@ class _Lowerer:
             return ("exprs", [inline[0], inline[1]])
         kwargs = (self.core.KwArg(name="mode", value=self.core.StringLit(value=fn.mode)),)
         return ("tuple", self._ns_call("linalg.qr", args, kwargs))
+
+    # -- scalarization support --------------------------------------------
+
+    def _want_scalarize(self, shape: tuple[int, ...] | None) -> bool:
+        """True iff scalarization is enabled, ``shape`` is statically known and small enough
+        (``prod(shape) <= POLYARRAY_SCALARIZE_MAX``), and the current output is NOT bulk.
+
+        A bulk output is read as a WHOLE tensor by its consumers (via ``bulkmap``), so scalarizing it would
+        only force an immediate re-stack — no fewer buffers, and it splits what Inductor would otherwise keep
+        as one clean output loop (measured: scalarizing the value kernel's final bulk fold went 2 → 13 loops).
+        Scalarize only outputs whose consumers read cells (→ scalar Vars) so the tensor never forms."""
+        if self._scalarize_max <= 0 or shape is None:
+            return False
+        co = self._current_out
+        if co and any(sa._bulk is not None for sa in co):
+            return False
+        size = 1
+        for s in shape:
+            size *= int(s)
+        return 0 < size <= self._scalarize_max
+
+    def scalar_grid(self, grid: np.ndarray) -> _ScalarGrid:
+        """Wrap an ``np.ndarray`` of scalar exprs as a scalarized output (for op-carried ``__pyab_lower__``
+        hooks — e.g. chartlib's ``QrSignFixOp`` — to return without importing pyab internals)."""
+        return _ScalarGrid(grid)
+
+    def _operand_grid(self, ref: Ref) -> np.ndarray:
+        """Resolve an operand ``ref`` to an ``np.ndarray`` of scalar exprs — one per element — so a
+        scalarized op reads its inputs component-wise (no intermediate tensor). Feeds a scalarized producer
+        (``grid_out``) straight through; otherwise reads a tensor/const/cells element-by-element."""
+        c = self.core
+        if isinstance(ref, Const):
+            return _const_grid(c, np.asarray(ref.value, dtype=float))
+        if isinstance(ref, SymArrayRef):
+            if ref._bulk is not None:                    # a whole-tensor operand: int-index it component-wise
+                shp = _ref_shape(ref)                    # None if any axis is dynamic (a DimAtom)
+                if shp is None:
+                    return np.array(self._ref_expr(ref), dtype=object)
+                return self._tensor_grid(self.bulkmap[ref._bulk.name], shp)
+            cells = np.asarray(ref._cells, dtype=object)
+            g = np.empty(cells.shape, dtype=object)
+            for idx in np.ndindex(*cells.shape) if cells.shape else [()]:
+                cell = cells[idx] if cells.shape else cells[()]
+                g[idx] = (self._rf_expr(cell) if isinstance(cell, RationalFunction)
+                          else c.FloatLit(value=float(cell)))
+            return g
+        if isinstance(ref, OutputRef):
+            key = (ref.stmt_idx, ref.out_idx)
+            sub = self.grid_out.get(key)
+            if sub is not None:
+                return sub[ref.indices] if ref.indices else sub
+            base = self._index(self.outvar[key], ref.indices)
+            return self._tensor_grid(base, self._ref_shape(ref))
+        if isinstance(ref, InputRef):
+            base = self._index(self.input_exprs[ref.name], ref.indices)
+            return self._tensor_grid(base, self._ref_shape(ref))
+        # RationalRef / IntAtomRef and any other ref: fall back to a single scalar expr.
+        return np.array(self._ref_expr(ref), dtype=object)
+
+    def _tensor_grid(self, base: PyExprs, shape: tuple[int, ...]) -> np.ndarray:
+        """A grid of all-integer subscripts of a tensor ``base`` — each element a scalar load."""
+        c = self.core
+        g = np.empty(shape, dtype=object)
+        for idx in np.ndindex(*shape) if shape else [()]:
+            g[idx] = (base if not idx
+                      else c.AccessExpr(base=base, index=tuple(c.IntLit(value=int(i)) for i in idx)))
+        return g
+
+    def try_small_qr_grid(self, mode: str = "reduced") -> tuple[np.ndarray, np.ndarray] | None:
+        """Scalar-grid twin of :meth:`try_small_qr`: return ``(Q_grid, R_grid)`` as ``np.ndarray``s of scalar
+        exprs (no ``stack``), reading the current op's first operand component-wise from ``_cur_in_refs``.
+        ``None`` when small-QR is disabled/too large or the operand ref is unavailable."""
+        sq = self.opts.small_qr
+        m, n = _static_matrix_shape(self._current_out)
+        if not (sq.enabled and m is not None and n is not None and m >= n
+                and max(m, n) <= sq.max_dim and mode in ("reduced", "complete")):
+            return None
+        if self._scalarize_max <= 0 or m * m > self._scalarize_max:
+            return None
+        refs = self._cur_in_refs
+        if not refs:
+            return None
+        a_grid = self._operand_grid(refs[0])
+        if a_grid.shape != (m, n):
+            return None
+        return _emit_householder_qr_grid(self, lambda i, j: a_grid[i, j], m, n, mode)
 
     # -- sub-program / vmap helper defs -----------------------------------
 
@@ -1742,7 +1955,7 @@ def _ret_value(core: ModuleType, out_exprs: list[PyExprs]) -> PyExprs:
     return core.TupleExpr(elts=tuple(out_exprs))
 
 
-def _static_matrix_shape(out: SymArray) -> tuple[int | None, int | None]:
+def _static_matrix_shape(out: tuple[SymArray, ...]) -> tuple[int | None, int | None]:
     """(m, n) of the QR operand, recovered from the produced Q output shape.
 
     ``QrOp`` reduced: Q is ``m x n``.  We read the output SymArray cell shapes:
@@ -1822,6 +2035,142 @@ def _resolve_einsum_ellipsis(
     else:
         out2 = list(out_sub)
     return in2, out2
+
+
+def _const_grid(core: ModuleType, arr: np.ndarray) -> np.ndarray:
+    """A grid of ``FloatLit``s for a numeric constant array (an einsum RHS / a ``Const`` operand)."""
+    g = np.empty(arr.shape, dtype=object)
+    for idx in np.ndindex(*arr.shape) if arr.shape else [()]:
+        g[idx] = core.FloatLit(value=float(arr[idx] if arr.shape else arr[()]))
+    return g
+
+
+def _einsum_index_sizes(
+    in_subs: list[str], out_sub: str, shapes: Sequence[tuple[int, ...] | None],
+    out_shape: tuple[int, ...] | None,
+) -> tuple[list[list[str]], list[str], dict[str, int], list[str]] | None:
+    """Resolve ``...``, then infer every index's extent from the operand shapes AND the output shape. Returns
+    ``(in2, out2, size, contracted)`` or ``None`` when unsupported / not statically inferable."""
+    res = _resolve_einsum_ellipsis(in_subs, out_sub, list(shapes))
+    if res is None:
+        return None
+    in2, out2 = res
+    size: dict[str, int] = {}
+    def add(sub: list[str], shp: tuple[int, ...] | None) -> bool:
+        if shp is None:
+            return True
+        if len(sub) != len(shp):
+            return False
+        for ch, s in zip(sub, shp):
+            if ch in size and size[ch] != int(s):
+                return False
+            size[ch] = int(s)
+        return True
+    for sub, shp in zip(in2, shapes):
+        if not add(sub, shp):
+            return None
+    if not add(out2, out_shape):
+        return None
+    if any(ch not in size for ch in out2):
+        return None
+    contracted = [ch for ch in size if ch not in out2]
+    return in2, out2, size, contracted
+
+
+def _scalar_einsum(
+    low: _Lowerer, spec: str, grids: Sequence[np.ndarray], out_shape: tuple[int, ...] | None,
+) -> _ScalarGrid | None:
+    """Lower a small einsum to a GRID of scalar exprs — each output element an explicit sum-of-products over
+    the operands' scalar grids. Fully scalar (no free tensor axes), so under ``torch.vmap`` every element is a
+    ``(n_cells,)`` value and the whole per-cell body stays in one fused loop. ``None`` to fall back."""
+    import itertools
+    c = low.core
+    if "->" not in spec:
+        return None
+    inp, _, outp = spec.partition("->")
+    in_subs = [s.strip() for s in inp.split(",")]
+    if len(in_subs) != len(grids):
+        return None
+    shapes = [tuple(int(s) for s in g.shape) for g in grids]
+    info = _einsum_index_sizes(in_subs, outp.strip(), shapes, out_shape)
+    if info is None:
+        return None
+    in2, out2, size, contracted = info
+    out_dims = [size[ch] for ch in out2]
+    grid = np.empty(tuple(out_dims), dtype=object)
+    for oidx in (np.ndindex(*out_dims) if out_dims else [()]):
+        label = {ch: oidx[k] for k, ch in enumerate(out2)}
+        terms = []
+        for cidx in itertools.product(*[range(size[ch]) for ch in contracted]):
+            cval = {ch: cidx[k] for k, ch in enumerate(contracted)}
+            full = {**label, **cval}
+            factors = [g[tuple(full[ch] for ch in sub)] if sub else g[()]
+                       for g, sub in zip(grids, in2)]
+            terms.append(_balanced(c, factors, c.BinaryOp.MUL) if factors else c.FloatLit(value=1.0))
+        grid[oidx] = _balanced(c, terms, c.BinaryOp.ADD) if terms else c.FloatLit(value=0.0)
+    return _ScalarGrid(grid)
+
+
+def _fold_weighted_einsum(
+    low: _Lowerer, spec: str, in_refs: Sequence[Ref], out_shape: tuple[int, ...] | None,
+) -> PyExprs | None:
+    """Lower a contraction of a per-cell WEIGHT (an operand indexed only by contracted axes) against a table
+    (an operand carrying the free output axes) as ``Σ_contracted (Π weight scalars) · table[contracted]`` — the
+    weight read component-wise as SCALARS (never stacked into an ``(n_cells, K)`` tensor) and the table sliced
+    at each contracted index so the free axes stay ONE tensor.
+
+    This is the fold ``'qab,q->ab'`` at the end of every element-matrix assembly. Stacking the weight into an
+    ``(n_cells, K)`` buffer forces Inductor to realise it — a fusion boundary that splits the per-cell body
+    into a second loop over cells (measured). Reading it as scalars keeps the whole body in ONE loop. Returns
+    the tensor expr, or ``None`` (no all-contracted operand, or the single-table shape assumption fails) to
+    fall back to :func:`_unroll_einsum`. Handles exactly ONE table operand (the common assembly shape)."""
+    import itertools
+    c = low.core
+    if _einsum_unroll_max() <= 0 or "->" not in spec:
+        return None
+    inp, _, outp = spec.partition("->")
+    in_subs = [s.strip() for s in inp.split(",")]
+    if len(in_subs) != len(in_refs):
+        return None
+    shapes = [_ref_shape(r) for r in in_refs]
+    info = _einsum_index_sizes(in_subs, outp.strip(), shapes, out_shape)
+    if info is None:
+        return None
+    in2, out2, size, contracted = info
+    if not contracted:
+        return None
+    cset = set(contracted)
+    scalar_ops = [(k, sub) for k, sub in enumerate(in2) if all(ch in cset for ch in sub)]
+    tensor_ops = [(k, sub) for k, sub in enumerate(in2) if any(ch not in cset for ch in sub)]
+    if not scalar_ops or len(tensor_ops) != 1:
+        return None                                          # no weight, or not the single-table shape
+    csz = 1
+    for ch in contracted:
+        csz *= size[ch]
+    if csz == 0 or csz > _einsum_unroll_max():
+        return None
+    tk, tsub = tensor_ops[0]
+    tfree = [ch for ch in tsub if ch not in cset]
+    if sorted(tfree) != sorted(out2):
+        return None                                          # the table must carry exactly the free axes
+    texpr = low._ref_expr(in_refs[tk])
+    sgrids = {k: low._operand_grid(in_refs[k]) for k, _ in scalar_ops}
+    terms: list[PyExprs] = []
+    for combo in itertools.product(*[range(size[ch]) for ch in contracted]):
+        cval = dict(zip(contracted, combo))
+        coeff_factors = []
+        for k, sub in scalar_ops:
+            idx = tuple(cval[ch] for ch in sub)
+            g = sgrids[k]
+            coeff_factors.append(g[idx] if idx else g[()])
+        coeff = _balanced(c, coeff_factors, c.BinaryOp.MUL)
+        index = tuple(c.IntLit(value=int(cval[ch])) if ch in cset else c.Slice() for ch in tsub)
+        slab = c.AccessExpr(base=texpr, index=index)         # free-shaped tensor slab at this contracted index
+        if tfree != list(out2):                              # reorder the slab's free axes to the output order
+            axes = tuple(tfree.index(ch) for ch in out2)
+            slab = c.TransposeExpr(a=slab, axes=axes)
+        terms.append(c.BinaryExpr(op=c.BinaryOp.MUL, lhs=slab, rhs=coeff))
+    return _balanced(c, terms, c.BinaryOp.ADD)
 
 
 def _unroll_einsum(
@@ -1960,18 +2309,15 @@ def _balanced(core: ModuleType, exprs: list[PyExprs], op: PyExprs) -> PyExprs:
 # Small-matrix Householder QR — unrolled scalar code, LAPACK sign convention.
 # ---------------------------------------------------------------------------
 
-def _emit_householder_qr(
-    low: _Lowerer, a_expr: PyExprs, m: int, n: int, mode: str
-) -> tuple[PyExprs, PyExprs]:
-    """Emit unrolled Householder QR of an ``m x n`` (m>=n) matrix.
-
-    Returns ``(Q_expr, R_expr)`` — reduced (``m x n`` / ``n x n``) for
-    ``mode="reduced"``, full (``m x m`` / ``m x n``) for ``mode="complete"``.
-    Uses only backend-agnostic IR (arith / where / stack), reproducing
-    LAPACK/numpy's convention ``R[k,k] = -sign(x0) * ||x||`` (with the
-    ``sign(0):=+1`` tie-break).  Every intermediate is bound to a fresh scalar
-    Var so the trees stay shallow and CSE-friendly.
-    """
+def _householder_qr_core(
+    low: _Lowerer, access: Callable[[int, int], PyExprs], m: int, n: int
+) -> tuple[list[list[PyExprs]], list[list[PyExprs]]]:
+    """Unrolled Householder QR of an ``m x n`` (m>=n) matrix, returning the FULL ``Q`` (``m x m``) and
+    ``R`` (``m x n``) as nested lists of scalar exprs (NOT stacked). ``access(i, j)`` supplies each input
+    entry (a tensor subscript or a scalar grid element). Reproduces LAPACK/numpy's convention
+    ``R[k,k] = -sign(x0)*||x||`` (``sign(0):=+1``). Every intermediate is bound to a fresh scalar Var.
+    Shared by the tensor emitter (:func:`_emit_householder_qr`) and the scalar-grid one
+    (:func:`_emit_householder_qr_grid`), which apply the reduced/complete shaping."""
     c = low.core
     b = low.b
     one = c.FloatLit(value=1.0)
@@ -1979,9 +2325,6 @@ def _emit_householder_qr(
 
     def sca(base: str, e: PyExprs) -> PyExprs:
         return b.assign_new(e, base=base)
-
-    def add(x: PyExprs, y: PyExprs) -> PyExprs:
-        return c.BinaryExpr(op=c.BinaryOp.ADD, lhs=x, rhs=y)
 
     def sub(x: PyExprs, y: PyExprs) -> PyExprs:
         return c.BinaryExpr(op=c.BinaryOp.SUB, lhs=x, rhs=y)
@@ -1997,7 +2340,7 @@ def _emit_householder_qr(
     for i in range(m):
         row = []
         for j in range(n):
-            row.append(sca("a", c.AccessExpr(base=a_expr, index=(c.IntLit(value=i), c.IntLit(value=j)))))
+            row.append(sca("a", access(i, j)))
         R.append(row)
     # Q accumulates the reflections (start as the m x m identity).
     Q: list[list[Any]] = [[one if i == j else zero for j in range(m)] for i in range(m)]
@@ -2063,32 +2406,55 @@ def _emit_householder_qr(
                 Q[i][j] = sca("Q", sub(Q[i][j], mul(w, v[i])))
 
     # Q currently holds H_{n-1}...H_0 (an m x m orthogonal matrix, applied to I).
-    # The QR factor is Q_full = (H_{n-1}...H_0)^T = transpose of the accumulated
-    # product. Assemble Q^T explicitly.
-    ncols_q = m if mode == "complete" else n
-    q_rows = []
-    for i in range(m):
-        q_rows.append(
-            c.StackExpr(
-                arrays=tuple(_as_tensor(low, Q[j][i]) for j in range(ncols_q)),
-                axis=0,
-            )
-        )
-    q_expr = c.StackExpr(arrays=tuple(q_rows), axis=0)
+    # The QR factor Q_full = (H_{n-1}...H_0)^T is its transpose; R keeps the upper
+    # triangle (below-diagonal entries are zeroed by the shaping wrappers).
+    return Q, R
 
+
+def _qr_scalar_grids(
+    Q: list[list[PyExprs]], R: list[list[PyExprs]], m: int, n: int, mode: str, zero: PyExprs
+) -> tuple[np.ndarray, np.ndarray]:
+    """Shape the full ``Q``/``R`` scalar lists to the reduced/complete factor grids: ``Q^T`` sliced to
+    ``ncols_q`` columns, ``R`` sliced to ``nrows_r`` rows with the strict lower triangle set to ``zero``."""
+    ncols_q = m if mode == "complete" else n
+    q_grid = np.empty((m, ncols_q), dtype=object)
+    for i in range(m):
+        for j in range(ncols_q):
+            q_grid[i, j] = Q[j][i]                       # transpose of the accumulated product
     nrows_r = m if mode == "complete" else n
-    r_rows = []
+    r_grid = np.empty((nrows_r, n), dtype=object)
     for i in range(nrows_r):
-        r_rows.append(
-            c.StackExpr(
-                arrays=tuple(
-                    _as_tensor(low, R[i][j] if i <= j else zero) for j in range(n)
-                ),
-                axis=0,
-            )
-        )
-    r_expr = c.StackExpr(arrays=tuple(r_rows), axis=0)
+        for j in range(n):
+            r_grid[i, j] = R[i][j] if i <= j else zero
+    return q_grid, r_grid
+
+
+def _emit_householder_qr(
+    low: _Lowerer, a_expr: PyExprs, m: int, n: int, mode: str
+) -> tuple[PyExprs, PyExprs]:
+    """Tensor form: unrolled Householder QR, returning ``(Q_expr, R_expr)`` as stacked backend tensors
+    (reduced ``m x n`` / ``n x n``, or full for ``mode="complete"``). Reads the input matrix by subscript."""
+    c = low.core
+    Q, R = _householder_qr_core(
+        low, lambda i, j: c.AccessExpr(base=a_expr, index=(c.IntLit(value=i), c.IntLit(value=j))), m, n
+    )
+    q_grid, r_grid = _qr_scalar_grids(Q, R, m, n, mode, c.FloatLit(value=0.0))
+    q_expr = c.StackExpr(
+        arrays=tuple(c.StackExpr(arrays=tuple(_as_tensor(low, e) for e in q_grid[i]), axis=0)
+                     for i in range(q_grid.shape[0])), axis=0)
+    r_expr = c.StackExpr(
+        arrays=tuple(c.StackExpr(arrays=tuple(_as_tensor(low, e) for e in r_grid[i]), axis=0)
+                     for i in range(r_grid.shape[0])), axis=0)
     return q_expr, r_expr
+
+
+def _emit_householder_qr_grid(
+    low: _Lowerer, access: Callable[[int, int], PyExprs], m: int, n: int, mode: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Scalar-grid form: unrolled Householder QR returning ``(Q_grid, R_grid)`` as ``np.ndarray``s of scalar
+    exprs (no ``stack``). ``access(i, j)`` supplies each input entry component-wise."""
+    Q, R = _householder_qr_core(low, access, m, n)
+    return _qr_scalar_grids(Q, R, m, n, mode, low.core.FloatLit(value=0.0))
 
 
 def _as_tensor(low: _Lowerer, e: PyExprs) -> PyExprs:
