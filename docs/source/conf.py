@@ -25,8 +25,12 @@ extensions = [
     "sphinx.ext.intersphinx",
     "sphinx.ext.viewcode",
     "sphinx.ext.todo",
+    "sphinx.ext.doctest",
     "numpydoc",
 ]
+
+# The examples page is written as doctests, so ``make -C docs doctest`` runs the
+# narrative and fails if the API drifts from what the docs claim.
 
 # The narrative pages left for the maintainer mark their gaps with ``todo``;
 # show them, so an unwritten section is visible in the built docs.
