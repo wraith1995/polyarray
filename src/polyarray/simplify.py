@@ -752,7 +752,7 @@ def _specialize(
 
     # Resolve every δ a folded Stmt created into its concrete rank across all
     # remaining shapes, so a folded constant SVD/GSVD/… leaves no lingering
-    # dynamic dim downstream (the Vandermonde stays square, etc.).
+    # dynamic dim downstream (a matrix that was square stays square, etc.).
     _substitute_dims(new, dim_subst)
 
     survivors = [i for i in range(len(new.statements)) if i not in foldable]

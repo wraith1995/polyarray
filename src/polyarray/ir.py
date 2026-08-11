@@ -86,10 +86,10 @@ type Index = int | slice | np.ndarray | Sequence[int] | tuple[int | slice | np.n
 # Ambient budget override
 # ---------------------------------------------------------------------------
 # A `Program` built with no explicit `budget=` consults this context. It lets a
-# caller (e.g. oracle's sparsity mask) request the non-deferred, inline-covariant
+# caller (e.g. a sparsity mask) request the non-deferred, inline-covariant
 # symbolic lane for the SHARED sampling program — so the covariant/φ-jet chain is
 # built inline over the vertices (not deferred to `out_cov`/`phi_jet` Stmts) — without
-# threading a budget through every builder (pointwise never references it).
+# threading a budget through every builder (a front end never references it).
 _BUDGET_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
     "_pa_budget_override", default=None
 )
@@ -346,29 +346,29 @@ class SymbolicBudget:
     # Retention knob: when True, the covariant frame conversion (orthonormal /
     # euclidean) is applied OUTSIDE the deferred numeric Stmt, so Q / R / R⁻¹
     # come through as visible QrSignFixOp atoms (the frame conversion is the
-    # last step).  Default False keeps the WS3 full-deferral (cheap; the whole
+    # last step).  Default False keeps the full-deferral (cheap; the whole
     # covariant chain incl. frame is one numeric Stmt).  Surfacing the frame
     # reintroduces order-≥2 symbolic cost on 3-D cells, so it is opt-in — the
-    # knob Plan B's budget-zero "build big symbols" mode flips on.
+    # knob the budget-zero "build big symbols" mode flips on.
     surface_frame: bool = False
-    # Deferral gates (Plan B step 4) — defaults == legacy symbolic path.
+    # Deferral gates — defaults == legacy symbolic path.
     einsum_bag_threshold: int | None = None
     defer_phi_jet: bool = True
     defer_covariant: bool = True
     freeze: bool = True
-    # Plan-D #4 / task #11 — the "middle ground": when surfacing the frame
+    # The "middle ground": when surfacing the frame
     # (``surface_frame``), defer the per-slot R⁻¹/Q contraction to numeric
     # TensordotOp/MoveaxisOp Stmts instead of running it inline as symbolic RF
     # arithmetic.  Keeps Q/R/R⁻¹ visible while making the surfaced frame usable
     # on 3-D high-order cells (where the inline contraction blows up).  Default
-    # False = today's inline rational lane (byte-identical).
+    # False = today's inline rational lane.
     defer_frame_contraction: bool = False
-    # Downstream block-inverse deferral (oracle's Schur `symbolic_inverse`): the matrix size at/above
+    # Downstream block-inverse deferral (a Schur `symbolic_inverse`): the matrix size at/above
     # which a base-case inverse / a Schur-combine matrix product offloads to a NUMERIC Stmt instead of
     # inline RationalFunction arithmetic (the degree blow-up on a single connected
     # component). ``None`` ⇒ the consumer's own module defaults; ``build_big_symbols`` raises them (stay
     # symbolic / never defer), ``force_stmts`` lowers them (always defer). Read via
-    # ``current_budget_override``; other budget fields left at legacy keep sampling byte-identical, so a
+    # ``current_budget_override``; other budget fields left at legacy keep sampling identical, so a
     # caller can tune ONLY the inverse without perturbing the sampling lane.
     schur_inverse_stmt_size: int | None = None
     schur_matmul_stmt_size: int | None = None
@@ -1257,7 +1257,7 @@ def _program_budget(program: Program | None) -> SymbolicBudget:
 
 
 # ---------------------------------------------------------------------------
-# Typed numpy ops (Plan B step 2)
+# Typed numpy ops
 # ---------------------------------------------------------------------------
 #
 # Each op is a frozen, hashable dataclass with a ``__call__`` that runs the
@@ -1275,7 +1275,7 @@ def _program_budget(program: Program | None) -> SymbolicBudget:
 # ``_apply_per_slot`` runs them *inline on object cells* — the rational lane).
 # They are added here as round-trip-tested vocabulary but are NOT yet emitted by
 # any sampler: turning those inline contractions into deferred numeric Stmts is a
-# symbolic→numeric deferral decision, deferred to Plan B step 4 (budget-zero) and
+# symbolic→numeric deferral decision, deferred (budget-zero) and
 # gated on flagging it first.
 
 
@@ -1592,7 +1592,7 @@ class DynBlockRepeatOp:
 
 
 # ---------------------------------------------------------------------------
-# Generic array builtins relocated from grassmann's lowering layer (Batch 2).
+# Generic array builtins of the lowering layer.
 # Each is a frozen, hashable Stmt.fn with a numpy host ``__call__``; both render
 # lanes live in ``pyab._ARRAY_OP_LOWERINGS`` and ``numpy_source._builtin_renderers``.
 # Several produce a 0-d int sizing a downstream dynamic axis (DimAtom source).
@@ -1853,11 +1853,10 @@ class LastColsOp:
         return np.asarray(A)[:, int(rank):]
 
 
-# --- Batch-3 relocated generic array / linalg builtins ----------------------
+# --- Generic array / linalg builtins ----------------------------------------
 # Subspace project/embed, Kronecker assembly, inverse-transpose / basis-compose,
 # the SPD operator square root, numeric rank, and metric orthonormalization —
-# bodies moved verbatim from grassmann's ``lower/represent.py`` (pure numpy, no
-# grassmann types).  Both lanes render (pyab ``_ARRAY_OP_LOWERINGS`` + numpy
+# pure numpy host bodies.  Both lanes render (pyab ``_ARRAY_OP_LOWERINGS`` + numpy
 # ``_builtin_renderers``).
 
 
@@ -2134,7 +2133,7 @@ class MoveaxisOp:
 
 
 # ---------------------------------------------------------------------------
-# Control-flow ops (Plan B step 3): Call + While
+# Control-flow ops: Call + While
 # ---------------------------------------------------------------------------
 #
 # ``SwitchOp`` (the conditional) is the only pre-existing control-flow op.  These
@@ -2419,7 +2418,7 @@ def _einsum_bag_threshold() -> int:
 
 # Contraction paths depend only on (spec, optimize, operand shapes), never on values, but
 # ``np.einsum(..., optimize=True)`` recomputes the path on EVERY call — ~28 µs of pure
-# planning that dominated symbolic-Vandermonde builds (hundreds of thousands of identical
+# planning that dominated large symbolic builds (hundreds of thousands of identical
 # small einsums at high degree). Cache the path by that key and pass it back: numpy
 # then skips the planning and runs the SAME contraction order ⇒ bit-identical results.
 _EINSUM_PATH_CACHE: dict[tuple[str, object, tuple[tuple[int, ...], ...]], Any] = {}
@@ -3200,7 +3199,7 @@ class Program:
         self.input_arrays: dict[str, SymArray] = {}
         for inp in self.inputs:
             if is_dynamic(inp.shape):
-                # Stage C: a dynamic (DimAtom-sized) input cannot enumerate
+                # A dynamic (DimAtom-sized) input cannot enumerate
                 # per-cell atoms — allocate one whole-tensor bulk handle whose
                 # symbolic shape carries the DimAtom axes (resolved at run
                 # time from the provided array; see build_runtime_bindings).
@@ -3216,7 +3215,7 @@ class Program:
         self.statements: list[Stmt] = []
         self.outputs: dict[str, SymArray] = {}
         # An explicit `budget=` always wins; otherwise consult the ambient `budget_override`
-        # context (oracle's sparsity mask requests the inline-covariant lane), else the default.
+        # context (a sparsity mask requests the inline-covariant lane), else the default.
         self.budget: SymbolicBudget = (
             budget if budget is not None
             else (_BUDGET_OVERRIDE.get() or SymbolicBudget())
@@ -3505,8 +3504,8 @@ class Program:
         # ``OutSpec.shape`` carrying a :class:`DimAtom` (whose ``source`` is
         # that output) resolves to a concrete shape.  Built ONLY for programs
         # that actually carry a dynamic shape; static programs pass ``None``
-        # so ``_run_stmt`` skips all per-output dim bookkeeping (B5) — the
-        # static path stays byte-identical AND free of per-output overhead.
+        # so ``_run_stmt`` skips all per-output dim bookkeeping — the
+        # static path stays identical AND free of per-output overhead.
         # The `only=` (cone) lane always uses the table: it may run mid-build (from
         # `evaluate_cone` inside a partially-built program), so it must NOT read/write the
         # whole-program `_has_dynamic_shape` memo (a partial program would cache a stale
@@ -3515,7 +3514,7 @@ class Program:
         dim_bindings: dict[DimSource, int] | None = (
             {} if (only is not None or self._has_dynamic_shape()) else None
         )
-        # Stage C: before walking statements, bind each dynamic INPUT.  Read
+        # Before walking statements, bind each dynamic INPUT.  Read
         # the provided array's actual shape, record each DimAtom axis into
         # dim_bindings (keyed by the DimAtom's ("in", name, axis) source so a
         # later dynamic OutSpec.shape / sibling resolves against it), and bind
@@ -3532,7 +3531,7 @@ class Program:
                     )
                 for axis, dim in enumerate(inp.shape):
                     if isinstance(dim, DimAtom):
-                        # An input axis sourced from a prior Stmt's output (e.g. an FFS-typed
+                        # An input axis sourced from a prior Stmt's output (e.g. an
                         # input Var sized by the factorization's canonical rank atom,
                         # ``source[0] == "stmt"``) is NOT bound from the fed array's shape:
                         # the producing Stmt records it later in ``_run_stmt``.  Binding it
@@ -3673,7 +3672,7 @@ class Program:
             self._bind_output(bound, outs[k], bindings, dim_bindings)
             # Record any scalar (0-d) output as a candidate runtime
             # dimension, keyed by its producing output position.  Only
-            # 0-d ints can size an axis (the SVD ``rank`` / δ_f output).
+            # 0-d ints can size an axis (the SVD ``rank`` output).
             if dim_bindings is not None:
                 arr = np.asarray(outs[k])
                 if arr.ndim == 0:
@@ -3843,7 +3842,7 @@ def _eval_cell(cell: Cell, bindings: dict[str, float]) -> float:
 # codegen-and-cache ``eval_numeric_fast``. The codegen amortizes over MANY runs of the same
 # program, but the structural-mask probe (:func:`polyarray.schur._structural_mask`) runs a
 # program only 3× — where compiling every RF (``builtins.compile`` + ``_poly_term_strings``)
-# is most of a degree-5 P(T) build for nothing. Values are byte-identical, so
+# is most of a degree-5 build for nothing. Values are identical, so
 # the probed mask is unchanged. Module-scoped: symbolic builds are single-threaded.
 _PROBE_DIRECT_EVAL = False
 

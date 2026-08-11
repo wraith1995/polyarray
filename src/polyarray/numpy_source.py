@@ -447,7 +447,7 @@ class _Emitter:
         """
         params: list[str] = []
         for inp in self.prog.inputs:
-            # A DimAtom-shaped (runtime-rank FFS) input is fine as a positional array param — its
+            # A DimAtom-shaped (runtime-rank) input is fine as a positional array param — its
             # actual shape is fixed at call time; the body's ops read it from the passed array.
             p = _safe_param_name(inp.name)
             self.param[inp.name] = p
@@ -887,7 +887,7 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
     def dyn_block_repeat(op: DynBlockRepeatOp, a: list[str]) -> str:
         return f"np.kron(np.eye(int({a[1]})), np.asarray({a[0]}, dtype=float))"
 
-    # --- Batch-2 relocated generic array ops (bodies moved from grassmann) ---
+    # --- Generic array ops ---
     def dyn_eye(op: DynEyeOp, a: list[str]) -> str:
         return f"np.eye(int(np.asarray({a[0]}).shape[{op.axis}]))"
 
@@ -962,7 +962,7 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
     def last_cols(op: LastColsOp, a: list[str]) -> str:
         return f"np.asarray({a[0]}, dtype=float)[:, int({a[1]}):]"
 
-    # --- Batch-3 relocated generic array / linalg ops (bodies from grassmann) ---
+    # --- Generic array / linalg ops ---
     def project(op: ProjectOp, a: list[str]) -> str:  # Pᵀ @ v  (ambient coords -> sub-basis coords)
         return f"(np.asarray({a[0]}, dtype=float).T @ np.asarray({a[1]}, dtype=float).reshape(-1))"
 

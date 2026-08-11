@@ -160,12 +160,12 @@ _MAX_DEPTH = 32
 # terms, summed over every symbolic cell) its operands may carry.  The time budget alone
 # cannot bound the exact lane, because a single ``np.einsum`` / Gauss elimination over
 # object-dtype ``RationalFunction`` cells runs to completion once STARTED, inside a single
-# budget check — a degree-5, 18-DOF symbolic Vandermonde stalled the lowering gate for
-# >55 min in one such einsum.  An op whose operands exceed the cap is
+# budget check — a large high-degree symbolic operand can spend many minutes inside one
+# such einsum.  An op whose operands exceed the cap is
 # declared *unresolved* up front (⇒ the warned probe fallback), so the exact lane's cost
 # per statement is bounded BEFORE the expensive work starts, not merely interrupted
 # after it.  Rationale for the size: the entries this lane certifies are small by
-# nature (a vertex-rational Vandermonde entry measures in the tens of monomials); a five-figure operand mass means the exact route has already lost
+# nature (a typical entry this lane certifies measures in the tens of monomials); a five-figure operand mass means the exact route has already lost
 # to the probe route, whatever the wall clock says.
 _MAX_SYM_MASS = 4096
 
@@ -174,32 +174,32 @@ _MAX_SYM_MASS = 4096
 # monomial mass is still bounded by ``_MAX_SYM_MASS`` (that is the SUM over the slices, so the
 # total symbolic work stays inside the same box), but each slice also pays the body's fixed
 # per-statement overhead, and one slice's flint arithmetic cannot be interrupted.  So the batch
-# itself is bounded BEFORE the loop starts (the stall lesson: an uninterruptible op
-# ignores any budget).  Over the cap ⇒ *unresolved* ⇒ the warned probe fallback.
+# itself is bounded BEFORE the loop starts (an uninterruptible op ignores any budget).
+# Over the cap ⇒ *unresolved* ⇒ the warned probe fallback.
 _MAX_VMAP_BATCH = 512
 
 # GLOBAL WORK BUDGET for one exact pass, in *work units* — a deterministic function of the
 # program, never of the machine.  One unit is roughly one monomial touched: a statement costs
 # `_STMT_COST` plus the monomial mass of the operands it actually processes.  See `_Meter`.
 #
-# WHY NOT SECONDS.  This budget used to be `time_budget`, wall-clock seconds off
-# `time.monotonic()`.  That made the CERTIFICATE a property of the machine: the same program on
-# the same input certified exactly on a quiet box and probe-backed on a loaded one — measured
-# 6874 / 6895 / 7726 frozen statements across three runs of ONE leg.  Since a certificate is
+# WHY NOT SECONDS.  A wall-clock budget — seconds off `time.monotonic()` — would make the
+# CERTIFICATE a property of the machine: the same program on
+# the same input certifies exactly on a quiet box and probe-backed on a loaded one — a swing of
+# hundreds of frozen statements between runs.  Since a certificate is
 # persisted and selects a whole compilation lane downstream, "this element certifies exactly"
 # was recording the load average as much as the mathematics.  Work units are reproducible: the
 # same program spends the same number, on any box, under any load, in any order.
 #
-# SIZED FROM MEASUREMENT, not guessed.  Calibration over the symbolic P(T) legs (TRI/TET,
-# r = 1..4, k = 1,2) gives a strikingly stable ~128 000 work units per second (123 k–158 k
-# across every leg), so the old nominal 10 s ceiling was worth ~1.3 M units on a quiet box.
-# This is ~3x that, which is the "no leg certifies less than it used to" margin the budget was
-# chosen for — and it is ~800x the heaviest single pass any current leg actually spends
-# (P⁻₃Λ¹(TET), 5 046 units), so today nothing comes close to the ceiling.
+# SIZED FROM MEASUREMENT, not guessed.  Calibration over the symbolic certification workloads
+# gives a strikingly stable ~128 000 work units per second (123 k–158 k
+# across every case), so a nominal 10 s ceiling was worth ~1.3 M units on a quiet box.
+# This is ~3x that, a margin chosen so nothing certifies less than under the seconds ceiling
+# — and it is ~800x the heaviest single pass any current workload actually spends
+# (~5 046 units), so nothing comes close to the ceiling.
 #
 # It still BOUNDS a pathological program: ~31 s of exact-lane work, after which the statement
 # degrades to the warned probe fallback exactly as an over-mass one does.  Re-derive it by
-# running the symbolic P(T) legs with the budget unbounded (``POLYARRAY_EXACT_WORK_BUDGET=0``)
+# running the symbolic certification workloads with the budget unbounded (``POLYARRAY_EXACT_WORK_BUDGET=0``)
 # and reading `ExactState.spent` — if the cost model or the lowering changes, that measurement
 # is the thing to repeat, not this constant to adjust by feel.
 _DEFAULT_WORK_BUDGET = 4_000_000
@@ -1145,7 +1145,7 @@ def _sym_apply_builtin(
       case PinvOp():
         return [_exact_pinv(args[0], meter)]
       case ProjectOp():
-        # ``Pᵀ @ v.reshape(-1)`` — the grassmann-origin drop-complement matvec.  Pure field
+        # ``Pᵀ @ v.reshape(-1)`` — the drop-complement matvec.  Pure field
         # arithmetic (no float coercion, unlike ``ProjectOp.__call__``'s numeric contract), so
         # it threads RF cells exactly.
         return [np.einsum("nr,n->r", _obj(args[0]), _obj(args[1]).reshape(-1), optimize=False)]
@@ -1158,16 +1158,15 @@ def _sym_apply_builtin(
         #
         # MINIMAL fold, deliberately — two sound cases and no guessing:
         #   (a) EQUAL BRANCHES ⇒ the scrutinee cannot matter, so the switch is that value. This is the
-        #       one that pays: it is the same question `savo _blocks_equal` asks at the folded block
-        #       ("does reorienting this entity change this value?"), asked per-operand.
+        #       one that pays: it asks, per operand, whether the selected branch changes the value at all.
         #   (b) a scrutinee that IS a build-time constant selects its branch.
-        # Anything else is opaque, as before. DISTRIBUTION — pushing an op through a switch,
+        # Anything else is opaque. DISTRIBUTION — pushing an op through a switch,
         # `f(select_x(a,[x,y]), c)` → `select_x(a,[f(x,c), f(y,c)])` — is a program REWRITE, not
         # something a per-op twin can do, and is deliberately left out of this pass.
         #
-        # Why it matters: design item B moves the σ switch from the folded OUTPUT to the geometry
-        # INPUTS, i.e. UPSTREAM of the whole body. Without (a), every σ-carrying expression would meet
-        # an unfoldable node first and degrade to probes — trading the `QrOp` just removed from the
+        # Why it matters: an orientation-sign switch can be moved from the folded OUTPUT to the geometry
+        # INPUTS, i.e. UPSTREAM of the whole body. Without (a), every orientation-carrying expression would meet
+        # an unfoldable node first and degrade to probes — trading a `QrOp` removed from the
         # dependency path for a `SwitchOp`.
         branches = args[1:]
         if len(branches) != fn.n_branches or not branches:
@@ -1199,7 +1198,7 @@ def _sym_apply_builtin(
         # STRICTLY 2-D only: the twin below is the matrix Kronecker product, and a non-matrix
         # operand would silently produce a wrong SHAPE (which does not fail here — it fails far
         # downstream in an unrelated einsum's arity check).  Anything else falls through to the
-        # opaque tail, i.e. exactly the pre-existing behaviour.
+        # opaque tail.
         mats = [_obj(a) for a in args]
         if any(m.ndim != 2 for m in mats):
             reason.note(f"KronOp over non-matrix operands (ndim={[m.ndim for m in mats]})")
@@ -1211,10 +1210,9 @@ def _sym_apply_builtin(
         return [out]
       case KronFreeOp():
         # The Kron block with trailing free axes — the same elementwise product as
-        # `KronFreeOp.__call__`, done in object dtype so exact cells survive.  Leaving this
-        # un-normalizable made the exact lane refuse every `Λᵏ` certificate: the wedge's
-        # two traced slots meet in exactly this op, so `KronFreeOp` sat directly on the result
-        # path with NOTHING irrational about it (a Kronecker product is field arithmetic).
+        # `KronFreeOp.__call__`, done in object dtype so exact cells survive.  Without a twin the
+        # exact lane refuses any certificate whose result path runs through this op — and a Kronecker
+        # product has NOTHING irrational about it (it is field arithmetic).
         F, G = _obj(args[0]), _obj(args[1])
         # Mirror `KronFreeOp.__call__`'s shape contract exactly: each operand is
         # ``(dom, cod, *free)`` with the declared free-axis counts.  A mismatch would build a
@@ -1277,12 +1275,10 @@ def _sym_apply_builtin(
       # Each op below is expressible over ℚ(atoms) — pure field arithmetic, a pure slice, or
       # a read of static SHAPE data — so each twin EXTENDS the certificate: statements that
       # previously degraded to the (warned) probe lane now certify exactly.  That changes what
-      # folds and hence downstream numerics at roundoff, which is why each landed with its own
-      # value A/B rather than as one sweep.
+      # folds and hence downstream numerics at roundoff.
       case ComposeViaStdOp():
         # `solve(R_to, R_from)` — the SAME exact Gauss elimination the `SolveOp` arm uses, on
-        # the same `_exact_solve`.  This was the sharpest of the listed gaps precisely because
-        # the twin it needed was already sitting in this module.
+        # the same `_exact_solve`.
         return [_exact_solve(_obj(args[0]), _obj(args[1]), meter)]
       case BlockDiagOp():
         # Block-diagonal assembly: pure STRUCTURE — every entry is either an operand cell or
@@ -1493,19 +1489,19 @@ def _run_program(
         return None
     for i, stmt in enumerate(body.statements):
         if not _exec_stmt(body, i, stmt, env, meter, depth, reason, max_sym_mass):
-            # KEEP GOING.  This used to `return None` ("one opaque stmt poisons the body"), which
-            # made the lane refuse on the PRESENCE of an un-normalizable op rather than on the
+            # KEEP GOING.  Returning `None` here ("one opaque stmt poisons the body") would make the
+            # lane refuse on the PRESENCE of an un-normalizable op rather than on the
             # RESULT depending on it.  A statement we cannot execute simply leaves its outputs
             # unbound, and `_resolve_ref` already yields `_OPAQUE` for those — so opacity cascades
             # to exactly the consumers that genuinely need it, and the declared-output check below
             # still returns `None` if the result is among them.  If the body's outputs resolve
             # anyway, the opaque statement was DEAD and refusing was pure loss.
             #
-            # This is what unblocks a certificate whose `grass_dof` body still CONTAINS a `QrOp`
+            # This unblocks a certificate whose body still CONTAINS a `QrOp`
             # that nothing downstream reads: liveness becomes implicit — "the result is a number"
             # is itself the proof that the op did not matter, and the statements can be discarded
-            # afterwards.  (Measured: `Λᵏ` face DOFs reach 0 LIVE frame ops but keep a dead
-            # `QrOp` in the body; presence-based refusal alone kept them on the probe lane.)
+            # afterwards.  (A body can reach 0 LIVE factorization ops yet keep a dead
+            # `QrOp`; presence-based refusal alone kept such bodies on the probe lane.)
             continue
     outs: list[Any] = []
     for sa in body.outputs.values():
@@ -1533,9 +1529,9 @@ def _exec_stmt(
     # A `SwitchOp`'s SCRUTINEE is allowed to stay unresolved. Its inputs are
     # `(scrutinee, branch_0, …)`, and when every branch carries the SAME value the switch is the
     # identity no matter which is picked — so the branch that a run-time-only `IntAtom` would select
-    # is irrelevant. Aborting on the unresolved scrutinee (as every other opaque operand does, and as
-    # this did) throws that away and freezes the whole downstream expression. Any opaque BRANCH is
-    # still fatal, exactly as before. See the `SwitchOp` twin in `_sym_apply`.
+    # is irrelevant. Aborting on the unresolved scrutinee (as every other opaque operand does)
+    # throws that away and freezes the whole downstream expression. Any opaque BRANCH is
+    # still fatal. See the `SwitchOp` twin in `_sym_apply`.
     _is_switch = isinstance(stmt.fn, SwitchOp)
     # An unresolved operand is NOT automatically fatal (`_tolerates_opaque_operand`): a
     # sub-Program may not read it, and a MULTILINEAR op with an exactly-zero factor is zero
@@ -1812,7 +1808,7 @@ def exact_fold_cells(
             flat_out[i] = cv
             changed = True
     # ACCUMULATE onto the state: `spent` is the work this certificate cost in total, across
-    # both passes, not just the statement pass.  On the FEEC legs the statement pass refutes
+    # both passes, not just the statement pass.  On some workloads the statement pass refutes
     # the vertex-dependent pieces and folds nothing — the cancellation completes HERE, per
     # cell — so a `spent` that omitted this pass would under-report the real cost of the
     # certificate by most of it.

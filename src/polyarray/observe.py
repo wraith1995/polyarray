@@ -213,9 +213,9 @@ class Measurement:
 _EMPTY = Measurement()
 
 
-# The attribute chain the consumers' wrappers use to hold the program they were built from:
-# a SymArray and a pointwise `Compiled` both expose `.program`, but a `Compiled`'s is a
-# `GrassmannProgram` wrapper whose polyarray `Program` is `.prog`.  Walking a couple of links
+# The attribute chain the consumer packages' wrappers use to hold the program they were built
+# from: a SymArray and a compiled wrapper both expose `.program`, but a compiled wrapper's is
+# another wrapper whose polyarray `Program` is `.prog`.  Walking a couple of links
 # lets a call site hand this module whatever its stage produced without unwrapping first.
 _PROGRAM_ATTRS = ("program", "prog")
 _MAX_UNWRAP = 4
@@ -457,7 +457,7 @@ def _measure(obj: Observable, degree_seed: Mapping[str, float] | None) -> Measur
                                symbolic_cells=sym, max_cell=mx, shape=tuple(obj.shape))
         return Measurement(kind="array", n_output_cells=int(obj.size), shape=tuple(obj.shape))
     if isinstance(obj, (list, tuple)):
-        # A stage that produced several artefacts (savo's `entries`, a jet's per-order arrays).
+        # A stage that produced several artefacts (a front end's `entries`, a jet's per-order arrays).
         # Sum the parts so the stage still reports one honest total.
         parts = [_measure(o, degree_seed) for o in obj]
         # Propagate the program identity when every part came off the SAME program (a jet's
@@ -629,8 +629,8 @@ class CompileTrace:
         self._dump_root = dump_root
         # (depth, stage) -> its dump dir. Keyed the SAME way rows are: the same stage name at two
         # DEPTHS is two distinct rows, and keying the directory by name alone silently collapsed
-        # them into one (savo's `dof-table` runs at two depths and the deeper, 30-occurrence row
-        # lost its directory entirely).
+        # them into one (a stage that runs at two depths lost the deeper, 30-occurrence row's
+        # directory entirely).
         self._dirs: dict[tuple[int, str], Path] = {}
         self._off_paths: dict[str, str] = {}   # uninstrumented routes taken (see `off_path`)
         self._detail_text: dict[tuple[int, str], str] = {}    # rendered caller descriptions
@@ -936,7 +936,7 @@ class CompileTrace:
         """
         if obj is None or key in self._program_text:
             return
-        # A stage may hand over a SEQUENCE of artefacts (savo's per-match integrands, a jet's
+        # A stage may hand over a SEQUENCE of artefacts (a front end's per-match outputs, a jet's
         # per-order arrays). Render the first one that carries a program and say how many there
         # were, rather than silently writing nothing.
         note = ""

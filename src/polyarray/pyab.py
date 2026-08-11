@@ -367,10 +367,9 @@ def _render_dyn_block_repeat(op: DynBlockRepeatOp, builder: StmtBuilder, args: l
     return [low._ns_call("kron", (eye, args[0]))]
 
 
-# --- Batch-2 relocated generic array-op lowerings ---------------------------
-# Bodies moved verbatim from grassmann's ``__pyab_lower__`` hooks, adapting only
-# the signature; ``_shape_axis_expr``/``_dyn_eye_expr`` become the identical
-# polyarray helpers ``_axis_len``/``_static_eye``.
+# --- Generic array-op lowerings ---------------------------------------------
+# ``__pyab_lower__`` hooks for generic array ops; ``_shape_axis_expr``/``_dyn_eye_expr``
+# map to the polyarray helpers ``_axis_len``/``_static_eye``.
 
 
 def _render_dyn_eye(op: DynEyeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
@@ -531,11 +530,11 @@ def _render_last_cols(op: LastColsOp, builder: StmtBuilder, args: list[PyExprs],
     return [c.AccessExpr(base=args[0], index=(c.Slice(), c.Slice(start=rank)))]
 
 
-# --- Batch-3 relocated generic array / linalg lowerings ---------------------
-# Bodies moved verbatim from grassmann's ``__pyab_lower__`` hooks; ``_ns_call``
+# --- Generic array / linalg lowerings ---------------------------------------
+# ``__pyab_lower__`` hooks; ``_ns_call``
 # routes ``linalg.*`` / ``kron`` / ``sqrt`` through the array namespace (numpy
 # AND torch), and ``torch.vmap`` supplies the batch axis around the plain 2-D
-# linalg. ``_shape_axis_expr`` becomes the identical polyarray helper ``_axis_len``.
+# linalg. ``_shape_axis_expr`` maps to the polyarray helper ``_axis_len``.
 
 
 def _render_project(op: ProjectOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
@@ -939,7 +938,7 @@ class _Lowerer:
         # Structural-fingerprint intern table (shared like ``helpers``): fingerprint of an
         # emitted helper's (params, body) -> its def name. ``helpers`` memoizes by
         # ``id(prog)`` only, so a content-identical sub-Program REBUILT as a fresh object
-        # (the per-σ-branch / per-functional ``grass_dof`` closures) re-emitted its whole
+        # (closures rebuilt per branch / per functional) re-emitted its whole
         # def — measured 388 emitted defs collapsing to 168 on one assembly's
         # kernels. This interns at emission: one def per distinct body, every call site
         # shares it. See ``_helper_fingerprint`` for the soundness argument.
@@ -1338,7 +1337,7 @@ class _Lowerer:
     # -- SVD / GSVD (data-dependent rank -> eager fusion boundary) ---------
     #
     # ``rank = (S > tol).sum()`` is genuinely runtime, so the rank-dependent
-    # FFS split (``U[:, :rank]`` etc.) uses ``int(rank)`` — correct in eager
+    # split (``U[:, :rank]`` etc.) uses ``int(rank)`` — correct in eager
     # torch / numpy, but a graph break under ``@torch.compile``. Emit these in a
     # plain (undecorated) callable and they run eager; only ``place="fuse"``
     # across the rank hits the break.

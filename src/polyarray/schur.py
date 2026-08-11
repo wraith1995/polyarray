@@ -147,7 +147,7 @@ def _deferred_matmul(*arrs: SymArray, masks: tuple[np.ndarray, ...] | None = Non
         if program is not None and big and not numeric:
             # A TYPED matmul op (2-D einsum `ij,jk->ik`), NOT an opaque ``lambda a, b: a @ b``: the typed op
             # lowers through EVERY backend — ``Program.run`` (numeric), ``to_numpy_source``, AND
-            # ``pyab``/torch (a grounded-symbolic ``P(T)`` compiled into savo's vmapped value kernel) — where
+            # ``pyab``/torch (a grounded-symbolic matrix compiled into a vmapped value kernel) — where
             # an opaque python callable raises "no lowering for op 'function'".
             (out,) = program.emit_stmt(
                 EinsumStmtOp(spec="ij,jk->ik"),
@@ -181,7 +181,7 @@ def _base_inverse(arr: SymArray) -> SymArray:
     if program is not None and not arr.is_numeric and n >= _defer_thresholds()[1]:
         # A TYPED ``InvOp`` (the SAME op :meth:`SymArray.inverse` defers to), NOT an opaque
         # ``lambda a: np.linalg.inv(a)``: lowers through Program.run / to_numpy_source / pyab-torch alike,
-        # so a grounded-symbolic ``P(T)`` compiles into savo's value kernel (an opaque callable cannot).
+        # so a grounded-symbolic matrix compiles into a vmapped value kernel (an opaque callable cannot).
         (out,) = program.emit_stmt(
             InvOp(),
             [arr],
@@ -252,7 +252,7 @@ def _structural_mask(matrix: SymArray) -> np.ndarray | None:
     # A 3-point probe runs the C program only 3× — no-``compile`` RF evaluation (direct term
     # sum, both in the program runner via ``probe_direct_eval`` and in the output-cell loop
     # via ``compiled=False``) is much cheaper than codegen on a degree-5 C, and
-    # byte-identical, so the probed mask is unchanged.
+    # gives identical values, so the probed mask is unchanged.
     with probe_direct_eval():
         for k in range(_N_PROBES):
             try:
@@ -298,11 +298,10 @@ def _approx_zero(cell: Cell) -> bool:
 #: same matrix yields the same mask everywhere.
 #:
 #: SIZED FROM MEASUREMENT, at ``exact_fold._DEFAULT_WORK_BUDGET`` — this is the same lane, bounded
-#: the same way. The plate mask folds spend 18 912 (morley), 50 832 (hermite), 544 389 (bell) and
-#: 703 663 (argyris) units, so the heaviest runs at ~18% of the ceiling. At the lane's calibrated
-#: ~128 000 units/second the ceiling this replaced (10 seconds) was worth only ~1.28 M units, which
-#: argyris was already spending 55% of: the mask was one loaded box away from silently coarsening,
-#: which is exactly the machine dependence this currency removes.
+#: the same way. The heaviest mask folds observed spend several hundred thousand units. At the lane's
+#: calibrated ~128 000 units/second the ceiling this replaced (10 seconds) was worth only ~1.28 M
+#: units, which the heaviest runs were already spending more than half of: the mask was one loaded
+#: box away from silently coarsening, which is exactly the machine dependence this currency removes.
 _MASK_FOLD_WORK_BUDGET = 4_000_000
 
 
