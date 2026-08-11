@@ -1606,15 +1606,23 @@ class _Lowerer:
         """Return ``(Q_grid, R_grid)`` — the scalar-grid twin of :meth:`try_small_qr`.
 
         ``np.ndarray``s of scalar exprs (no ``stack``), reading the current op's first operand
-        component-wise from ``_cur_in_refs``. ``None`` when small-QR is disabled/too large or the operand
-        ref is unavailable.
+        component-wise from ``_cur_in_refs``. ``None`` when small-QR is disabled, the matrix is too
+        large for ``sq.max_dim``, ``mode`` is not reduced/complete, the operand ref is unavailable or
+        its grid is not ``(m, n)``, or an explicit ``POLYARRAY_SCALARIZE_MAX`` cap excludes it.
         """
         sq = self.opts.small_qr
         m, n = _static_matrix_shape(self._current_out)
         if not (sq.enabled and m is not None and n is not None and m >= n
                 and max(m, n) <= sq.max_dim and mode in ("reduced", "complete")):
             return None
-        if self._scalarize_max <= 0 or m * m > self._scalarize_max:
+        # `_scalarize_max` is an OPTIONAL extra cap here, not an on/off switch. Its default is 0,
+        # documented as "never scalarize", so reading 0 as "disabled" made this whole path dead
+        # under stock environment however `small_qr` was configured — and `small_qr` is enabled by
+        # default, so a reader configuring it would reasonably expect the grid path to fire. The
+        # size guard it was meant to provide is already implied: `max(m, n) <= sq.max_dim` bounds
+        # the emitted grid at `sq.max_dim ** 2` scalars (16 at the default 4). The tensor twin
+        # `try_small_qr` carries no such gate. So honour an explicitly-set cap and nothing more.
+        if self._scalarize_max > 0 and m * m > self._scalarize_max:
             return None
         refs = self._cur_in_refs
         if not refs:
