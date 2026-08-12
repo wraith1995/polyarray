@@ -53,13 +53,13 @@ jobs:
   types:
     name: mypy (advisory)
     runs-on: ubuntu-latest
-    # mypy still reports a baseline of errors; the job surfaces the count and
-    # trend without blocking the build. Make it a required gate once it reaches zero.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - run: pip install -e ".[dev]"
-      - run: mypy
+      # mypy still reports a baseline of errors; run it for the count and trend in
+      # the log without failing the check. Drop the `|| true` to make it a gate
+      # once the baseline reaches zero.
+      - run: mypy || true
