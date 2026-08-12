@@ -12,7 +12,7 @@ contract — additions need it updated).
 |---|---|
 | a constant-folder / partial evaluator | `simplify.specialize(program, bind=, subs=, budget=)`; wrappers `fold_numeric`, `bind_inputs`, `substitute` |
 | an IR walker / cost report | `forward.analyze(program) -> IRReport` (walks nested sub-Programs + vmap bodies via `iter_programs`) |
-| staged compile logging / dumps / "why did this blow up" | `observe.py` — **read `OBSERVABILITY.md`**. `FEM_OBSERVE` ∈ off\|warn\|info\|debug\|dump; Δ-waterfall report + `peak_stage`/`jump_stage`/`rational_stage`; `dump_dir_for(name)` feeds `pyab.compile_torch(dump_dir=)` so symbolic + generated-torch artifacts share one numbered dir. Instrument in pointwise/savo/oracle ONLY — never grassmann/chartLib |
+| staged compile logging / dumps / "why did this blow up" | `observe.py` (see its module docstring). `FEM_OBSERVE` ∈ off\|warn\|info\|debug\|dump; Δ-waterfall report + `peak_stage`/`jump_stage`/`rational_stage`; `dump_dir_for(name)` feeds `pyab.compile_torch(dump_dir=)` so symbolic + generated-torch artifacts share one numbered dir. Instrument in pointwise/savo/oracle ONLY — never grassmann/chartLib |
 | a "collapse big cells to numeric" pass | `forward.partial_eval(program, max_cell_size=)` — both eval families (`forward` and `simplify`) are current; use whichever fits (cost-driven collapse vs bind/subs-driven folding) |
 | symbolic substitution | `RationalFunction.compose`/`compose_multi`; `substitute` / `specialize(subs=)` |
 | a zero/sparsity mask | `sparsity.propagate_sparsity(program)`, `block_zero_mask` (structural; opaque ops reset the mask — false *positives* are bugs) |

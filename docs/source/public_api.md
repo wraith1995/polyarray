@@ -513,8 +513,6 @@ At `dump` each stage directory gets `stage.txt` (numbers + `IRReport`), `program
 (the stage's polyarray IR rendered via `numpy_source.to_numpy_source`), and `detail.txt`
 if the call site supplied one.
 
-Full guide: **`OBSERVABILITY.md`**.
-
 Env: `FEM_OBSERVE` (level), `FEM_OBSERVE_DIR` (dump root), `FEM_OBSERVE_MASS_CEILING` /
 `_OPERAND_CEILING` / `_CELLS_CEILING` / `_DEGREE_CEILING` (warning thresholds).
 
