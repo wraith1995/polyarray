@@ -10,7 +10,6 @@
    
       Coeff
       CoeffLike
-      Monom
    
    .. rubric:: Functions
 

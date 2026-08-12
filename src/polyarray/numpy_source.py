@@ -1,12 +1,11 @@
 """Emit a standalone, runnable numpy ``.py`` source string from a :class:`Program`.
 
-A :class:`polyarray.Program` (built e.g. by grassmann's ``G.compile(term)``)
-can be *run* (:meth:`Program.run`) but not serialised to a readable numpy
-module.  :func:`to_numpy_source` walks the program and emits a self-contained
-function — one parameter per program input (named by the input name) and one
-per *free feed atom* (see below), each statement lowered to the numpy call its
-typed op models, and the output(s) assembled from their
-:class:`RationalFunction` cells — shaped like matrixcalculus.org's output::
+A :class:`polyarray.Program` runs (:meth:`Program.run`) but has no readable
+serialisation.  :func:`to_numpy_source` walks the program and emits a
+self-contained function: one parameter per program input (named by the input
+name) and one per *free feed atom* (see below), each statement lowered to the
+numpy call its typed op models, and the output(s) assembled from their
+:class:`RationalFunction` cells::
 
     import numpy as np
 
@@ -15,55 +14,54 @@ typed op models, and the output(s) assembled from their
         result = ...
         return result
 
-The emitter mirrors :meth:`Program.run` semantics exactly (the same
-ref-resolution + per-cell ``RationalFunction`` evaluation), but emits source
-instead of executing.  It reuses :func:`polyarray.rational._poly_to_pyexpr`
-(the helper that already renders a polynomial to a Python expression) for the
-rational-cell lane, so numerator/denominator rendering is shared with the
-runtime ``RationalFunction`` evaluator.
-
-The generated module depends on ``numpy`` only.
+The emitter mirrors :meth:`Program.run` exactly — the same ref-resolution and
+per-cell ``RationalFunction`` evaluation — but writes source in place of
+executing it.  The rational-cell lane reuses
+:func:`polyarray.rational._poly_to_pyexpr`, which renders a polynomial to a
+Python expression, so numerator and denominator rendering is shared with the
+runtime ``RationalFunction`` evaluator.  The generated module depends on
+``numpy`` alone.
 
 Free feed atoms become parameters
 ---------------------------------
-A cell's :class:`RationalFunction` generators are normally bound either by a
-declared program input or by an earlier statement's output.  A program may also
-be *open* over generators that are neither: a free FEED atom, such as savo's
-per-cell vertex atoms ``V_j_k``, carried symbolically through a mid-pipeline
-program that has not yet declared them.  These are exactly the program's free
-variables, and they render as further **parameters** of the generated function,
-appended after the declared inputs in sorted generator-name order.  A
-sub-:class:`Program` / ``vmap`` body open over such an atom gains the same
-trailing parameters, and every call site passes the enclosing scope's
-expression for them — so the closure is made explicit rather than dangling.
+A cell's :class:`RationalFunction` generators are normally bound by a declared
+program input or by an earlier statement's output.  A program may instead be
+*open* over a generator that is neither — a *free feed atom* such as ``V_j_k``,
+carried symbolically through a program that has not yet declared it.  These are
+exactly the program's free variables, and they render as further parameters of
+the generated function, appended after the declared inputs in sorted
+generator-name order.  A sub-:class:`Program` or ``vmap`` body open over such an
+atom gains the same trailing parameters, and every call site passes the
+enclosing scope's expression for them, so the closure is made explicit rather
+than left dangling.
 
-Extending to non-polyarray ops
-------------------------------
-polyarray's own typed ops (``DetOp``/``EinsumStmtOp``/…) are covered by the
-built-in registry.  Front-ends that lower onto polyarray with their *own* Stmt
-ops either give the op class a ``__numpy_source__`` hook (below — the canonical
-route) or pass an ``op_renderers`` mapping keyed by the op class name to
-:func:`to_numpy_source` — keeping polyarray free of any dependency on the
-front-end.  An op with neither raises a clear ``NotImplementedError`` naming the
-op.  A supplied key is matched against ``type(fn).__name__``; one that names a
-polyarray op with a private ``_Name`` spelling can never match and is reported
-(:class:`DeadOpKeyWarning`).
+Extending to front-end ops
+--------------------------
+polyarray's own typed ops (``DetOp``, ``EinsumStmtOp``, …) are covered by the
+built-in registry.  A front-end that lowers onto polyarray with its *own* Stmt
+ops either gives the op class a ``__numpy_source__`` hook (the canonical route,
+described below) or passes an ``op_renderers`` mapping keyed by op-class name to
+:func:`to_numpy_source`, so polyarray keeps no dependency on the front-end.  An
+op with neither raises a clear ``NotImplementedError`` naming it.  A supplied
+key is matched against ``type(fn).__name__``; a key naming a polyarray op under
+a private ``_Name`` spelling can never match, and is reported as a
+:class:`DeadOpKeyWarning`.
 
 The ``__numpy_source__`` emit hook
 ----------------------------------
-A ``Stmt.fn`` — an op instance, or a *plain Python callable* that is neither an
-op class, a sub-:class:`Program`, nor a ``vmap`` closure (e.g. a producer's
-``lambda *arrs: np.einsum(spec, *arrs)``) — emits **iff** the built-in registry
-and ``op_renderers`` do not cover it and it carries a
-``__numpy_source__(args) -> str`` attribute: a callable taking the list of
-already-rendered argument-expression strings (in operand order) and returning a
-single numpy *expression string* (written in terms of ``np`` and those arg
-exprs).  A front-end op defines it as a method on its class (``self`` is the
-op), exactly as it defines ``__pyab_lower__`` for :mod:`polyarray.pyab`;
-producers opt a plain-callable Stmt in by stamping ``fn.__numpy_source__``.
-The hook is consulted LAST, so an explicit ``op_renderers`` entry and the
-built-in vocabulary both take precedence over it and no stray hook can shadow a
-canonical rendering.  A fn with no hook still raises the clear
+A ``Stmt.fn`` carries its own emitter through a
+``__numpy_source__(args) -> str`` attribute: a callable taking the already-rendered
+argument-expression strings (in operand order) and returning a single numpy
+*expression string*, written in terms of ``np`` and those arg exprs.  The hook
+fires for a fn — an op instance, or a *plain Python callable* that is none of an
+op class, a sub-:class:`Program`, or a ``vmap`` closure (say a producer's
+``lambda *arrs: np.einsum(spec, *arrs)``) — exactly when the built-in registry
+and ``op_renderers`` do not cover it and it carries the attribute.  A front-end
+op defines it as a method on its class (``self`` is the op), just as it defines
+``__pyab_lower__`` for :mod:`polyarray.pyab`; a producer opts a plain-callable
+Stmt in by stamping ``fn.__numpy_source__``.  The hook is consulted last, after
+the explicit ``op_renderers`` override and the built-in vocabulary, so no stray
+hook can shadow a canonical rendering.  A fn with no hook raises the clear
 ``NotImplementedError``.  This keeps the protocol additive and polyarray free of
 any front-end dependency.
 """
@@ -155,10 +153,10 @@ __all__ = ["to_numpy_source", "OpRenderer"]
 def _vmap_body_of(fn: StmtOp) -> Program | None:
     """Pull a per-point body :class:`Program` out of a ``vmap`` closure.
 
-    Mirrors :func:`polyarray.forward._body_of` but kept local so this module
-    has no import-time dependency on ``forward``.  ``vmap`` also stamps the
-    body onto ``fn._vmap_body`` (additive); prefer that, fall back to the
-    closure scan for robustness.
+    Mirrors :func:`polyarray.forward._body_of`, kept local so this module has no
+    import-time dependency on ``forward``.  ``vmap`` stamps the body onto
+    ``fn._vmap_body``, which this reads first, falling back to a scan of the
+    closure cells for robustness.
     """
     body = getattr(fn, "_vmap_body", None)
     if isinstance(body, Program):
@@ -174,11 +172,11 @@ def _vmap_body_of(fn: StmtOp) -> Program | None:
 
 
 class _HelperRegistry:
-    """Shared, module-level helper-def accumulator across nested emitters.
+    """Accumulator for the module-level helper defs shared across nested emitters.
 
-    Sub-``Program`` bodies and ``vmap`` bodies are emitted once each as a
-    module-level ``def`` (deduplicated by object identity) and referenced by
-    name from the call sites that need them.
+    A sub-:class:`Program` body or a ``vmap`` body is emitted once as a
+    module-level ``def``, deduplicated by object identity, and referenced by name
+    from every call site that needs it.
     """
 
     def __init__(self) -> None:
@@ -203,29 +201,31 @@ type OpRenderer = Callable[[Any, list[str]], str]
 
 
 class DeadOpKeyWarning(UserWarning):
-    """A caller-supplied op-name key can never match any op, so its entry is unreachable.
+    """A caller-supplied op-name key that can never match any op, leaving its entry unreachable.
 
-    Both public string-keyed extension points (``to_numpy_source(op_renderers=)`` and
-    ``pyab.LowerOpts.op_lowerings``) exist so a front end can render ITS ops without polyarray
-    importing it. The price is that a key naming nothing is INVISIBLE: the lookup simply misses
-    and the caller gets the fallback — which is usually correct, so nothing fails and nothing
-    warns. Seven such keys survived a year in ``batch.py``.
+    Both public string-keyed extension points —
+    ``to_numpy_source(op_renderers=)`` and ``pyab.LowerOpts.op_lowerings`` —
+    exist so a front end can render its own ops without polyarray importing it.
+    The price is that a key naming nothing is invisible: the lookup simply misses
+    and the caller gets the fallback, which is usually correct, so nothing fails
+    and nothing warns.
 
-    polyarray cannot validate a genuine front-end name (it deliberately cannot see that
-    namespace). It CAN catch the specific spelling that caused every instance so far: a private
-    ``_Name`` for an op that now lives in polyarray as ``Name``. Ops were relocated here from
-    grassmann's lowering layer, so every such key was correct before the move and silently dead
-    after it — and the fallback kept the results right, which is precisely why nobody noticed.
+    polyarray cannot validate a genuine front-end name, since it deliberately
+    cannot see that namespace.  It can catch the one spelling that can never
+    match: a private ``_Name`` for an op that lives in polyarray as ``Name``.
+    Such a key is silently dead — the fallback keeps the results right, so
+    nothing flags the miss.
     """
 
 
 def _warn_dead_op_keys(keys: Iterable[str], where: str) -> None:
-    """Warn about supplied keys that name a polyarray op with a private spelling.
+    """Warn about supplied keys that name a polyarray op under a private spelling.
 
-    Deliberately narrow. A key that resolves to nothing at all is NOT flagged: it may name a
-    front-end op polyarray genuinely cannot see, and a false alarm on a legitimate key would
-    train people to ignore this warning. A key whose underscore-stripped form IS one of our op
-    classes is a different matter — there is no reading of it that can ever match.
+    The check is deliberately narrow.  A key that resolves to nothing at all
+    goes unflagged: it may name a front-end op polyarray genuinely cannot see,
+    and a false alarm on a legitimate key would train people to ignore the
+    warning.  A key whose underscore-stripped form is one of polyarray's own op
+    classes is a different matter, since no reading of it can ever match.
     """
     from . import ir as _ir
 
@@ -440,15 +440,15 @@ class _Emitter:
         return lines
 
     def _collect_helper_params(self) -> list[str]:
-        """Positional params for a helper: the body inputs, in order.
+        """Return the positional params for a helper: the body inputs, in order.
 
-        IntAtoms are intentionally excluded — ``_run_stmt`` passes only the
-        resolved operands to a sub-Program's :meth:`run`, so a body that
+        IntAtoms are excluded, since ``_run_stmt`` passes only the resolved
+        operands to a sub-:class:`Program`'s :meth:`run`, so a body that
         references an IntAtom would already fail at run time.
         """
         params: list[str] = []
         for inp in self.prog.inputs:
-            # A DimAtom-shaped (runtime-rank FFS) input is fine as a positional array param — its
+            # A DimAtom-shaped (runtime-rank) input is fine as a positional array param — its
             # actual shape is fixed at call time; the body's ops read it from the passed array.
             p = _safe_param_name(inp.name)
             self.param[inp.name] = p
@@ -888,7 +888,7 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
     def dyn_block_repeat(op: DynBlockRepeatOp, a: list[str]) -> str:
         return f"np.kron(np.eye(int({a[1]})), np.asarray({a[0]}, dtype=float))"
 
-    # --- Batch-2 relocated generic array ops (bodies moved from grassmann) ---
+    # --- Generic array ops ---
     def dyn_eye(op: DynEyeOp, a: list[str]) -> str:
         return f"np.eye(int(np.asarray({a[0]}).shape[{op.axis}]))"
 
@@ -963,7 +963,7 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
     def last_cols(op: LastColsOp, a: list[str]) -> str:
         return f"np.asarray({a[0]}, dtype=float)[:, int({a[1]}):]"
 
-    # --- Batch-3 relocated generic array / linalg ops (bodies from grassmann) ---
+    # --- Generic array / linalg ops ---
     def project(op: ProjectOp, a: list[str]) -> str:  # Pᵀ @ v  (ambient coords -> sub-basis coords)
         return f"(np.asarray({a[0]}, dtype=float).T @ np.asarray({a[1]}, dtype=float).reshape(-1))"
 
@@ -1066,7 +1066,7 @@ def to_numpy_source(
 
     The returned string defines ``import numpy as np`` and a function
     ``func_name`` taking one positional parameter per program input (named by
-    the input name), one per declared ``IntAtom``, and one per FREE feed atom
+    the input name), one per declared ``IntAtom``, and one per free feed atom
     (a cell generator bound by neither an input nor a statement output —
     appended last, in sorted generator-name order), computing every Stmt in
     order, and returning the program output(s) — a single array when there is

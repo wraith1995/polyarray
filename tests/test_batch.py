@@ -137,4 +137,6 @@ def test_project_and_embed_batched():
     (sub,) = p.emit_stmt(ProjectOp(), [Const(P), p.input("v")], [OutSpec("s", (2,))])
     (amb,) = p.emit_stmt(EmbedOp((4,)), [Const(P), sub], [OutSpec("a", (4,))])
     p.add_output("result", amb.cells)
-    _exact(p, {"v": _rng.standard_normal((B, 4))})
+    # ProjectOp / EmbedOp contract against the projector, so the batched einsum and
+    # the per-element loop agree only to rounding (not bit-for-bit across BLAS).
+    _check(p, {"v": _rng.standard_normal((B, 4))})

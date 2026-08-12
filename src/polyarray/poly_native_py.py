@@ -1,12 +1,11 @@
-"""Pure-Python native polynomial backend.
+"""The pure-Python polynomial backend: a sparse engine of monomial-tuple dicts.
 
-A dict-of-monomial-tuples sparse multivariate polynomial engine, generic over the
-coefficient type via a :class:`ValueHandle`. Selected by
-``CHARTLIB_POLY_BACKEND=native_py``, with the coefficient type chosen by
-``CHARTLIB_POLY_COEFF``.
-
-It implements the same :class:`Poly` / :class:`Ring` protocol as the sympy and flint
-backends, without the per-op Python cost of :class:`sympy.polys.rings.PolyElement`.
+Each polynomial is a dictionary mapping an exponent vector to its coefficient, and the
+engine is generic over the coefficient type through a :class:`ValueHandle`. It is
+selected by ``CHARTLIB_POLY_BACKEND=native_py`` with the coefficient type chosen by
+``CHARTLIB_POLY_COEFF``, and it implements the same :class:`Poly` and :class:`Ring`
+protocol as the sympy and flint backends without the per-operation Python cost of
+:class:`sympy.polys.rings.PolyElement`.
 """
 from __future__ import annotations
 

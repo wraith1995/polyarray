@@ -1,43 +1,49 @@
-"""Staged compile observability: measure a stage's IR, log it, warn on it, dump it.
+"""Measure the IR at each boundary of a staged compile, then log, warn, and dump it.
 
-The consumers (pointwise / savo / oracle) drive a multi-stage compile — enumerate, sample,
-represent, integrate, lower, torch-compile — and every hard bug in this stack has been "some
-stage blew the IR up and we could not see which".  This module is the instrument: a consumer
-calls :meth:`CompileTrace.stage` at a boundary with whatever that boundary produced (a
-:class:`~polyarray.ir.Program`, a :class:`~polyarray.ir.SymArray`, an array), and gets a
-:class:`Snapshot` recorded — symbolic mass, operand mass, cell counts, provenance histogram,
-polynomial degree — plus the **delta from the previous stage**, which is the thing that
+A consumer package drives a multi-stage compile whose boundaries are named stages, and any one
+of them can blow the IR up without it being visible which one did::
+
+    enumerate ─ sample ─ represent ─ integrate ─ lower ─ torch-compile
+        at each boundary:  CompileTrace.stage(obj)
+                                    │
+        Snapshot(mass, cells, degree, provenance,  Δ from the previous stage)
+
+A consumer calls :meth:`CompileTrace.stage` at a boundary with whatever that boundary produced
+(a :class:`~polyarray.ir.Program`, a :class:`~polyarray.ir.SymArray`, an array), and a
+:class:`Snapshot` is recorded: symbolic mass, operand mass, cell counts, provenance histogram,
+and polynomial degree, together with the delta from the previous stage. The delta is what
 actually names a culprit.
 
-Everything is measured with the analysis polyarray already owns
+Every number comes from the analysis polyarray already owns
 (:func:`polyarray.forward.analyze`, :func:`polyarray.degree.program_degree`,
 :func:`polyarray.ir._cell_size`); this module adds no parallel cost model.
 
-**Layering.**  This lives in polyarray because polyarray owns those primitives *and* the
-pyab→torch dump hand-off, and because polyarray is a dependency of every layer that wants to
-be observed — so instrumentation never inverts the stack.  grassmann and chartLib are
-deliberately NOT instrumented and must not import this.
+This lives in polyarray because polyarray owns those primitives and the pyab→torch dump
+hand-off, and because polyarray is a dependency of every layer that wants to be observed, so
+instrumentation never inverts the stack. The layers below polyarray are deliberately
+uninstrumented and must not import this module.
 
-**Levels** (``FEM_OBSERVE``, default ``warn``)::
+The level is read from ``FEM_OBSERVE`` (default ``warn``), and each level adds to the one below
+it::
 
-    off    nothing at all; `stage()` returns on its first line
+    off    nothing at all; stage() returns on its first line
     warn   proactive warnings only (oversized IR, degree jump)
     info   + one line per stage with mass / operand_mass / degree and the delta
     debug  + the per-sub-program breakdown and the provenance histogram
-    dump   + write `<FEM_OBSERVE_DIR>/NN-<stage>/` — the expensive level
+    dump   + write <FEM_OBSERVE_DIR>/NN-<stage>/ — the expensive level
 
 At ``dump`` a stage directory doubles as a pyab ``dump_dir``
-(:meth:`CompileTrace.dump_dir_for`), so a lowering stage's ``torch.py`` / ``ir.txt`` /
-``inductor/`` / ``dynamo_explain.txt`` land beside the symbolic snapshot that produced them:
-one numbered listing is the whole compile, symbolic IR through to the generated kernel.
+(:meth:`CompileTrace.dump_dir_for`), so a lowering stage's ``torch.py``, ``ir.txt``,
+``inductor/``, and ``dynamo_explain.txt`` land beside the symbolic snapshot that produced them:
+one numbered listing holds the whole compile, symbolic IR through to the generated kernel.
 
 Two guarantees the call sites depend on:
 
-* **Measurement never breaks a compile.**  Every probe is failure-tolerant; a Snapshot with
+* Measurement never breaks a compile. Every probe is failure-tolerant, and a Snapshot with
   missing numbers is the worst case.
-* **Nothing is forced.**  Bulk (deferred) nodes are counted as deferred and never
-  materialised — :func:`polyarray.forward.analyze` already honours this, and the dump writer
-  reads placeholder cells the same way.
+* Nothing is forced. Bulk (deferred) nodes are counted as deferred and never materialised;
+  :func:`polyarray.forward.analyze` already honours this, and the dump writer reads placeholder
+  cells the same way.
 """
 from __future__ import annotations
 
@@ -73,7 +79,7 @@ _ENV_CELLS = "FEM_OBSERVE_CELLS_CEILING"
 _ENV_DEGREE = "FEM_OBSERVE_DEGREE_CEILING"
 
 # Warning thresholds.  Generous on purpose: a warning must be signal, not noise.  These are the
-# "this stage is already pathological" marks, not "this stage is big" — a high-degree value kernel
+# "this stage is already pathological" marks, not "this stage is big" — a high-degree kernel
 # legitimately carries tens of thousands of monomials.  Tunable per run via the env vars above.
 _MASS_CEILING = 250_000        # Σ monomials over symbolic OUTPUT cells
 _OPERAND_CEILING = 1_000_000   # Σ monomials over non-bulk RF OPERAND cells (the real lowering cost)
@@ -81,8 +87,8 @@ _CELLS_CEILING = 16_384        # symbolic output cells (the eager per-cell scatt
 _DEGREE_CEILING = 24.0         # polynomial degree in the program's inputs
 
 # A stage whose operand mass multiplies by more than this over its parent is a *jump* — the
-# blow-up signature the epic is built to surface (pullback ξ going rational, Faà di Bruno
-# transport).  Growth is normal; an order of magnitude in one stage is not.
+# blow-up signature this module is built to surface (an operation going rational, a
+# higher-order derivative chain).  Growth is normal; an order of magnitude in one stage is not.
 _JUMP_FACTOR = 10.0
 _JUMP_FLOOR = 10_000           # below this absolute mass a jump is uninteresting
 
@@ -90,7 +96,10 @@ _INF = float("inf")
 
 
 class Level(IntEnum):
-    """Observability verbosity.  Ordered — a feature is active at its level and above."""
+    """How much the instrument reports, from silent to full dump.
+
+    The levels are ordered, and a feature is active at its own level and every level above it.
+    """
 
     OFF = 0
     WARN = 1
@@ -144,13 +153,13 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _ensure_logging(lv: Level) -> None:
-    """Give ``fem.observe`` a stderr handler when the app has not configured logging.
+    """Give ``fem.observe`` a stderr handler when the application has not configured logging.
 
-    Observability nobody sees is not observability: the point of ``FEM_OBSERVE=info`` is that a
-    plain script prints the staged trace, and a test that passes ``level=Level.DUMP`` in code
-    must get the same treatment (hence this runs per-trace, not once at import).  Deliberately a
-    no-op when this logger already has a handler or the root logger is configured, so an
-    application's own logging setup always wins.
+    The instrument is only useful when its output is seen: ``FEM_OBSERVE=info`` means a plain
+    script prints the staged trace, and a test that passes ``level=Level.DUMP`` in code gets the
+    same treatment, so this runs per-trace rather than once at import. It is a no-op when this
+    logger already has a handler or the root logger is configured, so an application's own logging
+    setup always wins.
     """
     if lv < Level.INFO:
         return
@@ -171,12 +180,12 @@ def _ensure_logging(lv: Level) -> None:
 
 @dataclass(frozen=True)
 class Measurement:
-    """The size/degree/provenance numbers for one observed object.
+    """The size, degree, and provenance numbers for one observed object.
 
     ``kind`` names what was measured (``program`` / ``symarray`` / ``array`` / ``scalar`` /
-    ``none`` / ``unmeasurable``).  Every count is ``0`` and ``degree`` ``None`` when the object
-    carries no symbolic IR — a numeric stage is legitimately weightless, and that is itself the
-    signal "this stage stayed numeric".
+    ``none`` / ``unmeasurable``). Every count is ``0`` and ``degree`` is ``None`` when the object
+    carries no symbolic IR, because a numeric stage is legitimately weightless, and that emptiness
+    is itself the signal that this stage stayed numeric.
     """
 
     kind: str = "none"
@@ -200,11 +209,11 @@ class Measurement:
 
     @property
     def mass(self) -> int:
-        """The headline cost — operand mass when there is any, else output mass.
+        """The headline cost: operand mass when there is any, otherwise output mass.
 
-        Operand mass is the number that predicts lowering cost (einsum/linalg statements defer
-        their *outputs* to atoms, so output mass reads tiny while the operands expand into the
-        codegen AST); output mass is the meaningful one for a stage that has not yet emitted
+        Operand mass predicts lowering cost, because einsum and linear-algebra statements defer
+        their outputs to atoms, so output mass reads tiny while the operands expand into the
+        codegen AST. Output mass is the meaningful figure for a stage that has not yet emitted
         statements.
         """
         return self.operand_mass or self.out_mass
@@ -213,9 +222,9 @@ class Measurement:
 _EMPTY = Measurement()
 
 
-# The attribute chain the consumers' wrappers use to hold the program they were built from:
-# a SymArray and a pointwise `Compiled` both expose `.program`, but a `Compiled`'s is a
-# `GrassmannProgram` wrapper whose polyarray `Program` is `.prog`.  Walking a couple of links
+# The attribute chain the consumer packages' wrappers use to hold the program they were built
+# from: a SymArray and a compiled wrapper both expose `.program`, but a compiled wrapper's is
+# another wrapper whose polyarray `Program` is `.prog`.  Walking a couple of links
 # lets a call site hand this module whatever its stage produced without unwrapping first.
 _PROGRAM_ATTRS = ("program", "prog")
 _MAX_UNWRAP = 4
@@ -254,38 +263,38 @@ _RESULT_OUTPUT = "staged_result"
 
 
 def _program_with_result(program: Program, obj: Observable) -> tuple[Program, str]:
-    """``program`` extended with the staged value as a declared OUTPUT, plus a note for the header.
+    """Return ``program`` extended with the staged value as a declared output, plus a header note.
 
     Parameters
     ----------
     program
         The :class:`~polyarray.ir.Program` the staged value was computed on.
     obj
-        Whatever the call site staged.  Only a :class:`~polyarray.ir.SymArray` riding ``program``
+        Whatever the call site staged. Only a :class:`~polyarray.ir.SymArray` riding ``program``
         gains an output; anything else (a bare ``Program``, a wrapper) is returned untouched.
 
     Returns
     -------
     tuple
-        ``(program_to_render, note)`` — a COPY carrying the extra output when one was added, else
+        ``(program_to_render, note)``, a copy carrying the extra output when one was added, else
         ``program`` itself; ``note`` is a header comment for the rendered file, empty when nothing
         changed.
 
     Notes
     -----
-    A staged ``SymArray`` is usually not a declared output of the program its cells are expressions
-    over — the statements are the sampling/lowering chain, and the value the stage is *about* lives
-    only in the cells the caller holds.  Rendered as-is, the emitted function therefore computes
-    every statement and then ends ``return None``: nothing connects the code to the matrix.
-    Declaring the array as an output makes the rendered function return it.
+    A staged ``SymArray`` is usually not a declared output of the program its cells are
+    expressions over: the statements are the sampling and lowering chain, and the value the stage
+    is *about* lives only in the cells the caller holds. Rendered as-is, the emitted function
+    computes every statement and then ends ``return None``, so nothing connects the code to the
+    staged value. Declaring the array as an output makes the rendered function return it.
 
-    ⚠ OBSERVATION-ONLY.  The output is declared on :meth:`~polyarray.ir.Program.copy`, never on the
-    live program: a dump must not change what the compile does, and ``add_output`` mutates the
-    program it is called on.  ``copy`` shares only the frozen input descriptors and ring data, so
-    the caller's ``outputs`` dict is untouched.
+    This is observation only. The output is declared on a :meth:`~polyarray.ir.Program.copy`,
+    never on the live program, because a dump must not change what the compile does and
+    ``add_output`` mutates the program it is called on. ``copy`` shares only the frozen input
+    descriptors and ring data, so the caller's ``outputs`` dict is untouched.
 
-    Nothing is FORCED.  ``add_output`` accepts the ``SymArray`` itself, which copies the cell
-    placeholder and the bulk handle without reading ``cells`` — so a bulk (deferred) array is
+    Nothing is forced. ``add_output`` accepts the ``SymArray`` itself and copies the cell
+    placeholder and the bulk handle without reading ``cells``, so a bulk (deferred) array is
     declared as bulk rather than materialised.
     """
     from .ir import SymArray
@@ -317,11 +326,11 @@ def _one(_name: str) -> int:
 
 
 def _degree_of(program: Program, seed: Mapping[str, float] | None) -> float | None:
-    """Polynomial degree of ``program``'s outputs, **in its symbolic atoms**.
+    """Return the polynomial degree of ``program``'s outputs, measured in its symbolic atoms.
 
     The default scores every declared input AND every stray generator as degree 1, which makes
     the number a consistent monotone signal across stages without this module needing any
-    finite-element domain knowledge (that seeding lives in pointwise's ``estimate_degree``, where
+    domain knowledge (that seeding lives in the front end's degree estimation, where
     it belongs).  A caller with a sharper seed — vertices only, say — passes one.
 
     Scoring the *generators* (``gen_deg``), not only the input names, is load-bearing: a stage
@@ -439,7 +448,7 @@ def _measure(obj: Observable, degree_seed: Mapping[str, float] | None) -> Measur
         )
     if isinstance(obj, np.ndarray):
         if obj.dtype == object:
-            # An object array of RationalFunctions — the pre-SymArray shape a sampler hands
+            # An object array of RationalFunctions — the pre-SymArray shape a front end hands
             # back.  Weigh the cells directly; this is the same accounting `_symarray_cells`
             # does, without a program to attribute it to.
             from .ir import _cell_size
@@ -457,10 +466,10 @@ def _measure(obj: Observable, degree_seed: Mapping[str, float] | None) -> Measur
                                symbolic_cells=sym, max_cell=mx, shape=tuple(obj.shape))
         return Measurement(kind="array", n_output_cells=int(obj.size), shape=tuple(obj.shape))
     if isinstance(obj, (list, tuple)):
-        # A stage that produced several artefacts (savo's `entries`, a jet's per-order arrays).
+        # A stage that produced several artefacts (a front end's `entries`, a derivative-expansion's per-order arrays).
         # Sum the parts so the stage still reports one honest total.
         parts = [_measure(o, degree_seed) for o in obj]
-        # Propagate the program identity when every part came off the SAME program (a jet's
+        # Propagate the program identity when every part came off the SAME program (a derivative-expansion's
         # per-order arrays do), so the roll-up can still tell that repeated occurrences are
         # views of one growing program rather than independent work.
         pids = {p.program_id for p in parts if p.program_id is not None}
@@ -547,16 +556,15 @@ def _analyze(program: Program) -> IRReport:
 class Snapshot:
     """One observed stage: what it was, what it produced, and how long it took.
 
-    A stage inside a loop — ``single_compile`` runs once per enumerated match, so its
-    ``sample`` / ``represent`` boundaries fire hundreds of times in one assembly — is **rolled
-    up**: every recording of the same stage name at the same depth accumulates into this one
-    Snapshot rather than appending a new row.  Without that a large compile produces an
-    800-row table and 800 dump directories, which is not observability, it is a log flood.
+    A stage that runs inside a loop is rolled up. Such a stage fires many times in one run, and
+    every recording of the same stage name at the same depth accumulates into this one Snapshot
+    rather than appending a new row. Without that roll-up the report would carry one row and one
+    dump directory per occurrence, which is a log flood rather than observability.
 
-    Under roll-up, :attr:`m` is the measurement of the largest MEASURED occurrence (the one that
-    matters for a blow-up), :attr:`elapsed_s` is cumulative over every occurrence, :attr:`count`
-    says how many times the stage ran, and :attr:`n_measured` how many of those were measured
-    (see :meth:`CompileTrace._should_measure` — below ``debug`` the occurrences are sampled).
+    Under roll-up, :attr:`m` is the measurement of the largest measured occurrence, the one that
+    matters for a blow-up; :attr:`elapsed_s` is cumulative over every occurrence; :attr:`count` is
+    how many times the stage ran; and :attr:`n_measured` is how many of those were measured, since
+    below ``debug`` the occurrences are sampled (see :meth:`CompileTrace._should_measure`).
     """
 
     seq: int
@@ -576,7 +584,7 @@ class Snapshot:
 
     @property
     def slug(self) -> str:
-        """Filesystem-safe ``NN-stage`` name — the dump directory and the report's row key."""
+        """The filesystem-safe ``NN-stage`` name, used for the dump directory and the report row key."""
         return f"{self.seq:02d}-{_safe_name(self.stage)}"
 
     def merged_with(self, other: Snapshot, *, measured: bool) -> Snapshot:
@@ -629,8 +637,8 @@ class CompileTrace:
         self._dump_root = dump_root
         # (depth, stage) -> its dump dir. Keyed the SAME way rows are: the same stage name at two
         # DEPTHS is two distinct rows, and keying the directory by name alone silently collapsed
-        # them into one (savo's `dof-table` runs at two depths and the deeper, 30-occurrence row
-        # lost its directory entirely).
+        # them into one (a stage that runs at two depths lost the deeper, 30-occurrence row's
+        # directory entirely).
         self._dirs: dict[tuple[int, str], Path] = {}
         self._off_paths: dict[str, str] = {}   # uninstrumented routes taken (see `off_path`)
         self._detail_text: dict[tuple[int, str], str] = {}    # rendered caller descriptions
@@ -645,19 +653,20 @@ class CompileTrace:
               detail: Callable[[], str] | None = None, **ctx: object) -> Snapshot | None:
         """Record ``obj`` as the result of stage ``name``.
 
-        ``detail`` is a zero-argument callable returning extra text for the stage's dump — what
-        this stage actually produced in the caller's own vocabulary (which basis, which terms,
-        which bindings), which this module cannot know.  It is called **only** at
-        :attr:`Level.DUMP`, and only once per stage, so building an expensive description costs
-        nothing at the other levels.  Because it is a thunk it may close over locals that are not
-        yet bound when ``phase()`` is entered — they are read when the phase exits.
+        ``detail`` is a zero-argument callable returning extra text for the stage's dump: what the
+        stage actually produced, described in the caller's own vocabulary, which this module cannot
+        know. It is called only at :attr:`Level.DUMP`, and only once per stage, so building an
+        expensive description costs nothing at the other levels. Because it is a thunk, it may close
+        over locals that are not yet bound when ``phase()`` is entered; they are read when the phase
+        exits.
 
-        Returns the :class:`Snapshot`, or ``None`` at :attr:`Level.OFF` — where this method does
-        no work beyond the level test, so instrumented call sites cost a comparison.
+        The return value is the :class:`Snapshot`, or ``None`` at :attr:`Level.OFF`, where this
+        method does no work beyond the level test, so an instrumented call site costs one
+        comparison.
 
-        ``**ctx`` is free-form, but the parameter names above are RESERVED — a ``ctx`` key called
-        ``name``, ``obj``, ``elapsed_s``, ``degree_seed`` or ``detail`` collides with the signature
-        and raises ``TypeError`` at the call site. Name such context something else
+        ``**ctx`` is free-form, but the parameter names above are reserved: a ``ctx`` key named
+        ``name``, ``obj``, ``elapsed_s``, ``degree_seed``, or ``detail`` collides with the signature
+        and raises ``TypeError`` at the call site, so name such context something else
         (``element=``, ``stage_name=``).
         """
         if self.level <= Level.OFF:
@@ -693,8 +702,8 @@ class CompileTrace:
         Yields a one-element list; assign the stage's product to ``box[0]`` (or call
         ``box.append``) and it gets measured on exit.  Nested phases are indented in the report.
 
-        The stage is recorded even when the block raises — a stage that blew up is *precisely*
-        the one you want in the trace — and the exception then propagates untouched.
+        The stage is recorded even when the block raises, since a stage that blew up is *precisely*
+        the one you want in the trace, and the exception then propagates untouched.
         """
         if self.level <= Level.OFF:
             yield []
@@ -710,11 +719,11 @@ class CompileTrace:
                        degree_seed=degree_seed, detail=detail, **ctx)
 
     def note_off_path(self, name: str, why: str = "") -> None:
-        """Record an uninstrumented / non-canonical path taken during this trace.
+        """Record an uninstrumented or non-canonical path taken during this trace.
 
-        See :func:`off_path` for why this exists. Recorded as a zero-cost stage (so it appears in
-        the report *in sequence*, where the reader can see what it happened between) and warned
-        about once, because the whole value is "you did not see this part."
+        See :func:`off_path` for why this exists. The path is recorded as a zero-cost stage, so it
+        appears in the report *in sequence*, where the reader can see what it fell between, and it
+        is warned about once, because its whole value is that you did not see this part.
         """
         if name in self._off_paths:
             return
@@ -729,24 +738,24 @@ class CompileTrace:
 
     @property
     def off_paths(self) -> Mapping[str, str]:
-        """The uninstrumented paths this trace hit — ``{name: why}``, in first-seen order."""
+        """The uninstrumented paths this trace hit, as ``{name: why}`` in first-seen order."""
         return dict(self._off_paths)
 
     def _should_measure(self, occurrence: int) -> bool:
-        """Whether the ``occurrence``-th run of a stage gets measured, or just counted and timed.
+        """Whether the ``occurrence``-th run of a stage gets measured, or only counted and timed.
 
-        Measuring is O(program size) — a full `forward.analyze` plus a degree walk — and the
-        instrumented boundaries sit inside hot loops: a high-degree element calls `bind-field` ~1000
-        times, each
-        against a program that has GROWN since the last call, so the analysis cache cannot help
-        and measuring every occurrence made the default level **3.3× slower than no
-        instrumentation at all** (37s → 122s). That is not a tool anyone would leave on.
+        Measuring is O(program size) — a full ``forward.analyze`` plus a degree walk — and the
+        instrumented boundaries sit inside hot loops. A hot loop can re-measure a growing program
+        many times, each pass against a larger program than the last, so the
+        analysis cache cannot help and measuring every occurrence would make the default level far
+        slower than no instrumentation at all.
 
-        So below :attr:`Level.DEBUG` the occurrences are sampled geometrically — 1, 2, 4, 8, … —
-        giving O(log n) measurements instead of O(n) while keeping FULL fidelity for the small
-        loops where n is small anyway. A blow-up that shows on occurrence 900 but on none of
-        1, 2, 4, …, 512 is not a thing that happens. `debug` and `dump` measure everything,
-        because there the user has explicitly asked for the detail and accepted the cost.
+        Below :attr:`Level.DEBUG` the occurrences are therefore sampled geometrically at
+        1, 2, 4, 8, …, which gives O(log n) measurements instead of O(n) while keeping full
+        fidelity for the small loops where n is small anyway; a blow-up that shows on occurrence
+        900 but on none of 1, 2, 4, …, 512 does not happen. ``debug`` and ``dump`` measure
+        everything, because there the user has explicitly asked for the detail and accepted the
+        cost.
         """
         if self.level >= Level.DEBUG:
             return True
@@ -766,11 +775,11 @@ class CompileTrace:
     def dump_dir_for(self, stage: str) -> Path | None:
         """Return the directory for ``stage``, created on demand, or ``None`` below :attr:`Level.DUMP`.
 
-        This is the pyab hand-off: pass the result as ``pyab.compile_torch(dump_dir=...)`` and
-        the generated ``torch.py`` / ``ir.txt`` / ``inductor/`` / ``dynamo_explain.txt`` land in
-        the same numbered directory as the symbolic snapshot of the program that produced them.
-        Passing ``None`` through to pyab is harmless — it then falls back to ``PYAB_DUMP_DIR``,
-        which is unset in the normal case.
+        This is the pyab hand-off: pass the result as ``pyab.compile_torch(dump_dir=...)`` and the
+        generated ``torch.py``, ``ir.txt``, ``inductor/``, and ``dynamo_explain.txt`` land in the
+        same numbered directory as the symbolic snapshot of the program that produced them. Passing
+        ``None`` through to pyab is harmless, since it then falls back to ``PYAB_DUMP_DIR``, which
+        is unset in the normal case.
         """
         root = self.dump_root
         if root is None:
@@ -788,10 +797,10 @@ class CompileTrace:
     # -- emission ----------------------------------------------------------
 
     def _parent_seq(self) -> int | None:
-        """Find the most recent snapshot at or above this depth — what a delta is measured against.
+        """Find the most recent snapshot at or above this depth, the one a delta is measured against.
 
-        Called from :meth:`stage` *before* the new snapshot is appended, so this walks the whole
-        list: the last element IS the previous stage, not the current one.
+        This is called from :meth:`stage` *before* the new snapshot is appended, so walking the
+        whole list finds the previous stage as the last element, not the current one.
         """
         for s in reversed(self.snapshots):
             if s.depth <= self._depth:
@@ -809,12 +818,12 @@ class CompileTrace:
 
     def _emit(self, snap: Snapshot, obj: Observable = None,
               detail: Callable[[], str] | None = None, *, quiet: bool = False) -> None:
-        """Log / warn / dump a recorded stage.
+        """Log, warn about, or dump a recorded stage.
 
-        ``quiet`` is set for a rolled-up repeat that did NOT raise the stage's high-water mark:
+        ``quiet`` is set for a rolled-up repeat that did not raise the stage's high-water mark:
         re-logging a line and re-raising the same warning on every one of a few hundred loop
-        iterations is the flood roll-up exists to prevent.  A repeat that sets a new maximum is
-        the interesting one, so it emits and refreshes the stage's dump.
+        iterations is the flood roll-up exists to prevent. A repeat that sets a new maximum is the
+        interesting one, so it emits and refreshes the stage's dump.
         """
         if quiet:
             return
@@ -863,10 +872,10 @@ class CompileTrace:
                 f"{m.symbolic_cells} symbolic cells > {_int_env(_ENV_CELLS, _CELLS_CEILING)} "
                 "(eager per-cell scatter?)")
         # A FINITE degree above the ceiling is a real signal.  An INFINITE one is not: the degree
-        # walk returns inf for any rational/algebraic op on a seed, and a non-affine value kernel
-        # legitimately contains both (the measure's sqrt, the 1/det of an inverse pullback).  So
+        # walk returns inf for any rational/algebraic op on a seed, and a non-affine kernel
+        # legitimately contains both (a sqrt, the 1/det of an inverse).  So
         # `inf` here means "not a polynomial in the inputs", which is the normal state of affairs
-        # downstream of geometry — warning on it would fire on every curved compile and train the
+        # downstream of the model inputs — warning on it would fire on every curved compile and train the
         # reader to ignore the warnings.  It is reported in the table instead
         # (:meth:`rational_stage` names where it first happened, which IS the interesting part).
         if (m.degree is not None and m.degree != _INF
@@ -919,24 +928,24 @@ class CompileTrace:
             logger.warning("observe: dump of stage %r failed: %r", snap.stage, exc)
 
     def _dump_program(self, d: Path, obj: Observable, key: tuple[int, str]) -> None:
-        """Write the stage's polyarray IR as readable source — "what is the output in polyarray".
+        """Write the stage's polyarray IR as readable source, showing what the output is in polyarray.
 
-        Uses :func:`polyarray.numpy_source.to_numpy_source`, the renderer polyarray already owns,
-        so a stage directory shows the ACTUAL program, not just its size.  Front-end ops (grassmann,
-        chartlib) render through their own hooks; anything the renderer cannot express is written as
-        a note rather than raising, because a dump must never break a compile.
+        This uses :func:`polyarray.numpy_source.to_numpy_source`, the renderer polyarray already
+        owns, so a stage directory shows the actual program rather than just its size. Front-end
+        ops render through their own hooks, and anything the renderer cannot express is written as a
+        note rather than raising, because a dump must never break a compile.
 
-        A staged :class:`~polyarray.ir.SymArray` is rendered as the program's RESULT
+        A staged :class:`~polyarray.ir.SymArray` is rendered as the program's result
         (:func:`_program_with_result`), so the emitted function ends in a ``return`` of the value
-        the stage is about rather than the ``return None`` an undeclared array gives.  Should that
-        enriched render fail, the plain program is rendered instead — a dump degrades, it does not
-        vanish.
+        the stage is about rather than the ``return None`` an undeclared array gives. Should that
+        enriched render fail, the plain program is rendered instead, so a dump degrades rather than
+        vanishing.
 
-        Rendered once per stage — the first occurrence — for the same reason as ``detail``.
+        It is rendered once per stage, on the first occurrence, for the same reason as ``detail``.
         """
         if obj is None or key in self._program_text:
             return
-        # A stage may hand over a SEQUENCE of artefacts (savo's per-match integrands, a jet's
+        # A stage may hand over a SEQUENCE of artefacts (a front end's per-match outputs, a derivative-expansion's
         # per-order arrays). Render the first one that carries a program and say how many there
         # were, rather than silently writing nothing.
         note = ""
@@ -1012,7 +1021,18 @@ class CompileTrace:
     # -- the report --------------------------------------------------------
 
     def report(self) -> str:
-        """Render the staged delta waterfall, the table read to find the culprit stage."""
+        """Render the staged delta waterfall, the table read to find the culprit stage.
+
+        Each row is a stage, indented by depth, and the ``Δ`` column carries the mass change over
+        the stage it is compared against, so a blow-up shows as a jump down the column::
+
+            NN  stage        n  meas    mass      Δ           cells  deg  time
+            01  sample       1     1     120                  12/12    2  0.01s
+            02  represent    1     1    4800  (+4680, ×40)    48/48    4  0.30s
+            03  lower        1     1    4800                  48/48    4  0.05s
+
+        The peak, largest-jump, went-rational, and off-path lines follow the table.
+        """
         head = (f"{'':2} {'stage':<26} {'n':>5} {'meas':>5} {'mass':>10} {'Δ':>12} "
                 f"{'cells':>12} {'deg':>5} {'time':>7}")
         lines = [f"compile trace {self.name!r} — {len(self.snapshots)} stage(s), "
@@ -1053,16 +1073,15 @@ class CompileTrace:
         return "\n".join(lines)
 
     def peak_stage(self) -> Snapshot | None:
-        """Return the stage with the largest mass — where the IR is biggest."""
+        """Return the stage with the largest mass, where the IR is biggest."""
         return max(self.snapshots, key=lambda s: s.m.mass, default=None)
 
     def rational_stage(self) -> Snapshot | None:
-        """Return the first stage whose degree went infinite — where the IR stopped being polynomial.
+        """Return the first stage whose degree went infinite, where the IR stopped being polynomial.
 
-        This is the epic's stage-4/stage-6 signature (the pullback ξ going rational, the Faà di
-        Bruno transport).  It is *reported*, never warned about: downstream of a curved geometry
-        it is the expected state, and only its POSITION is informative — a value kernel going
-        rational is routine, a reference basis jet going rational is a bug.
+        It is reported, never warned about: downstream of a rational or algebraic operation an
+        infinite degree is the expected state, and only its position is informative, since some
+        stages legitimately go rational while an early one doing so is a bug.
         """
         prev_finite = True
         for s in self.snapshots:
@@ -1074,10 +1093,10 @@ class CompileTrace:
         return None
 
     def jump_stage(self) -> Snapshot | None:
-        """Return the stage with the largest mass multiplier over its parent — where it *got* big.
+        """Return the stage with the largest mass multiplier over its parent, where the IR *got* big.
 
-        This, not the peak, is usually the culprit: the peak stage often just carries forward
-        what an earlier stage already inflated.
+        This, not the peak, is usually the culprit, because the peak stage often just carries
+        forward what an earlier stage already inflated.
         """
         best: Snapshot | None = None
         best_ratio = 1.0
@@ -1091,12 +1110,12 @@ class CompileTrace:
         return best
 
     def write_report(self) -> Path | None:
-        """Write :meth:`report` to ``<dump_root>/report.txt``; ``None`` below ``DUMP``.
+        """Write :meth:`report` to ``<dump_root>/report.txt``, returning ``None`` below ``DUMP``.
 
-        Also REWRITES every stage's ``stage.txt``.  A stage that ran in a loop was dumped on its
-        first occurrence, when its roll-up counters still read ``1``; only here are the final
-        counts known, so the on-disk snapshot must be refreshed or it lies about how many times
-        the stage ran and how long it took in total.
+        This also rewrites every stage's ``stage.txt``: a stage that ran in a loop was dumped on
+        its first occurrence, when its roll-up counters still read ``1``, and only here are the
+        final counts known, so the on-disk snapshot must be refreshed or it lies about how many
+        times the stage ran and how long it took in total.
         """
         root = self.dump_root
         if root is None:
@@ -1112,11 +1131,11 @@ class CompileTrace:
 def describe_value(x: object, *, _depth: int = 0) -> str:
     """Render a one-line identity for a value, for ``detail`` text.
 
-    A bare ``repr`` is useless in a dump: a field wrapper prints its whole numeric matrix, so
-    two of them bury the rest of the description under forty lines of numbers. This names the
-    wrapper class, the value's ``name``, the *shapes* of any arrays but never their contents,
-    a few identifying scalars, and recurses into a wrapped ``base`` — usually the question
-    being asked, namely which basis an argument really is.
+    A bare ``repr`` is useless in a dump, because a wrapper that prints its whole numeric array
+    buries the rest of the description under dozens of lines of numbers. This names the wrapper
+    class, the value's ``name``, the shapes of any arrays but never their contents, a few
+    identifying scalars, and recurses into a wrapped ``base``, which is usually the identity
+    actually in question.
 
     This is generic dump plumbing, so it lives here rather than in the consumers, which are
     forbidden to name a class in text at all.
@@ -1139,7 +1158,7 @@ def describe_value(x: object, *, _depth: int = 0) -> str:
     for attr in ("element", "degree", "order"):
         v = getattr(x, attr, None)
         if v is not None and not isinstance(v, np.ndarray) and not callable(v):
-            # BOUNDED. A finite element's repr carries its whole Σ (every DOF functional's PTEM),
+            # BOUNDED. A kernel's repr carries its whole Σ (every coefficient functional's PTEM),
             # which runs to thousands of characters and buries the rest of the line — the same
             # failure as dumping a numeric matrix. Identify it, don't transcribe it.
             bits.append(f"{attr}={_short(v)}")
@@ -1153,7 +1172,7 @@ def _short(v: object, limit: int = 72) -> str:
     """Render an identifying attribute on one bounded line.
 
     Falls back to ``ClassName(name=…)`` rather than a truncated repr when the repr is long: a
-    clipped repr of a finite element is neither readable nor informative, whereas its class and
+    clipped repr of a program is neither readable nor informative, whereas its class and
     name are exactly what the reader needs.
     """
     text = str(v)
@@ -1189,9 +1208,9 @@ def _indent(text: str, pad: str) -> str:
 class _NullTrace(CompileTrace):
     """The trace instrumented code sees when nobody is observing.
 
-    Not a separate protocol — a :class:`CompileTrace` pinned to :attr:`Level.OFF`, so every
-    ``stage`` / ``phase`` / ``dump_dir_for`` call takes its early-out and the call sites need no
-    ``if trace is not None`` guard anywhere.
+    It is a :class:`CompileTrace` pinned to :attr:`Level.OFF`, so every ``stage``, ``phase``, and
+    ``dump_dir_for`` call takes its early-out and the call sites need no ``if trace is not None``
+    guard anywhere.
     """
 
     def __init__(self) -> None:
@@ -1212,9 +1231,9 @@ def trace() -> CompileTrace:
 
 
 def active() -> bool:
-    """Whether anything is being recorded — for skipping *expensive* context gathering.
+    """Whether anything is being recorded, for skipping *expensive* context gathering.
 
-    The ``stage`` call itself is already free when off; use this only to guard work you would
+    The ``stage`` call itself is already free when off, so use this only to guard work you would
     otherwise do purely to hand to the tracer.
     """
     return _CURRENT.get().level > Level.OFF
@@ -1226,10 +1245,10 @@ def observe_compile(name: str, *, level: Level | None = None,
                     report: bool = True) -> Iterator[CompileTrace]:
     """Observe everything instrumented inside the block as one trace.
 
-    ``level`` overrides ``FEM_OBSERVE`` for this block — a test or a script can force
-    ``Level.DUMP`` without touching the environment.  ``report=True`` logs the delta waterfall on
-    exit (and writes ``report.txt`` at ``DUMP``), including when the block raises: a compile that
-    died is the one whose staged trace you most want.
+    ``level`` overrides ``FEM_OBSERVE`` for this block, so a test or a script can force
+    ``Level.DUMP`` without touching the environment. ``report=True`` logs the delta waterfall on
+    exit, and writes ``report.txt`` at ``DUMP``, including when the block raises, because a compile
+    that died is the one whose staged trace you most want.
     """
     root = Path(dump_root) if dump_root is not None else None
     tr = CompileTrace(name, level=level, dump_root=root)
@@ -1245,19 +1264,19 @@ def observe_compile(name: str, *, level: Level | None = None,
 
 
 def off_path(name: str, why: str = "") -> None:
-    """Mark that execution entered a path the trace does NOT cover — a blind spot, loudly.
+    """Mark, loudly, that execution entered a path the trace does not cover.
 
-    The instrumented boundaries describe *one* route through the stack, and the failure this
-    guards against is a quantity taking a different route in a different consumer. A trace that
-    silently omits the route actually taken is worse than no trace, because it reads like a
-    complete account of the compile.
+    The instrumented boundaries describe one route through the stack, and the failure this guards
+    against is a quantity taking a different route in a different consumer. A trace that silently
+    omits the route actually taken is worse than no trace, because it reads like a complete account
+    of the compile.
 
-    So an uninstrumented or non-canonical path calls this. When a trace is ACTIVE it records an
-    ``off-path/<name>`` stage and warns ONCE per path; when nobody is observing it is silent, so
-    ordinary consumers of these APIs see nothing. That asymmetry is the point — the warning means
-    *"your trace has a hole here"*, which is only meaningful to someone holding a trace.
+    So an uninstrumented or non-canonical path calls this. When a trace is active it records an
+    ``off-path/<name>`` stage and warns once per path; when nobody is observing it is silent, so
+    ordinary consumers of these APIs see nothing. That asymmetry is the point: the warning means
+    *your trace has a hole here*, which is only meaningful to someone holding a trace.
 
-    Fires once per distinct ``name`` per trace: it flags a route taken, not a count.
+    It fires once per distinct ``name`` per trace, flagging a route taken rather than a count.
     """
     tr = _CURRENT.get()
     if tr.level <= Level.OFF:
@@ -1267,12 +1286,12 @@ def off_path(name: str, why: str = "") -> None:
 
 @contextmanager
 def scope(name: str, **kw: object) -> Iterator[CompileTrace]:
-    """Open a trace for this block **unless one is already open**, in which case reuse it.
+    """Open a trace for this block unless one is already open, in which case reuse it.
 
-    This is what a library entry point uses (savo's ``generic_assembly``, pointwise's
-    ``single_compile``): calling it makes the entry point observable on its own, while a caller
-    who wrapped a larger region in :func:`observe_compile` still gets ONE trace spanning
-    everything rather than an inner trace that shadows theirs and reports half the compile.
+    A library entry point uses this, such as a top-level assembly or compile routine: calling it
+    makes the entry point observable on its own, while a caller who wrapped a larger region in
+    :func:`observe_compile` still gets one trace spanning everything rather than an inner trace
+    that shadows theirs and reports half the compile.
     """
     if active():
         yield _CURRENT.get()
@@ -1282,12 +1301,12 @@ def scope(name: str, **kw: object) -> Iterator[CompileTrace]:
 
 
 def stage(name: str, obj: Observable = None, **kw: object) -> Snapshot | None:
-    """Record a stage on the ambient trace — the one-liner form of ``trace().stage(...)``."""
+    """Record a stage on the ambient trace, the one-liner form of ``trace().stage(...)``."""
     return _CURRENT.get().stage(name, obj, **kw)
 
 
 def phase(name: str, **kw: object) -> AbstractContextManager[list[Observable]]:
-    """Time a block on the ambient trace — the one-liner form of ``trace().phase(...)``."""
+    """Time a block on the ambient trace, the one-liner form of ``trace().phase(...)``."""
     return _CURRENT.get().phase(name, **kw)
 
 
@@ -1306,10 +1325,10 @@ def dump_root() -> Path | None:
 
     Notes
     -----
-    For artefacts that belong to the RUN rather than to one stage. A process-wide compiler cache is
-    the case this exists for: one cache serves every stage, so writing it inside a stage directory
-    would attribute all of it to whichever stage happened to compile first, and the stages that
-    followed would look as though they generated nothing.
+    This is for artefacts that belong to the run rather than to one stage. A process-wide compiler
+    cache is the case it exists for: one cache serves every stage, so writing it inside a stage
+    directory would attribute all of it to whichever stage happened to compile first, and the
+    stages that followed would look as though they generated nothing.
     """
     return _CURRENT.get().dump_root
 

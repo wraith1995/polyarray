@@ -1,13 +1,19 @@
-"""Coefficient-type value handles for the ``native_py`` / ``native_cpp`` backends.
+"""Coefficient-type value handles for the ``native_py`` and ``native_cpp`` backends.
 
-A :class:`ValueHandle` is a small frozen struct exposing every coefficient-level op the
-polynomial engines call. It is the genericity seam that lets one engine module serve
-several coefficient types: ``double``, ``mpf`` (arbitrary precision via :mod:`mpmath`)
-and ``quad`` (113-bit mpf, the closest portable quadruple precision available without
-a C toolchain).
+A :class:`ValueHandle` is a small frozen struct exposing every coefficient-level
+operation a polynomial engine calls. It is the genericity seam that lets one engine
+module serve several coefficient types by carrying the arithmetic as data rather than
+branching on the type::
 
-Selected by the ``CHARTLIB_POLY_COEFF`` environment variable through
-:func:`get_value_handle`.
+    polynomial engine  ──runs on──▶  ValueHandle
+                                        ├─ double   Python float
+                                        ├─ mpf      arbitrary precision (mpmath)
+                                        └─ quad     113-bit mpf
+
+The ``mpf`` handle gives arbitrary precision via :mod:`mpmath`, and ``quad`` pins that
+to 113 bits — the closest portable quadruple precision available without a C toolchain.
+The active handle is selected by the ``CHARTLIB_POLY_COEFF`` environment variable
+through :func:`get_value_handle`.
 """
 from __future__ import annotations
 

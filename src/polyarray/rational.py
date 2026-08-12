@@ -1,56 +1,53 @@
 """Rational functions over a per-instance polynomial :class:`Ring`.
 
-A :class:`RationalFunction` is a pair ``(num, den)`` of polynomials
-sharing the same ring.  The ring abstraction is provided by
-:mod:`chartlib._symbolic.poly_backend`, which has two implementations:
+A :class:`RationalFunction` is a pair of polynomials ``num`` and ``den`` sharing one
+:class:`Ring`, read as the quotient ``num / den``::
 
-* ``sympy`` (default) — :class:`sympy.polys.rings.PolyElement` over
-  :data:`sympy.RR` (53-bit mpmath floats).
-* ``flint`` — :class:`flint.fmpq_mpoly` over exact rationals.  ~210×
-  faster multivariate multiplication and ~30× faster ring construction
-  on realistic generator counts.
+    RationalFunction
+      ├─ num   Poly  ┐  one shared Ring
+      └─ den   Poly  ┘  (generators identified by name), den ≠ 0
 
-The backend is selected at import time via
-``CHARTLIB_POLY_BACKEND={sympy,flint}`` and is opaque to the rest of
-chartlib — every call site here goes through ``Poly`` / ``Ring``
-methods that both backends provide.
+Cells of the symbolic interpreter's :class:`SymArray` are ``RationalFunction | float``:
+a numeric cell is a plain Python float, and a generator-bearing cell is a rational
+function.
 
-Cells of the symbolic interpreter's ``SymArray`` are
-``RationalFunction | float``: numeric cells are plain Python floats,
-generator-bearing cells are rational functions.
+The :class:`Ring` abstraction comes from :mod:`.poly_backend`, which has two
+implementations:
 
-Per the plan:
+* ``sympy`` — :class:`sympy.polys.rings.PolyElement` over :data:`sympy.RR`
+  (53-bit mpmath floats).
+* ``flint`` — :class:`flint.fmpq_mpoly` carrying exact rationals and substantially faster
+  at multivariate multiplication and ring construction.
 
-* Each instance carries its own ring spanning the generators it
-  actually uses.  Arithmetic combining two instances with different
-  rings rebuilds a joint ring on demand.  Generator identity is by
-  name, so a global :class:`SymbolEnv` (defined in ``ir.py``)
-  remains the source of truth for "what does ``v_2_x`` mean."
-* Arithmetic does **not** call :func:`sympy.simplify` or
-  :func:`sympy.cancel`.  The class accumulates raw ``num/den`` pairs
-  during a hot loop; the only simplification is in :meth:`clean`,
-  which is reserved for boundary calls.
-* On the sympy backend ``num/den`` are over ``sympy.RR`` (mpmath
-  floats); on flint they are over ``QQ`` (exact rationals).  Chartlib
-  samples numerically and the ring exists to carry generator
-  structure, not to recover exact rationals from floats — converting
-  floats to exact rationals only where needed.  Structural-zero
-  detection (:func:`coeff_zero`, :func:`simple_zero`) on the sympy
-  backend only fires on coefficients that are exactly ``0.0``;
-  floating-point cancellation that produces ``1e-16`` will miss the
-  sparsity short-circuit.  Flint's exact arithmetic doesn't have that
-  problem.
+The backend is chosen at import time by ``CHARTLIB_POLY_BACKEND={sympy,flint}``, and
+when that is unset it is ``flint`` if python-flint is installed and ``sympy`` otherwise.
+The choice is opaque to the rest of the package: every call site here goes through the
+``Poly`` / ``Ring`` methods that both backends provide.
 
-Helpers exported alongside the class:
+Three properties govern the design:
 
-* :func:`coeff_zero` — structural-zero predicate on a polynomial.
-* :func:`simple_zero` — structural-zero predicate on a
-  :class:`RationalFunction` (numerator only; denominator is non-zero
-  by construction).
-* :func:`bareiss_det` — fraction-free determinant of a matrix of
-  polynomials.
-* :func:`schur_inverse` — block-Schur inverse for a ``2 x 2`` block
-  matrix, used as the leaf of the structured rational inverse.
+* Each instance carries its own ring, spanning only the generators it uses. Arithmetic
+  combining two instances with different rings rebuilds a joint ring on demand. Generator
+  identity is by name, so a global :class:`SymbolEnv` (in :mod:`.ir`) stays the source of
+  truth for what a name like ``v_2_x`` means.
+* Arithmetic accumulates raw ``num/den`` pairs through a hot loop and never calls
+  :func:`sympy.simplify` or :func:`sympy.cancel`; the sole simplification is
+  :meth:`clean`, reserved for boundary calls.
+* Coefficients stay in the backend's ground domain — ``sympy.RR`` mpmath floats on sympy,
+  ``QQ`` exact rationals on flint. The ring carries generator structure for callers that
+  sample numerically, not machinery to recover exact rationals from floats, so a float
+  becomes an exact rational only where needed. Structural-zero detection
+  (:func:`coeff_zero`, :func:`simple_zero`) on the sympy backend fires only on
+  coefficients that are exactly ``0.0``, so a floating-point cancellation down to
+  ``1e-16`` slips past the sparsity short-circuit, whereas flint's exact arithmetic
+  reports the true zero.
+
+Alongside the class, :func:`coeff_zero` and :func:`simple_zero` are the structural-zero
+predicates — the first over a polynomial, the second over a :class:`RationalFunction`'s
+numerator, whose denominator is non-zero by construction — while :func:`bareiss_det`
+takes the fraction-free determinant of a matrix of polynomials and :func:`schur_inverse`
+forms the block-Schur inverse of a ``2 x 2`` block matrix at the leaf of the structured
+rational inverse.
 """
 from __future__ import annotations
 
@@ -118,15 +115,13 @@ def _ring_names(ring: Ring) -> tuple[str, ...]:
 
 
 def _coeff_to_float(coeff: CoeffLike) -> float:
-    """Universal coefficient-to-float coercion.
+    """Coerce any backend coefficient to a plain Python ``float``.
 
-    Used by the eval-codegen and partial-substitution paths to lower a
-    polynomial's ground element to a plain Python ``float``.  Accepts
-    mpf (sympy ``RR``), PythonMPQ / sympy ``Rational`` (sympy ``QQ``
-    without python-flint), and ``flint.fmpq`` (sympy ``QQ`` *with*
-    python-flint installed — sympy auto-promotes the ground domain in
-    that case, so legacy ``QQ`` callers and the new ``RR`` callers both
-    converge here).
+    The eval-codegen and partial-substitution paths call this to lower a polynomial's
+    ground element. It accepts mpf (sympy ``RR``), PythonMPQ or sympy ``Rational`` (sympy
+    ``QQ`` without python-flint), and ``flint.fmpq`` (sympy ``QQ`` with python-flint
+    installed, where sympy auto-promotes the ground domain so ``QQ`` and ``RR`` callers
+    both converge here).
     """
     if isinstance(coeff, float):
         return coeff
@@ -144,9 +139,8 @@ def _to_qq(coeff: NumericLike | sp.Expr) -> float:
 
     Both backends accept ``float`` in :meth:`Ring.ground_new` /
     :meth:`Ring.from_dict` and coerce it internally to their native
-    ground type (``mpf`` for sympy ``RR``; ``fmpq`` for flint).  We
-    keep the historical name ``_to_qq`` for grep continuity but
-    otherwise the return type is just ``float`` now.
+    ground type (``mpf`` for sympy ``RR``; ``fmpq`` for flint).
+    Returns a plain ``float``.
     """
     if isinstance(coeff, float):
         return coeff
@@ -220,10 +214,9 @@ class RationalFunction:
     ``CHARTLIB_POLY_BACKEND``; both implement the same ``Poly`` /
     ``Ring`` protocol so this class is backend-agnostic.
 
-    The class is *not* a frozen dataclass — equality is structural via
-    the underlying poly rings (rebuilding to a common ring on the fly)
-    and hashing matches that.  Mutation methods are absent; the only
-    public operations return new instances.
+    An instance is an immutable value: every operation returns a new instance and none
+    mutates in place. Equality is structural, comparing the two functions over a common
+    ring rebuilt on the fly, and hashing agrees with it.
 
     Attributes
     ----------
@@ -253,10 +246,10 @@ class RationalFunction:
         # Canonicalise structural zero: ``0/d == 0/1`` for any nonzero
         # ``d``.  Without this the denominator accumulates dead weight
         # through chains of multiplications that produce a zero
-        # numerator (e.g. Faà di Bruno on an affine chart, where
+        # numerator (e.g. a derivative expansion over the parameterization, where
         # ``D²f == 0`` but the contraction's denominator inherits a
-        # ``det(J)``-like polynomial).  Observed on
-        # ``Lagrange(orthonormal)/tetrahedron/n_derivs=2``: 36 cells
+        # constant-matrix-like polynomial).  Observed on a degree-2
+        # derivative expansion of one kernel: 36 cells
         # carrying ``num=0`` and ``den`` with 10147 terms each — pure
         # eval-time waste since the cell is identically zero.
         if coeff_zero(num):
@@ -297,8 +290,8 @@ class RationalFunction:
         """Build the rational function ``x`` for a fresh single-generator ring named ``name``.
 
         Convenience wrapper around :meth:`generator` that allocates the
-        ring for you — matches the per-cell-ring convention used by
-        :func:`chartlib._symbolic.ir.allocate_input`.
+        ring for you — matches the per-cell-ring convention used for
+        input allocation.
         """
         return cls.generator(_make_ring([name]), name)
 
@@ -340,12 +333,13 @@ class RationalFunction:
         return coeff_zero(self._num)
 
     def max_abs_coeff(self) -> float:
-        """Largest ``|coefficient|`` of the numerator (``0.0`` if the numerator is zero).
+        """Largest ``|coefficient|`` of the numerator, or ``0.0`` when the numerator is zero.
 
-        A *numeric* magnitude for a tolerance-based sparsity test: a cell whose numerator
-        coefficients are all negligible (``≤ tol·scale``) is an identically-zero rational function
-        up to float roundoff (e.g. chartLib QR / Orthopoly's irrational normalization) — a structural
-        zero that exact :meth:`is_zero` misses. Distinct from ``is_zero`` (which is exact).
+        This is the numeric magnitude behind a tolerance-based sparsity test. A cell whose
+        numerator coefficients are all negligible (``≤ tol·scale``) is an identically-zero
+        rational function up to float roundoff from irrational normalization factors, a
+        structural zero that the exact :meth:`is_zero` misses because those coefficients
+        are tiny rather than exactly zero.
         """
         m = 0.0
         for _, co in self._num.terms():
@@ -359,10 +353,15 @@ class RationalFunction:
         return _total_degree(self._num) == 0 and _total_degree(self._den) == 0
 
     def to_constant(self) -> sp.Rational:
-        """Return the rational value of a constant.  Raises if non-constant.
+        """Return the rational value of a constant rational function.
 
-        Goes through float on the way out, so exact-rational backends
-        lose precision here.  Display / debugging only.
+        The value passes through ``float`` on the way out, so exact-rational backends lose
+        precision here; this is for display and debugging only.
+
+        Raises
+        ------
+        ValueError
+            If this rational function is not constant.
         """
         if not self.is_constant():
             raise ValueError("RationalFunction is not constant")
@@ -414,14 +413,15 @@ class RationalFunction:
     def __add__(self, other: Operand) -> RationalFunction:
         # Short-circuit on either operand being zero — saves the
         # ``_coerce`` / ``_aligned`` / ring-arithmetic cost in the
-        # ``Σ ... + ...`` accumulators that drive ``compose_jets`` and
+        # ``Σ ... + ...`` accumulators that drive the single-operand
+        # (derivative-expansion) einsum and
         # ``np.einsum`` over object dtype.  Same algebraic identity as
         # ``a + 0 = a`` and ``0 + b = b``; no backend dispatch.
         if coeff_zero(self._num):
             # ``0 + other = other``.  Return ``other`` in its *own* ring
             # rather than lifting it into ``join(self, other)``: the lift
             # (``_flint_lift`` rebuilding monomial-by-monomial) is the
-            # dominant cost in order-3 covariant accumulators, where most
+            # dominant cost in order-3 higher-order-derivative accumulators, where most
             # addends are structurally zero (sparse Christoffel / derivative
             # tensors).  Mirrors the ``0 * other`` short-circuit below.
             # Ring mixing is resolved lazily by the next non-zero operation.
@@ -529,23 +529,24 @@ class RationalFunction:
     # ------------------------------------------------------------------
 
     def eval(self, bindings: Mapping[str, float]) -> float | RationalFunction:
-        """Evaluate ``self`` against a generator-name → value mapping.
+        """Evaluate ``self`` against a mapping from generator name to value.
 
-        Returns a Python ``float`` when every generator of the ring is
-        bound to a numeric value, and a fresh :class:`RationalFunction`
-        over the leftover-generator ring when the mapping is partial.
+        The result depends on how much of the ring the mapping covers::
 
-        ``bindings`` is keyed by generator *name*, not generator
-        :class:`PolyElement`.  This is the boundary between "polynomial
-        arithmetic" and "actual numeric values"; it does *not* go via
-        :func:`sympy.subs`.
+            every generator bound  →  float
+            some generators bound  →  RationalFunction over the leftover generators
 
-        Full-binding case: routes through a per-instance compiled
-        Python evaluator (built on first call via :func:`exec`, then
-        cached on the RF).  This avoids walking sympy term iterators
-        on every invocation — critical for the vmap-style build-once
-        path where the same RF is evaluated M times across query
-        points.
+        ``bindings`` is keyed by generator *name*, not by generator :class:`PolyElement`.
+        This is the boundary between polynomial arithmetic and actual numeric values, and
+        it does not go through :func:`sympy.subs`.
+
+        A full binding routes through a per-instance compiled Python evaluator, built on
+        the first call via :func:`exec` and then cached on the instance, so evaluation
+        never walks sympy's term iterators again; this amortizes over the build-once path
+        where the same rational function is evaluated at many points. A partial binding
+        instead folds each bound generator's contribution into the surviving terms'
+        coefficients and emits the residue into a fresh ring over the leftover names,
+        because a :class:`PolyElement`'s own ``evaluate`` requires every generator at once.
         """
         names = _ring_names(self._ring)
         if not names:
@@ -575,18 +576,15 @@ class RationalFunction:
         return RationalFunction(new_num, new_den)
 
     def eval_numeric_fast(self, bindings: Mapping[str, float]) -> float:
-        """Fast-path evaluator that trusts the caller.
+        """Evaluate at a full numeric binding, trusting the caller to supply one.
 
-        Assumes every generator of ``self.ring`` has a numeric entry in
-        ``bindings``.  Skips both the per-call ``all(n in bindings)``
-        membership scan and the ``for v in bindings.values()`` type
-        check that :meth:`eval` performs defensively.  Intended for
-        program-runner / SymArray-evaluator hot paths where the
-        boundary already guarantees the dict is full and float-valued.
-
-        Falls back to :meth:`eval` (which raises on missing keys) when
-        the compiled-fast path does not apply.  Returns a Python
-        ``float``.
+        Every generator of ``self.ring`` is assumed to have a numeric entry in
+        ``bindings``, so this skips both the per-call ``all(n in bindings)`` membership
+        scan and the ``for v in bindings.values()`` type check that :meth:`eval` performs
+        defensively. It suits the program-runner and SymArray-evaluator hot paths, where
+        the boundary already guarantees the dict is full and float-valued. When the
+        compiled fast path does not apply it falls back to :meth:`eval`, which raises on
+        missing keys, and it returns a Python ``float``.
         """
         names = _ring_names(self._ring)
         if not names:
@@ -600,13 +598,14 @@ class RationalFunction:
     def eval_numeric_direct(self, bindings: Mapping[str, float]) -> float:
         """Evaluate at a full binding by direct term summation, with no per-cell codegen.
 
-        Returns the same ``float`` as :meth:`eval_numeric_fast` (same terms in the same order,
-        same ``_coeff_to_float`` coercion, so bit-identical), but with O(#terms) arithmetic
-        instead of building and ``exec``-ing a reusable Python evaluator. That codegen
-        amortizes over many evaluations — the vmap build-once path, a cell run at M query
-        points — but is pure waste for a few, as in the handful of probes
-        :func:`polyarray.schur._structural_mask` takes: compiling every cell of a
-        high-degree matrix to use each evaluator three times costs tens of seconds.
+        The result is the same ``float`` as :meth:`eval_numeric_fast` — the same terms in
+        the same order under the same ``_coeff_to_float`` coercion, so bit-identical — but
+        reached with ``O(#terms)`` arithmetic rather than building and ``exec``-ing a
+        reusable Python evaluator. That codegen amortizes over many evaluations, such as
+        the build-once path where a cell runs at many points, yet it is pure waste for a
+        few: the handful of probes :func:`polyarray.schur._structural_mask` takes would
+        pay to compile every cell of a high-degree matrix only to run each evaluator a few
+        times.
         """
         names = _ring_names(self._ring)
         if not names:
@@ -624,8 +623,8 @@ class RationalFunction:
         ``repl`` is a :class:`RationalFunction` over *other* generators.
         The result lives over a ring spanning
         ``(self.gens - {name}) ∪ repl.gens`` and equals ``self`` with every
-        occurrence of ``name`` replaced by ``repl`` — computed by **ring
-        arithmetic**, a generalization of :func:`_partial_substitute` where
+        occurrence of ``name`` replaced by ``repl``, computed by ring
+        arithmetic, a generalization of :func:`_partial_substitute` where
         the bound generator's contribution ``name**exp`` is the RF power
         ``repl**exp`` (RF multiply / add) instead of a float.
 
@@ -685,8 +684,8 @@ class RationalFunction:
 
         For the trivial shapes that dominate on statement-output atoms and constant cells —
         a single-monomial numerator over a ring-one denominator — ``compile``/``exec`` is
-        skipped entirely in favour of a direct Python closure, which is measurably cheaper
-        when each cell is evaluated only a handful of times.
+        skipped entirely in favour of a direct Python closure, which is cheaper when each
+        cell is evaluated only a handful of times.
         """
         fast = self._maybe_compile_fast(names)
         if fast is not None:
@@ -714,7 +713,7 @@ class RationalFunction:
 
         Trivial shapes — a ring-one denominator over a numerator that is constant, a pure
         atom, or a scaled atom — cover the dominant majority of cells produced by
-        :meth:`atom`, statement outputs, and constant DOF entries. For those the
+        :meth:`atom`, statement outputs, and constant parameter entries. For those the
         ``compile`` + ``exec`` round-trip is pure overhead, and a plain closure runs at the
         same speed once built.
 
@@ -751,13 +750,12 @@ class RationalFunction:
     # ------------------------------------------------------------------
 
     def compute_degree(self, degrees: Mapping[str, int] | None = None) -> int:
-        """Total-degree estimate.
+        """Estimate the total degree of this rational function.
 
-        ``degrees`` maps generator names to assigned degrees (default 1
-        per generator).  Returns
-        ``max(deg(num), deg(den))`` under the weighted total-degree
-        induced by ``degrees``.  This is the bound consulted by
-        :class:`SymbolicBudget` for lane choice (§1.2.1).
+        With no ``degrees`` mapping every generator counts as degree 1, giving
+        ``max(deg(num), deg(den))``. When ``degrees`` assigns per-name weights, the same
+        maximum is taken under the induced weighted total degree. This bound is what
+        :class:`SymbolicBudget` consults for lane choice.
         """
         if degrees is None:
             return max(_total_degree(self._num), _total_degree(self._den))
@@ -785,12 +783,11 @@ class RationalFunction:
     def clean(self, tol: float = 0.0) -> RationalFunction:
         """Cancel common factors of numerator and denominator.
 
-        ``tol`` is reserved for a future numeric-zeroing pass; today it
-        is only consulted to short-circuit "no-op" calls.  We never
-        call :func:`sympy.simplify` here — the backend's ``cancel``
-        (sympy: PolyElement.cancel; flint: gcd-based exact division) is
-        sufficient for "drop a common gcd."  Per §1.2.2 this is a
-        *boundary* operation and must not be invoked in inner loops.
+        ``tol`` currently only short-circuits no-op calls. The cancellation uses the
+        backend's ``cancel`` — ``PolyElement.cancel``
+        on sympy, gcd-based exact division on flint — which suffices to drop a common gcd,
+        never :func:`sympy.simplify`. This is a boundary operation and must not run in inner
+        loops.
         """
         del tol  # reserved for future numeric-zeroing
         if coeff_zero(self._num):
@@ -889,14 +886,12 @@ def _poly_to_pyexpr(
     names: Sequence[str],
     var_names: Sequence[str],
 ) -> str:
-    """Render ``poly`` as a Python expression over ``var_names``.
+    """Render ``poly`` as a single Python expression over ``var_names``.
 
-    Each term ``coeff · prod_j var_j ** exp_ij`` becomes ``c*v0**e0*...``;
-    the term list is joined with ``+``.  Empty poly renders as ``0.0``.
-
-    Use :func:`_poly_to_sum_pyexpr` for hot paths — long ``+`` chains
-    blow CPython's compile recursion limit on Christoffel-chain
-    polynomials.
+    Each term ``coeff · prod_j var_j ** exp_ij`` becomes ``c*v0**e0*...`` and the terms
+    are joined with ``+``; an empty polynomial renders as ``0.0``. For hot paths reach for
+    :func:`_emit_poly_assign` instead, since a long ``+`` chain overruns CPython's compile
+    recursion limit on polynomials with hundreds of terms.
     """
     terms = _poly_term_strings(poly, var_names)
     if not terms:
@@ -1033,20 +1028,18 @@ def _compose_poly(
 ) -> RationalFunction:
     """Substitute the generator at ``name_pos`` with ``repl_t`` in ``poly``.
 
-    The symbolic analogue of :func:`_partial_substitute`: iterate ``poly``'s
-    terms once; each term is ``coeff · (leftover monomial) · name**exp``.  The
-    leftover monomial (and the coefficient folded in) is built directly in the
-    target ring, the bound generator's ``name**exp`` is the RF power
-    ``repl_t**exp``, and the term RFs are summed.  ``repl_t`` is assumed already
-    lifted into ``target``.
+    This is the symbolic analogue of :func:`_partial_substitute`. It iterates ``poly``'s
+    terms once, each of the form ``coeff · (leftover monomial) · name**exp``: the leftover
+    monomial with the coefficient folded in is built directly in the target ring, the
+    bound generator's ``name**exp`` becomes the RF power ``repl_t**exp``, and the term
+    rational functions are summed. ``repl_t`` is assumed already lifted into ``target``.
 
-    COEFFICIENT EXACTNESS: the source coefficient is passed to the target ring
-    NATIVELY (``ground_new`` / ``from_dict`` accept each backend's own ground
-    type — fmpq / RR — unchanged), never round-tripped through ``float``.  The
-    old float round-trip silently rounded any non-double-representable
-    coefficient (e.g. the ``c·0.5625`` produced by a previous compose in a
-    ``compose_multi`` chain), which broke the exact-fold soundness contract:
-    a chained substitution must be exact on exact backends.
+    Coefficients stay exact: the source coefficient reaches the target ring natively, since
+    ``ground_new`` and ``from_dict`` accept each backend's own ground type (fmpq or RR)
+    unchanged, and it is never round-tripped through ``float``. A float round-trip would
+    silently round a non-double-representable coefficient — such as a ``c·0.5625`` from an
+    earlier compose in a ``compose_multi`` chain — and break the exactness that a chained
+    substitution must preserve on exact backends.
     """
     target_names = target.names
     n_tgt = len(target_names)
@@ -1229,16 +1222,22 @@ def _as_rf(value: Operand) -> RationalFunction:
 def schur_inverse(matrix: np.ndarray, top_left: int) -> np.ndarray:
     """Block-``2x2`` Schur-complement inverse with ``top_left`` rows in the upper block.
 
-    For
-    ``M = [[A, B], [C, D]]`` with ``A`` square of size ``top_left``,
+    For ``M = [[A, B], [C, D]]`` with ``A`` square of size ``top_left``.
 
     Returns
     -------
-    ``M^{-1}`` via
-    ``S = D - C A^{-1} B``,
-    ``[[A^{-1} + A^{-1} B S^{-1} C A^{-1}, -A^{-1} B S^{-1}],
-       [-S^{-1} C A^{-1}, S^{-1}]]``.
-    Raises ``ZeroDivisionError`` if ``A`` is structurally singular.
+    np.ndarray
+        ``M^{-1}``, formed from the Schur complement ``S = D - C A^{-1} B``:
+
+        .. code-block:: text
+
+            [[A^{-1} + A^{-1} B S^{-1} C A^{-1}, -A^{-1} B S^{-1}],
+             [-S^{-1} C A^{-1},                  S^{-1}]]
+
+    Raises
+    ------
+    ZeroDivisionError
+        If ``A`` is structurally singular.
     """
     arr = np.asarray(matrix, dtype=object)
     n, m = arr.shape

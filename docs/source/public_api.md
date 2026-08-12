@@ -1,9 +1,8 @@
 # polyarray — public API
 
-Committed surface, faithful to chartlib's `_symbolic` exports at the
-extraction commit (see `VENDORED.md`). No names were added beyond what
-chartlib already exposed; signatures are reproduced verbatim from the
-extracted source.
+The committed public surface. Everything an addition adds must be recorded
+here; this file is the contract, and the generated
+[API reference](api/index.rst) is its browsable form.
 
 Everything below is importable from the top-level package:
 
@@ -361,6 +360,7 @@ def partial_eval(program: Program, *, max_cell_size: int) -> Program
     # monomial bound become IdentityOp atoms re-evaluated at run time.
     # max_cell_size=0 collapses all symbolic outputs to numeric.
     # partial_eval(p).run(x) == p.run(x).
+```
 
 ```python
 def specialize(program, *, bind=None, subs=None, budget=None) -> Program
@@ -448,7 +448,6 @@ def is_structurally_constant(program: Program, target: SymArray) -> bool
     # be positively classified constant-safe — or a cone that fails to enumerate —
     # forces False. Folds without any evaluation/codegen.
 ```
-```
 
 ## Degree estimation (`degree.py`)
 
@@ -458,8 +457,8 @@ def program_degree(program: Program, seed: Mapping[str, float], *,
                    zero_ops: frozenset[str] = frozenset(),
                    passthrough_ops: frozenset[str] = frozenset(),
                    multilinear_ops: frozenset[str] = frozenset()) -> float
-    # Whole-program POLYNOMIAL degree of the output in the seeded inputs
-    # (fem task #9, lifted from pointwise). Sound over-estimation:
+    # Whole-program POLYNOMIAL degree of the output in the seeded inputs.
+    # Sound over-estimation:
     # multilinear ops SUM, passthrough/additive MAX, all-constant
     # operands short-circuit to 0, det of an (n,n) degree-d operand is
     # n*d, CallOp (vmap) bodies are unwrapped and recursed; genuinely
@@ -467,17 +466,14 @@ def program_degree(program: Program, seed: Mapping[str, float], *,
     # seed-dependent value give inf — the caller supplies its own order
     # there. The *_ops sets EXTEND the native categories with a front
     # end's op names (the `to_numpy_source(op_renderers=)` pattern);
-    # domain seeding (FE degrees, affine geometry gates) stays with the
-    # caller (pointwise `estimate_degree`).
+    # domain seeding stays with the caller.
 ```
 
 ## Compile observability (`observe.py`)
 
-The staged compile trace the consumers (pointwise / savo / oracle) instrument against.
-It lives here because this repo owns the measurement primitives (`forward.analyze`,
-`degree.program_degree`, `ir._cell_size`) *and* the pyab→torch dump hand-off, and is a
-dependency of every layer that wants observing. grassmann and chartLib are deliberately
-NOT instrumented and do not import this.
+The staged compile trace that a front end instruments against. It lives here
+because this package owns the measurement primitives (`forward.analyze`,
+`degree.program_degree`, `ir._cell_size`) and the pyab→torch dump hand-off.
 
 ```python
 class Level(IntEnum): OFF, WARN, INFO, DEBUG, DUMP     # from FEM_OBSERVE, default WARN
@@ -517,8 +513,6 @@ At `dump` each stage directory gets `stage.txt` (numbers + `IRReport`), `program
 (the stage's polyarray IR rendered via `numpy_source.to_numpy_source`), and `detail.txt`
 if the call site supplied one.
 
-Full guide: **`OBSERVABILITY.md`**.
-
 Env: `FEM_OBSERVE` (level), `FEM_OBSERVE_DIR` (dump root), `FEM_OBSERVE_MASS_CEILING` /
 `_OPERAND_CEILING` / `_CELLS_CEILING` / `_DEGREE_CEILING` (warning thresholds).
 
@@ -527,7 +521,7 @@ Env: `FEM_OBSERVE` (level), `FEM_OBSERVE_DIR` (dump root), `FEM_OBSERVE_MASS_CEI
 Selected at import time of `polyarray.poly_backend` from the
 `CHARTLIB_POLY_BACKEND` (`sympy` | `flint` | `native_py` | `native_cpp`)
 and `CHARTLIB_POLY_COEFF` (`double` | `mpf` | `quad`) environment
-variables — **preserved verbatim from chartlib** (see VENDORED.md). The
+variables. The
 sympy / native_py / native_value backends are pure Python; `native_cpp`
 requires the built Cython `.so` (ship via wheels or `make cython`) and
 falls back with a clear error if absent; `flint` requires the optional
@@ -578,7 +572,5 @@ supplied by the caller, never imported by polyarray):
 
 ## Not included
 
-`Program.fingerprint()` — referenced in chartlib comments but never
-implemented; explicitly out of scope (plan §3b / §8). No caching layer
-was added. Ops remain frozen / hashable as extracted.
-```
+`Program.fingerprint()` — explicitly out of scope; there is no caching
+layer. Ops remain frozen and hashable.

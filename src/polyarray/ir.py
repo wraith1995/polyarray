@@ -1,26 +1,37 @@
-"""Imperative IR: descriptors, registry, ``SymArray``, ``Program``, ``Stmt``, ``Ref``.
+"""The imperative IR: programs of statements over symbolic-numeric arrays.
 
-This module is the single home for everything program-scoped in the
-symbolic interpreter:
+A :class:`Program` is an ordered list of imperative :class:`Stmt` statements over
+:class:`SymArray` values, with named :class:`SymInput` inputs and named outputs::
 
-Metadata / registry
-    :class:`Provenance`, :class:`SymInput`, :class:`SymbolEnv`,
-    :func:`allocate_input`, :func:`cells_sparsity`.  Value-free
-    descriptors plus the global generator-name table.
+    Program
+      ├─ inputs   named SymInputs
+      ├─ body     an ordered list of Stmts,  each  fn(Ref, …) → SymArray, …
+      └─ outputs  named SymArrays
 
-Live values
-    :class:`SymArray` — wraps an ``ndarray`` of
-    ``RationalFunction | float`` cells plus a back-reference to its
-    owning :class:`Program`.  Quacks like a numpy ndarray for read
-    access; knows how to extend its program by emitting a :class:`Stmt`
-    (slice B).  Replaces the former ``SymArray`` / ``Output`` /
-    ``BoundOutput`` triple — there is exactly one type now.
+    SymArray  =  a numpy array of cells  |  a single bulk tensor
+      cell    =  RationalFunction (exact)  |  float (numeric)  |  Ref (a prior output)
 
-IR structure
-    :class:`InputRef`, :class:`OutputRef`, :class:`Const`,
-    :class:`RationalRef`, :class:`Ref`, :class:`Stmt`,
-    :class:`Program`.  The :meth:`Program.run` plain-Python evaluator
-    plus :meth:`Program.copy` for sub-interpreter spawning.
+A :class:`SymArray` is the one value type, and it takes one of two forms. Usually
+it is a numpy array of cells, where each cell is an exact
+:class:`~polyarray.rational.RationalFunction`, a plain float, or a :class:`Ref`
+that names the output of an earlier statement. Otherwise it is a single *bulk*
+tensor: the whole output of one statement, held undivided so that it costs one
+run-time binding rather than a rational function and a ring for every cell.
+
+These two forms carry two lanes in one program. Computation that stays symbolic
+lives in the cells as exact rational functions, while computation deferred to a
+numeric or opaque operation becomes a :class:`Stmt` whose result the consuming
+cells name through a :class:`Ref`. A single :class:`Program` therefore expresses
+symbolic and numeric work together.
+
+Every :class:`SymArray` also carries a reference to its owning program, so an
+operation on it — a matmul, a determinant, an einsum — extends that program in
+place, rewriting cells where the result is closed-form and appending a
+:class:`Stmt` where it is not. :class:`SymbolEnv` is the program's registry of
+generator names, and :class:`Provenance` records where each generator originates.
+
+A program runs as plain Python: :meth:`Program.run` binds the inputs by name,
+evaluates the statements in order, and returns the named outputs as numpy arrays.
 """
 from __future__ import annotations
 
@@ -43,12 +54,14 @@ Cell = Union[RationalFunction, float, int]
 
 @runtime_checkable
 class VmapClosure(Protocol):
-    """A ``vmap`` closure, as the metadata :func:`vmap` stamps on it describes.
+    """A ``vmap`` callable, recognised by the descriptive attributes :func:`vmap` stamps on it.
 
-    The attributes are additive and purely descriptive — evaluation never reads them — so a
-    tool can recover the batched body and the normalised axis tuples without spelunking the
-    closure cells. A front end may stamp the same attributes on a wrapper of its own; naming
-    the shape here is what lets a consumer narrow to it instead of probing with ``getattr``.
+    The three attributes record the batched body and the per-operand and per-output
+    axis tuples. They are additive and purely descriptive, so evaluation never reads
+    them; a tool recovers the batched body and the normalised axis tuples by reading
+    them directly rather than inspecting the closure cells. A front end may stamp the
+    same attributes on a wrapper of its own, and naming the shape here is what lets a
+    consumer narrow to it instead of probing with :func:`getattr`.
     """
 
     #: The per-element body the closure batches.
@@ -61,10 +74,11 @@ class VmapClosure(Protocol):
 
 @runtime_checkable
 class NestedVmapClosure(Protocol):
-    """A multi-variable nested ``vmap`` closure, batched once per bound variable.
+    """A nested ``vmap`` callable that batches one level per bound variable.
 
-    The first :attr:`_nested_n_vars` operands each get their own vmap level; the remaining
-    :attr:`_nested_n_free` broadcast.
+    The first :attr:`_nested_n_vars` operands each receive their own ``vmap`` level,
+    and the remaining :attr:`_nested_n_free` operands broadcast unbatched across all
+    of them.
     """
 
     #: How many leading operands are batched, one nesting level each.
@@ -86,10 +100,10 @@ type Index = int | slice | np.ndarray | Sequence[int] | tuple[int | slice | np.n
 # Ambient budget override
 # ---------------------------------------------------------------------------
 # A `Program` built with no explicit `budget=` consults this context. It lets a
-# caller (e.g. oracle's sparsity mask) request the non-deferred, inline-covariant
-# symbolic lane for the SHARED sampling program — so the covariant/φ-jet chain is
-# built inline over the vertices (not deferred to `out_cov`/`phi_jet` Stmts) — without
-# threading a budget through every builder (pointwise never references it).
+# caller (e.g. a sparsity mask) request the non-deferred, inline higher-order
+# symbolic lane for the SHARED sampling program — so the derivative chain / single-operand
+# einsum is built inline over the vertices (not deferred to `out_cov`/`phi_jet` Stmts) — without
+# threading a budget through every builder (a front end never references it).
 _BUDGET_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
     "_pa_budget_override", default=None
 )
@@ -97,7 +111,11 @@ _BUDGET_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
 
 @contextlib.contextmanager
 def budget_override(budget: SymbolicBudget | None) -> Iterator[None]:
-    """Within this context, budget-less `Program`s use `budget` (None restores default)."""
+    """Make budget-less :class:`Program`s use ``budget`` for the duration of this context.
+
+    Passing ``None`` restores the default budget. A :class:`Program` built with no
+    explicit ``budget=`` consults this ambient value at construction time.
+    """
     tok = _BUDGET_OVERRIDE.set(budget)
     try:
         yield
@@ -106,10 +124,10 @@ def budget_override(budget: SymbolicBudget | None) -> Iterator[None]:
 
 
 def current_budget_override() -> SymbolicBudget | None:
-    """Return the ambient :func:`budget_override` budget, or ``None``.
+    """Return the ambient :func:`budget_override` budget, or ``None`` if none is set.
 
-    For builders that construct a :class:`Program` with an explicit budget and want to honour
-    the override themselves.
+    A builder that constructs a :class:`Program` with an explicit budget reads this
+    to honour the override itself.
     """
     return _BUDGET_OVERRIDE.get()
 
@@ -125,14 +143,13 @@ ProvenanceKind = Literal[
 
 @dataclass(frozen=True)
 class Provenance:
-    """Where a generator came from.
+    """The source a generator was allocated from.
 
-    ``kind`` is one of ``"vertex"``, ``"point"``, ``"coeff"``,
-    ``"stmt_out"``.  ``origin`` identifies the source object
-    (a :class:`Geometry`, a basis vector, a :class:`Stmt`, …).
-    ``index`` is the position inside that origin (vertex j, query
-    point row, coefficient n, output cell index, …).  ``label`` is
-    the human-readable name attached to the generator.
+    The ``kind`` is a :data:`ProvenanceKind` tag naming the sort of source, and
+    ``origin`` is the source object it came from — an input source, a basis vector, a
+    :class:`Stmt`, and so on. ``index`` is the position within that origin, such as
+    the vertex, query-point row, coefficient, or output-cell index, and ``label`` is
+    the human-readable name carried on the generator.
     """
 
     kind: ProvenanceKind
@@ -148,15 +165,12 @@ class Provenance:
 class SymbolEnv:
     """Global identity table for symbolic generators.
 
-    Allocates fresh generator names with attached :class:`Provenance`
-    metadata.  Two rational functions with the same generator name
-    refer to the same algebraic object regardless of which ring they
-    were originally constructed in — :class:`SymbolEnv` is what
-    enforces that invariant.
-
-    The class is *not* responsible for owning a single shared
-    :class:`PolyRing`; rings are per-:class:`RationalFunction` and
-    rebuilt on demand.
+    The env allocates fresh generator names and attaches :class:`Provenance` metadata
+    to each. Two rational functions built with the same generator name denote the
+    same algebraic object no matter which ring each was constructed in, and the env is
+    what enforces that invariant. Rings themselves stay per-:class:`RationalFunction`,
+    rebuilt on demand, so the env holds names and provenance rather than any shared
+    :class:`PolyRing`.
     """
 
     def __init__(self) -> None:
@@ -180,8 +194,8 @@ class SymbolEnv:
     def declare(self, name: str, provenance: Provenance) -> None:
         """Record an externally-chosen name with its provenance.
 
-        Raises if ``name`` is already declared (we do not silently
-        rebind — a clash means the caller has a bug in its naming).
+        Raises :class:`ValueError` when ``name`` is already declared: a clash is
+        never rebound silently, because it means the caller's naming has a bug.
         """
         if name in self._provenance:
             raise ValueError(f"generator {name!r} already declared")
@@ -222,23 +236,22 @@ class SymbolEnv:
 
 @dataclass(frozen=True)
 class SymInput:
-    """A flat, atom-per-cell descriptor for a named symbolic input.
+    """A named symbolic input, described flat as one atom per cell.
 
-    See plan §1.4: a *static* :class:`SymInput` allocates *one atom per
-    cell* of its declared shape — there is no granularity knob.  The
-    ``provenance`` field is either a fixed :class:`Provenance` (used
-    for every cell, with the cell's own index appended) or a callable
-    mapping a cell index to its :class:`Provenance` for fully custom
+    A static :class:`SymInput` allocates one atom for every cell of its declared
+    shape; there is no granularity knob. Its ``provenance`` is either a fixed
+    :class:`Provenance` reused for every cell, with the cell's own index appended, or
+    a callable mapping a cell index to its :class:`Provenance` for fully custom
     labelling.
 
-    **Dynamic inputs (Stage C).** A ``shape`` entry may be a
-    :class:`DimAtom` (an axis whose size is known only at run time — e.g. an
-    FFS-typed Grassmann input ``a : Λᵏ`` whose dimension ``δ`` is a runtime
-    rank).  Such an input is *dynamic* (:func:`is_dynamic`); it does **not**
-    enumerate per-cell atoms but is allocated as a single **bulk**
-    :class:`SymArray` whose axis sizes are read from the provided array at
-    :meth:`Program.run` time and bound into ``dim_bindings``.  Static inputs
-    are unchanged (byte-identical).
+    A ``shape`` entry may instead be a :class:`DimAtom`, an axis whose size is known
+    only at run time. That makes the input *dynamic* (:func:`is_dynamic`): rather than
+    enumerating per-cell atoms, it is allocated as a single bulk :class:`SymArray`
+    whose axis sizes are read from the provided array at :meth:`Program.run` time and
+    bound into ``dim_bindings``. Static inputs are unaffected::
+
+        static  shape (2, 3)   ->  6 atoms, one per cell
+        dynamic shape (r, 3)   ->  1 bulk SymArray, r resolved at run time
     """
 
     name: str
@@ -252,8 +265,7 @@ def allocate_input(env: SymbolEnv, spec: SymInput) -> np.ndarray:
     Returns a numpy ``object`` ndarray of shape ``spec.shape``.  Each
     atom lives in its own single-generator :class:`PolyRing` whose
     generator name is freshly allocated against ``env``.  Cross-cell
-    arithmetic rebuilds joint rings on demand (see
-    :func:`chartlib._symbolic.rational._join_rings`).
+    arithmetic rebuilds joint rings on demand.
     """
     prov_fn: Callable[[tuple[int, ...]], Provenance]
     if isinstance(spec.provenance, Provenance):
@@ -310,68 +322,65 @@ def cells_sparsity(arr: np.ndarray) -> np.ndarray:
 class SymbolicBudget:
     """Tunable knobs that drive lane choice for the symbolic interpreter.
 
-    ``naive_inverse_max_size`` and ``inverse_max_degree`` are static
-    structural bounds (matrix size, total-degree estimate) above which
-    ``det`` / ``inverse`` route from the closed-form rational lane (the
-    naive cofactor / Schur expansion) into a :class:`Stmt`-emitting
-    fallback (slice B).
+    ``naive_inverse_max_size`` and ``inverse_max_degree`` are static structural bounds
+    (matrix size and total-degree estimate) above which ``det`` and ``inverse`` route
+    from the closed-form rational lane — the naive cofactor or Schur expansion — into
+    a :class:`Stmt`-emitting fallback.
 
-    Plan B step 4 adds the **deferral gates** below.  Their *defaults
-    reproduce the legacy symbolic path exactly* — i.e. ``SymbolicBudget()``
-    (== :meth:`legacy`) is byte-identical to the pre-Plan-B behaviour, and
-    that path is a *preserved, first-class budget choice*, not an accident of
-    defaults.  :meth:`build_big_symbols` is the opposite end (budget zero):
-    every modeled op stays symbolic so a sampler produces big-symbol IR over
-    its vertex / DoF inputs instead of collapsing to numeric Stmts.
+    The deferral gates below default to full deferral, so a bare ``SymbolicBudget()``
+    (equivalently :meth:`legacy`) fully defers, and that path is itself a first-class
+    budget choice. :meth:`build_big_symbols` sits at the opposite end, budget zero,
+    where every modeled op stays symbolic and a front end produces big-symbol IR over
+    its inputs instead of collapsing to numeric Stmts.
 
-    Deferral gates (all default to "defer", == legacy):
+    Each deferral gate defaults to deferring (the legacy behaviour):
 
-    * ``einsum_bag_threshold`` — per-output-cell monomial bound above which a
-      multi-operand symbolic einsum offloads to a numeric Stmt.  ``None`` means
-      "use the module / ``CHARTLIB_EINSUM_BAG_THRESHOLD`` default" (64) — the
-      legacy, env-aware behaviour.  Budget-zero sets it huge (never offload).
-    * ``defer_phi_jet`` — when True (legacy) the single-operand φ-jet einsum
-      (``runtime_einsum``) offloads its object-dtype LHS to a numeric Stmt.
-      False keeps the contraction symbolic, so the **parameterization built
-      from the vertex / DoF atoms comes through** (the step-4 retention target).
-    * ``defer_covariant`` — when True (legacy) the order-≥1 covariant chain
-      (``covariant.defer_covariant``) becomes one numeric Stmt.  False keeps it
-      symbolic — heavier (the 3-D high-order blow-up Plan A measured), so it is
-      opt-in even at budget zero (``build_big_symbols(retain_covariant=...)``).
-    * ``freeze`` — when True (legacy) :func:`freeze_array` caps cell complexity
-      by capturing big cells as fresh atoms.  False disables it (retain).
+    * ``einsum_bag_threshold`` is the per-output-cell monomial bound above which a
+      multi-operand symbolic einsum offloads to a numeric Stmt. ``None`` selects the
+      module ``CHARTLIB_EINSUM_BAG_THRESHOLD`` default of 64, the env-aware
+      behaviour; budget zero sets it huge so the einsum never offloads.
+    * ``defer_phi_jet``, when True, offloads the single-operand einsum
+      (``runtime_einsum``) — its object-dtype LHS goes to a numeric Stmt.
+      False keeps the contraction symbolic, so the symbolic expression built from the
+      input atoms comes through.
+    * ``defer_covariant``, when True, collapses a chain of deferred contractions into
+      one numeric Stmt. False keeps it symbolic, which is heavier because that chain
+      grows quickly in high dimensions, so it is opt-in even at budget zero
+      (``build_big_symbols(retain_covariant=...)``).
+    * ``freeze``, when True, lets :func:`freeze_array` cap cell complexity by
+      capturing big cells as fresh atoms. False disables that and retains the cells.
     """
 
     naive_inverse_max_size: int = 6
     inverse_max_degree: int | None = None
     cancel_num_dom: bool = False
     iszero_tol: float = 0.0
-    # Retention knob: when True, the covariant frame conversion (orthonormal /
+    # Retention knob: when True, the higher-order derivative chain frame conversion (orthonormal /
     # euclidean) is applied OUTSIDE the deferred numeric Stmt, so Q / R / R⁻¹
     # come through as visible QrSignFixOp atoms (the frame conversion is the
-    # last step).  Default False keeps the WS3 full-deferral (cheap; the whole
-    # covariant chain incl. frame is one numeric Stmt).  Surfacing the frame
+    # last step).  Default False keeps the full-deferral (cheap; the whole
+    # derivative chain incl. frame is one numeric Stmt).  Surfacing the frame
     # reintroduces order-≥2 symbolic cost on 3-D cells, so it is opt-in — the
-    # knob Plan B's budget-zero "build big symbols" mode flips on.
+    # knob the budget-zero "build big symbols" mode flips on.
     surface_frame: bool = False
-    # Deferral gates (Plan B step 4) — defaults == legacy symbolic path.
+    # Deferral gates — defaults == legacy symbolic path.
     einsum_bag_threshold: int | None = None
     defer_phi_jet: bool = True
     defer_covariant: bool = True
     freeze: bool = True
-    # Plan-D #4 / task #11 — the "middle ground": when surfacing the frame
+    # The "middle ground": when surfacing the frame
     # (``surface_frame``), defer the per-slot R⁻¹/Q contraction to numeric
     # TensordotOp/MoveaxisOp Stmts instead of running it inline as symbolic RF
     # arithmetic.  Keeps Q/R/R⁻¹ visible while making the surfaced frame usable
     # on 3-D high-order cells (where the inline contraction blows up).  Default
-    # False = today's inline rational lane (byte-identical).
+    # False = today's inline rational lane.
     defer_frame_contraction: bool = False
-    # Downstream block-inverse deferral (oracle's Schur `symbolic_inverse`): the matrix size at/above
+    # Downstream block-inverse deferral (a Schur `symbolic_inverse`): the matrix size at/above
     # which a base-case inverse / a Schur-combine matrix product offloads to a NUMERIC Stmt instead of
     # inline RationalFunction arithmetic (the degree blow-up on a single connected
     # component). ``None`` ⇒ the consumer's own module defaults; ``build_big_symbols`` raises them (stay
     # symbolic / never defer), ``force_stmts`` lowers them (always defer). Read via
-    # ``current_budget_override``; other budget fields left at legacy keep sampling byte-identical, so a
+    # ``current_budget_override``; other budget fields left at legacy keep sampling identical, so a
     # caller can tune ONLY the inverse without perturbing the sampling lane.
     schur_inverse_stmt_size: int | None = None
     schur_matmul_stmt_size: int | None = None
@@ -393,19 +402,20 @@ class SymbolicBudget:
         surface_frame: bool | None = None,
         **overrides: int | bool | None,
     ) -> SymbolicBudget:
-        """Budget-zero: retain the parameterization (chart φ) built from vertices.
+        """Return the budget-zero preset that retains closed-form symbolic structure.
 
-        Turns off the φ-jet single-operand offload, raises the multi-operand
-        einsum threshold so contractions stay symbolic, and disables
-        :func:`freeze_array` — so the parameterization comes through as big
-        symbols over the vertex / DoF inputs.
+        It turns off the single-operand offload, raises the multi-operand einsum
+        threshold so contractions stay symbolic, and disables :func:`freeze_array`, so
+        the symbolic expression built from the input atoms comes through as big symbols
+        rather than numeric Stmts.
 
-        ``retain_covariant`` (default False) additionally keeps the order-≥1
-        covariant chain symbolic.  It is **not** required merely to see the
-        parameterization, and it is prone to the 3-D high-order blow-up Plan A
-        measured, so it is opt-in.  ``surface_frame`` defaults to track
-        ``retain_covariant`` (surface the frame only when the covariant chain is
-        retained).  Extra ``overrides`` are forwarded to the constructor.
+        ``retain_covariant`` (default False) additionally keeps the deferred
+        contraction chain symbolic. It is not needed merely to surface the symbolic
+        expression, and it invites high-order growth in operand size on 3-D cells, so
+        it is opt-in.
+        ``surface_frame`` defaults to track ``retain_covariant``, surfacing the frame
+        only when the derivative chain is retained. Any extra ``overrides`` are
+        forwarded to the constructor.
         """
         if surface_frame is None:
             surface_frame = retain_covariant
@@ -422,21 +432,20 @@ class SymbolicBudget:
 
     @classmethod
     def force_stmts(cls, **overrides: int | bool | None) -> SymbolicBudget:
-        """Return the no-symbolic-budget preset, driving every modeled op to a statement.
+        """Return the no-symbolic-budget preset that drives every modeled op to a statement.
 
-        The opposite of :meth:`build_big_symbols`: rather than retaining closed-form rational
-        structure, this forces every modeled op to
-        emit an imperative :class:`Stmt` (no closed-form rational lane), so
-        Grassman's symbolic inputs flow through as deferred Stmts that are
-        simplified afterward (the build-then-simplify novelty).
+        Opposite to :meth:`build_big_symbols`: rather than retaining closed-form
+        rational structure, it forces every modeled op to emit an imperative
+        :class:`Stmt`, so there is no closed-form rational lane and symbolic inputs
+        flow through as deferred Stmts that are simplified afterward.
 
-        * ``naive_inverse_max_size=0`` / ``inverse_max_degree=0`` — every
-          ``det`` / ``inverse`` is over-budget ⇒ emits a Stmt.
-        * ``einsum_bag_threshold=1`` — every multi-operand symbolic einsum
-          offloads to a numeric Stmt.
-        * ``freeze=True`` — cap any residual cell to an atom.
+        * ``naive_inverse_max_size=0`` and ``inverse_max_degree=0`` make every ``det``
+          and ``inverse`` over-budget, so each emits a Stmt.
+        * ``einsum_bag_threshold=1`` sends every multi-operand symbolic einsum to a
+          numeric Stmt.
+        * ``freeze=True`` caps any residual cell to an atom.
 
-        Extra ``overrides`` are forwarded to the constructor.
+        Any extra ``overrides`` are forwarded to the constructor.
         """
         return cls(
             naive_inverse_max_size=0,
@@ -502,8 +511,8 @@ class IntAtomRef:
 class RationalRef:
     """A :class:`RationalFunction` whose generators are program atoms.
 
-    Used to splice rational expressions over inputs / prior stmt-out
-    atoms into a Stmt's input list — slice B uses these heavily.
+    It splices a rational expression over input or prior Stmt-output atoms into a
+    statement's input list.
     """
 
     rf: RationalFunction
@@ -511,23 +520,23 @@ class RationalRef:
 
 @dataclass(frozen=True)
 class BulkOut:
-    """Handle for a :class:`Stmt` output kept as one whole numeric tensor.
+    """Handle for a :class:`Stmt` output carried as one whole tensor.
 
-    A *bulk* output is NOT scattered into per-cell atom RationalFunctions:
-    at :meth:`Program.run` time the producing Stmt's numeric result is
-    bound under a single name, and the owning :class:`SymArray` evaluates
-    to that whole tensor directly.  This avoids minting one RF + one ring
-    per cell for tensors that are only consumed in bulk (terminal outputs,
-    or anything not dissected per-cell).
+    A *bulk* output stays a single numeric tensor: at :meth:`Program.run` time
+    the producing statement's result is bound under one name, and the owning
+    :class:`SymArray` evaluates directly to that tensor. One name and one binding
+    stand in for the rational function and ring that a per-cell output mints for
+    every cell, which is the right form for a tensor consumed whole — a terminal
+    output, or any array read as a block rather than cell by cell.
 
-    A consumer that needs per-cell symbolic structure (an einsum / rational
-    arithmetic) calls :func:`unpack`, which emits an unpack Stmt converting
-    the bulk tensor into the usual per-cell atom array.
+    To read per-cell symbolic structure from it — for an einsum or rational
+    arithmetic — a consumer calls :func:`unpack`, which appends a statement that
+    expands the bulk tensor into the usual per-cell array of atom rational
+    functions.
 
-    ``name`` is the run-time binding key; ``shape`` is the tensor shape.
-    For a *dynamic* bulk output (Stage B) ``shape`` may carry
-    :class:`DimAtom` entries (the symbolic shape); the concrete axis sizes
-    are resolved at :meth:`Program.run` time.
+    ``name`` is the run-time binding key and ``shape`` is the tensor shape; for a
+    *dynamic* bulk output ``shape`` may contain :class:`DimAtom` entries whose
+    concrete axis sizes are resolved at :meth:`Program.run` time.
     """
 
     name: str
@@ -588,21 +597,20 @@ class DimAtom:
     Unlike :class:`IntAtom` (a pre-declared integer-valued *input*), a
     ``DimAtom`` is an integer resolved at :meth:`Program.run` time.  It may be
     used as an entry in an :class:`OutSpec.shape` / :class:`SymInput.shape`,
-    making that shape **dynamic**: the axis size is resolved at run time from
+    making that shape *dynamic*: the axis size is resolved at run time from
     the bound value of its source.
 
-    * ``name`` — provenance, e.g. ``"rank:Alt"``.
+    * ``name`` — provenance, e.g. ``"rank:svd"``.
     * ``source`` — a *tagged* hashable tuple identifying the run-time origin
       of the dimension and used as the ``dim_bindings`` key:
 
-      - ``("stmt", stmt_idx, out_idx)`` — a prior Stmt output (Stage B), e.g.
-        the ``rank`` (δ_f) output of an :class:`SvdOp`.
-      - ``("in", input_name, axis)`` — an axis of a dynamic :class:`SymInput`
-        (Stage C); resolved from the provided array's actual shape.
+      - ``("stmt", stmt_idx, out_idx)`` — a prior Stmt output, e.g.
+        the ``rank`` output of an :class:`SvdOp`.
+      - ``("in", input_name, axis)`` — an axis of a dynamic :class:`SymInput`;
+        resolved from the provided array's actual shape.
 
-    Backward-compat shim: a bare 2-tuple ``(stmt_idx, out_idx)`` (Stage B's
-    original form) is normalised to ``("stmt", stmt_idx, out_idx)`` so old
-    callers keep working and the key still matches the binder.
+    A bare 2-tuple ``(stmt_idx, out_idx)`` is normalised to
+    ``("stmt", stmt_idx, out_idx)`` so the key matches the binder.
 
     Frozen so it hashes by value (usable as a dict key and in a shape
     tuple alongside concrete ints).
@@ -628,18 +636,17 @@ class DimAtom:
 
     @staticmethod
     def from_input(name: str, input_name: str, axis: int) -> DimAtom:
-        """Construct an input-axis ``DimAtom`` (Stage C)."""
+        """Construct an input-axis ``DimAtom``."""
         return DimAtom(name=name, source=("in", input_name, int(axis)))
 
 
 def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool:
     """Report whether any entry of ``shape`` is a :class:`DimAtom`, i.e. a runtime dimension.
 
-    The single gate that routes a shape away from the static per-cell
-    build-time path (cell-atom allocation, ``np.ndindex``, cell-size math)
-    and into the dynamic bulk lane.  A fully-concrete shape is *not*
-    dynamic, so static-shape programs hit none of the dynamic branches and
-    remain byte-identical.
+    This is the one gate that routes a shape away from the static per-cell build-time
+    path — cell-atom allocation, ``np.ndindex``, cell-size math — and into the dynamic
+    bulk lane. A fully concrete shape is not dynamic, so static-shape programs reach
+    none of the dynamic branches and are unaffected.
     """
     return any(isinstance(d, DimAtom) for d in shape)
 
@@ -671,18 +678,17 @@ def _resolve_shape(
 
 @dataclass(frozen=True)
 class OutSpec:
-    """Declaration of one Stmt output: a name and a shape.
+    """Declaration of one Stmt output as a name and a shape.
 
-    Passed to :meth:`SymArray.emit_stmt` so that fresh atom RFs can be
-    allocated for each cell of the declared shape.  The ``name`` is
-    used as the provenance label prefix for the allocated atoms — it
-    surfaces in repr / debug output.
+    It is passed to :meth:`Program.emit_stmt`, which allocates fresh atom RFs for each
+    cell of the declared shape. The ``name`` becomes the provenance-label prefix for
+    those atoms and surfaces in repr and debug output.
 
-    ``shape`` entries are ordinarily ``int``; an entry may also be a
-    :class:`DimAtom` (a runtime dimension produced by a prior Stmt
-    output), making the shape **dynamic** — see :func:`is_dynamic`.  A
-    dynamic output is always emitted bulk (whole-tensor), its axis sizes
-    resolved at :meth:`Program.run` time.
+    A ``shape`` entry is ordinarily an ``int``, but it may instead be a
+    :class:`DimAtom` — a runtime dimension produced by a prior Stmt output — which
+    makes the shape *dynamic* (see :func:`is_dynamic`). A dynamic output is always
+    emitted bulk, as one whole tensor, its axis sizes resolved at :meth:`Program.run`
+    time.
     """
 
     name: str
@@ -696,11 +702,10 @@ class OutSpec:
 class SymArray:
     """Cell ndarray attached to a :class:`Program`.
 
-    Unifies the previous ``SymArray`` / ``Output`` / ``BoundOutput``
-    triple into one type.  Cells are ``RationalFunction | float``;
-    ``program`` is the owning Program (``None`` for standalone literals).
-    ``name`` is set when the array is registered as a program output or
-    a Stmt-bound output.
+    A :class:`SymArray` is the single value type for a symbolic array. Its cells are
+    ``RationalFunction | float``; ``program`` is the owning :class:`Program`, or
+    ``None`` for a standalone literal; and ``name`` is set once the array is
+    registered as a program output or a Stmt-bound output.
 
     Read protocol mirrors a numpy ndarray:
 
@@ -713,7 +718,7 @@ class SymArray:
     * iteration yields per-row SymArrays / cells.
 
     The back-reference to ``program`` is what lets operations on this
-    array extend the program (slice B): array methods like
+    array extend the program: array methods like
     :meth:`inverse` / :meth:`matmul` route closed-form work through
     rational arithmetic on cells and over-budget / imperative work
     through ``self.program.emit_stmt(...)``.
@@ -772,12 +777,12 @@ class SymArray:
 
     @property
     def cells(self) -> np.ndarray:
-        """Per-cell ndarray; auto-unpacks a bulk array to atom RFs.
+        """Return the per-cell ndarray, unpacking a bulk array to atom RFs on demand.
 
-        For a bulk array this materialises (one ``unpack`` Stmt, memoised)
-        — the safety net that lets any per-cell consumer work unchanged.
-        Shape/dtype/ndim below read the placeholder directly, so querying
-        them does NOT force materialisation.
+        For a bulk array this materialises the tensor through one memoised ``unpack``
+        Stmt — the safety net that lets any per-cell consumer work unchanged. The
+        :attr:`shape`, :attr:`dtype`, and :attr:`ndim` properties read the placeholder
+        directly, so querying them does not force materialisation.
         """
         if self._bulk is not None:
             return unpack(self)._cells
@@ -901,24 +906,25 @@ class SymArray:
 
     def evaluate(self, bindings: Mapping[str, np.ndarray | float], *,
                  compiled: bool = True) -> np.ndarray:
-        """Substitute numeric ``bindings`` into the cells; return float ndarray.
+        """Substitute numeric ``bindings`` into the cells and return a float ndarray.
 
-        ``compiled`` selects the per-cell RF evaluator: the default codegen-and-cache path
-        (``eval_numeric_fast`` — amortizes over MANY evaluations of the same cells), or, with
-        ``compiled=False``, a direct term-sum (``eval_numeric_direct``) that skips the per-RF
-        ``compile`` — the right choice for a FEW evaluations, e.g. the 3-point structural-mask
-        probe (:func:`polyarray.schur._structural_mask`). Byte-identical values either way.
+        ``compiled`` selects the per-cell RF evaluator. The default codegen-and-cache
+        path (``eval_numeric_fast``) amortizes over many evaluations of the same
+        cells; with ``compiled=False`` a direct term-sum (``eval_numeric_direct``)
+        skips the per-RF ``compile``, which is the right choice for a few evaluations
+        such as the 3-point structural-mask probe
+        (:func:`polyarray.schur._structural_mask`). The two evaluators give identical
+        values.
 
-        ``bindings`` is keyed by symbolic-input name (e.g. ``"V_0"``) and
-        each value is the numeric vector / scalar to substitute for that
-        input.  Vector-shape values are auto-flattened to per-generator
-        names ``f"{input_name}_{k}"``.
+        ``bindings`` is keyed by symbolic-input name (e.g. ``"V_0"``), each value
+        being the numeric vector or scalar to substitute for that input. A
+        vector-shaped value is auto-flattened to the per-generator names
+        ``f"{input_name}_{k}"``.
 
-        When :attr:`program` has statements (Stmt-emitting primitives have
-        been run), this method runs those statements first to bind the
-        Stmt-output atoms — same machinery as :meth:`Program.run`, but
-        targeted at this single SymArray rather than the program's
-        registered outputs.
+        When :attr:`program` carries statements — Stmt-emitting primitives have run —
+        this method executes those statements first to bind the Stmt-output atoms, the
+        same machinery as :meth:`Program.run` but targeted at this single SymArray
+        rather than the program's registered outputs.
         """
         if self._bulk is not None:
             # Bulk: run the producing Stmt and read the whole tensor —
@@ -955,19 +961,18 @@ class SymArray:
     # ------------------------------------------------------------------
 
     def reshape(self, shape: tuple[int, ...] | list[int]) -> SymArray:
-        """``self.reshape(shape)``, keeping a bulk array BULK.
+        """Reshape the array to ``shape``, keeping a bulk array bulk.
 
-        A reshape wants no cell VALUES — only a shape. But ``.cells`` auto-unpacks a bulk array
-        (one ``unpack`` Stmt materialising every per-cell atom), so ``SymArray(sa.cells.reshape(...))``
-        forces the whole tensor to answer a question about its layout. Six sites across pointwise and
-        savo were doing exactly that, for no other reason than that this method did not exist —
-        `ReshapeOp` has been in the IR (and rendered by pyab, and degree-transparent) all along.
+        A reshape needs only a shape, never the cell values. But reading ``.cells``
+        auto-unpacks a bulk array — one ``unpack`` Stmt materialising every per-cell
+        atom — so ``SymArray(sa.cells.reshape(...))`` would force the whole tensor just
+        to answer a question about its layout. Bulk in gives bulk out: this emits one
+        ``ReshapeOp`` Stmt so the chain stays deferred, while a non-bulk array goes
+        through ``_cells`` directly, which is already materialised, so nothing is
+        forced there either.
 
-        Bulk in, bulk out: emits one ``ReshapeOp`` Stmt so the chain stays deferred. Non-bulk goes
-        through ``_cells`` directly, which is already materialised, so nothing is forced there either.
-
-        ``-1`` is resolved here rather than left to numpy, because the emitted ``OutSpec`` needs a
-        concrete shape.
+        A ``-1`` entry is resolved here rather than left to numpy, because the emitted
+        :class:`OutSpec` needs a concrete shape.
         """
         cur = self.shape
         static_cur = not is_dynamic(cur)
@@ -1033,8 +1038,8 @@ class SymArray:
     def matmul(self, other: SymArray | np.ndarray) -> SymArray:
         """Matrix product ``self @ other``.
 
-        Numeric short-circuit when both operands are float arrays;
-        cell-arithmetic dispatch otherwise.
+        When both operands are float arrays it short-circuits to a numeric matmul;
+        otherwise the cells contract through :class:`RationalFunction` arithmetic.
         """
         Aa = self.cells
         Bb = _to_cells(other)
@@ -1055,21 +1060,23 @@ class SymArray:
     def einsum(self, subscripts: str, *others: SymArray | np.ndarray) -> SymArray:
         """Contract cells with ``np.einsum(subscripts, self, *others)``, threading the program.
 
-        A general axis-specified contraction, as in ``"mi...,ip->mp..."``. Numeric operands
-        short-circuit to a float einsum; otherwise the cells contract through
-        :class:`RationalFunction` arithmetic. One program, two lanes, as in :meth:`matmul`.
-        The bound program is ``self``'s; any ``SymArray`` operand must share it (or be
-        program-less / numeric).
+        This is a general axis-specified contraction, as in ``"mi...,ip->mp..."``.
+        Numeric operands short-circuit to a float einsum; otherwise the cells contract
+        through :class:`RationalFunction` arithmetic — one program, two lanes, as in
+        :meth:`matmul`. The bound program is ``self``'s, and any :class:`SymArray`
+        operand must share it or be program-less or numeric.
 
-        **Bulk in, bulk out** (as :meth:`reshape`): a contraction wants no per-cell VALUES, only the
-        contraction itself — but ``.cells`` auto-unpacks a bulk array (one ``unpack`` Stmt materialising
-        every per-cell atom, then an object-dtype ``np.einsum`` doing ring arithmetic over them). When any
-        operand is a bulk (deferred whole-tensor) :class:`SymArray` and a program is present, the
-        contraction is handed to :func:`runtime_einsum_multi`, whose bulk branch emits ONE
-        :class:`EinsumStmtOp` :class:`Stmt` and keeps the chain deferred. Mathematically the same
-        contraction; it is simply not densified into the symbolic ring on the way. A bulk array is by
-        construction a Stmt output (opaque atoms), so this never intercepts the numeric lane, and a
-        non-bulk operand set takes exactly the code below.
+        Bulk in gives bulk out, as in :meth:`reshape`: a contraction needs only the
+        contraction, no per-cell values, yet reading ``.cells`` would auto-unpack a
+        bulk array (one ``unpack`` Stmt materialising every per-cell atom, then an
+        object-dtype ``np.einsum`` doing ring arithmetic over them). When any operand
+        is a bulk (deferred whole-tensor) :class:`SymArray` and a program is present,
+        the contraction is handed to :func:`runtime_einsum_multi`, whose bulk branch
+        emits one :class:`EinsumStmtOp` :class:`Stmt` and keeps the chain deferred. It
+        is mathematically the same contraction, simply not densified into the symbolic
+        ring on the way. A bulk array is by construction a Stmt output of opaque atoms,
+        so this never intercepts the numeric lane, and a non-bulk operand set takes
+        exactly the code below.
         """
         prog = self.program
         operands: list[SymArray | np.ndarray] = [self]
@@ -1094,8 +1101,9 @@ class SymArray:
     def det(self, budget: SymbolicBudget | None = None) -> SymArray:
         """Return ``det(self)`` as a 0-d SymArray.
 
-        Numeric short-circuit; closed-form Bareiss for object cells in
-        budget; ``Stmt(fn=numpy.linalg.det)`` otherwise.
+        A numeric matrix short-circuits to ``np.linalg.det``. A symbolic matrix within
+        budget takes the closed-form Bareiss expansion over its object cells; over
+        budget it emits a :class:`DetOp` statement.
         """
         if self.cells.dtype.kind == "f":
             return SymArray(np.asarray(np.linalg.det(self.cells)), program=self.program)
@@ -1126,8 +1134,9 @@ class SymArray:
     def inverse(self, budget: SymbolicBudget | None = None) -> SymArray:
         """Return ``inv(self)`` as an ``(n, n)`` SymArray.
 
-        Numeric short-circuit; closed-form cofactor for object cells in
-        budget; ``Stmt(fn=numpy.linalg.inv)`` otherwise.
+        A numeric matrix short-circuits to ``np.linalg.inv``. A symbolic matrix within
+        budget takes the closed-form cofactor inverse over its object cells; over
+        budget it emits an :class:`InvOp` statement.
         """
         if self.cells.dtype.kind == "f":
             return SymArray(np.linalg.inv(self.cells), program=self.program)
@@ -1152,7 +1161,11 @@ class SymArray:
         return SymArray(cofactor_inverse(_ensure_object(self.cells)), program=self.program)
 
     def pinv(self) -> SymArray:
-        """Moore–Penrose pseudoinverse.  Numeric eager; symbolic always emits."""
+        """Return the Moore–Penrose pseudoinverse.
+
+        A numeric matrix is computed eagerly with ``np.linalg.pinv``; a symbolic
+        matrix always emits a :class:`PinvOp` statement.
+        """
         if self.cells.dtype.kind == "f":
             return SymArray(np.linalg.pinv(self.cells), program=self.program)
         if self.program is None:
@@ -1172,7 +1185,11 @@ class SymArray:
         return out
 
     def solve(self, b: SymArray | np.ndarray) -> SymArray:
-        """Solve ``self @ x = b``.  Numeric eager; symbolic emits ``np.linalg.solve``."""
+        """Solve ``self @ x = b`` for ``x``.
+
+        A numeric system is solved eagerly with ``np.linalg.solve``; a symbolic system
+        emits a :class:`SolveOp` statement.
+        """
         Aa = self.cells
         Bb = _to_cells(b)
         if Aa.dtype.kind == "f" and Bb.dtype.kind == "f":
@@ -1198,19 +1215,18 @@ class SymArray:
     # ------------------------------------------------------------------
 
     def sqrt(self) -> SymArray:
-        """Element-wise sqrt; numeric eager, symbolic emits a 0-d Stmt per cell.
+        """Square-root each cell: numeric cells eagerly, symbolic cells via a 0-d Stmt each.
 
-        Restricted to 0-d (scalar) SymArrays in slice B — broader
-        broadcasting comes later.
+        Restricted to 0-d (scalar) SymArrays.
         """
         return self._scalar_op(SqrtOp(), "sqrt", float_fn=np.sqrt)
 
     def abs(self) -> SymArray:
-        """Element-wise abs; 0-d only in slice B."""
+        """Take the element-wise absolute value; restricted to 0-d SymArrays."""
         return self._scalar_op(AbsOp(), "abs", float_fn=np.abs)
 
     def sign(self) -> SymArray:
-        """Element-wise sign; 0-d only in slice B."""
+        """Take the element-wise sign; restricted to 0-d SymArrays."""
         return self._scalar_op(SignOp(), "sign", float_fn=np.sign)
 
     def _scalar_op(self, stmt_fn: StmtFn, name: str, *,
@@ -1261,25 +1277,23 @@ def _program_budget(program: Program | None) -> SymbolicBudget:
 
 
 # ---------------------------------------------------------------------------
-# Typed numpy ops (Plan B step 2)
+# Typed numpy ops
 # ---------------------------------------------------------------------------
 #
 # Each op is a frozen, hashable dataclass with a ``__call__`` that runs the
 # modeled numpy operation on the bound *numeric* operands at ``Program.run``
-# time — the same shape as the pre-existing :class:`EinsumOp` / :class:`SwitchOp`
-# / :class:`covariant.QrSignFixOp`.  Promoting the linalg / scalar deferrals from
-# bare ``np.linalg.*`` callables (which the SymArray methods previously stored as
-# ``Stmt.fn``) to these typed ops is behaviour-preserving — the numeric result is
-# identical — but gives the IR typed, inspectable nodes with a stable hashable
-# identity (the hook the future ``fingerprint`` / partial-eval transform needs to
-# recognise a linalg / structural node without ``is np.linalg.det`` sniffing).
+# time — the same shape as :class:`EinsumOp` / :class:`SwitchOp`.  Modeling the
+# linalg / scalar deferrals as typed ops rather than bare ``np.linalg.*``
+# callables in ``Stmt.fn`` gives the IR typed, inspectable nodes with a stable
+# hashable identity (the hook a partial-eval transform needs to recognise a
+# linalg / structural node without ``is np.linalg.det`` sniffing).
 #
 # ``TensordotOp`` / ``MoveaxisOp`` are the contraction / structural surface the
-# covariant frame conversion applies to symbolic data today (``covariant.py``
-# ``_apply_per_slot`` runs them *inline on object cells* — the rational lane).
+# higher-order derivative chain frame conversion applies to symbolic data (run
+# *inline on object cells* — the rational lane).
 # They are added here as round-trip-tested vocabulary but are NOT yet emitted by
-# any sampler: turning those inline contractions into deferred numeric Stmts is a
-# symbolic→numeric deferral decision, deferred to Plan B step 4 (budget-zero) and
+# any front end: turning those inline contractions into deferred numeric Stmts is a
+# symbolic→numeric deferral decision, deferred (budget-zero) and
 # gated on flagging it first.
 
 
@@ -1353,8 +1367,8 @@ class SvdOp:
     Multi-output: returns ``(U, S, Vh, rank)`` where ``rank`` is a 0-d
     integer ndarray giving the numerical rank of ``A`` at tolerance
     ``rcond`` (defaulting to numpy's ``matrix_rank`` rule).  The ``rank``
-    output is the runtime dimension ``δ_f`` consumed as a :class:`DimAtom`
-    (Stage B) — sizing image / projected / FFS arrays at run time.
+    output is the runtime dimension consumed as a :class:`DimAtom` —
+    sizing image / projected / rank-selected arrays at run time.
 
     ``full_matrices=False`` (the default) yields the reduced SVD, matching
     the orthonormal-basis use; ``rcond`` mirrors ``np.linalg.matrix_rank``.
@@ -1386,22 +1400,32 @@ class GSvdOp:
     inner-product / metric and ``M_W`` (``|W|×|W|`` SPD) the codomain metric.
 
     The factors are orthonormal **in the respective metrics** and split into
-    the four-fundamental-subspace (FFS) blocks at the numerical ``rank``
-    (``δ_f``), exactly as in `50 §A1`/`§A5`:
+    the four-fundamental-subspace blocks at the numerical ``rank``:
 
-    =======  ===============================  ========================
-    output   columns                          FFS block / property
-    =======  ===============================  ========================
-    ``U``    first ``rank`` cols of the        **image** basis of ``A`` in
-             codomain factor                   ``W``; ``Uᵀ M_W U = I``
-    ``UI``   remaining ``|W|−rank`` cols        **coker** basis (``M_W``-⊥
-                                               complement of the image)
-    ``V``    first ``rank`` cols of the        **coimg** basis of ``A`` in
-             domain factor                     ``V``; ``Vᵀ M_V V = I``
-    ``VI``   remaining ``|V|−rank`` cols        **ker** basis (``A·VI ≈ 0``)
-    ``S``    descending singular values        the ``rank`` nonzero ones lead
-    ``rank`` 0-d int ndarray                   numerical rank ``δ_f``
-    =======  ===============================  ========================
+    .. list-table::
+       :header-rows: 1
+
+       * - output
+         - columns
+         - subspace block / property
+       * - ``U``
+         - first ``rank`` cols of the codomain factor
+         - **image** basis of ``A`` in ``W``; ``Uᵀ M_W U = I``
+       * - ``UI``
+         - remaining ``|W|−rank`` cols
+         - **coker** basis (``M_W``-⊥ complement of the image)
+       * - ``V``
+         - first ``rank`` cols of the domain factor
+         - **coimg** basis of ``A`` in ``V``; ``Vᵀ M_V V = I``
+       * - ``VI``
+         - remaining ``|V|−rank`` cols
+         - **ker** basis (``A·VI ≈ 0``)
+       * - ``S``
+         - descending singular values
+         - the ``rank`` nonzero ones lead
+       * - ``rank``
+         - 0-d int ndarray
+         - numerical rank
 
     Both ``U`` (``=[U|UI]``) and ``V`` (``=[V|VI]``) are returned as the
     leading (image / coimg) blocks only; ``UI`` / ``VI`` carry the
@@ -1409,18 +1433,24 @@ class GSvdOp:
     factors are the horizontal concatenations ``[U, UI]`` and ``[V, VI]``.
 
     **Construction.**  Whiten ``A`` by the Cholesky factors of the two
-    metrics (``M_W = Lw Lwᵀ``, ``M_V = Rw Rwᵀ``)::
+    metrics (``M_W = Lw Lwᵀ``, ``M_V = Rw Rwᵀ``):
+
+    .. code-block:: text
 
         Aw = Lwᵀ · A · Rw⁻ᵀ            # both spaces now orthonormal
         Ũ, S, Ṽᵀ = svd(Aw)            # ordinary SVD in white coords
 
-    then de-whiten the factors back into the metrics::
+    then de-whiten the factors back into the metrics:
+
+    .. code-block:: text
 
         [U|UI] = Lw⁻ᵀ · Ũ             # ⇒ ([U|UI])ᵀ M_W ([U|UI]) = I
         [V|VI] = Rw⁻ᵀ · Ṽ             # ⇒ ([V|VI])ᵀ M_V ([V|VI]) = I
 
     **Reconstruction identity** (note the trailing ``M_V`` — the dual
-    pairing makes the coordinates contravariant)::
+    pairing makes the coordinates contravariant):
+
+    .. code-block:: text
 
         A = U · diag(S[:rank]) · Vᵀ · M_V
           = [U|UI] · Sfull · [V|VI]ᵀ · M_V        # full form
@@ -1497,8 +1527,8 @@ class SinvFullOp:
     """The ``nrows×ncols`` rectangular-diagonal pseudo-inverse ``S⁻¹``.
 
     ``out[i, i] = 1/Sᵢ`` for ``i < rank`` (the numerical rank), else ``0`` — the
-    metric pseudo-inverse assembled from a :class:`GSvdOp`'s singular values
-    (grassmann `50 §A5`).  ``rank`` is a runtime 0-d int; the diagonal beyond it
+    metric pseudo-inverse assembled from a :class:`GSvdOp`'s singular values.
+    ``rank`` is a runtime 0-d int; the diagonal beyond it
     is masked to zero (so trailing near-zero singular values never divide).
     """
 
@@ -1522,8 +1552,8 @@ class GSvdFullOp:
     Multi-output ``(Ufull, Vfull, S, rank)`` with *static* widths: ``Ufull =
     [U|UI]`` (``cod×cod``) and ``Vfull = [V|VI]`` (``dom×dom``) are the full
     de-whitened factors (image/coimg = leading ``rank`` cols, coker/ker = the
-    trailing complement).  The runtime-δ block slice happens in a downstream
-    Stmt referencing this op's ``rank`` output (grassmann `50 §A1`).
+    trailing complement).  The runtime-rank block slice happens in a downstream
+    Stmt referencing this op's ``rank`` output.
     """
 
     rcond: float | None = None
@@ -1586,7 +1616,7 @@ class DynBlockRepeatOp:
 
 
 # ---------------------------------------------------------------------------
-# Generic array builtins relocated from grassmann's lowering layer (Batch 2).
+# Generic array builtins of the lowering layer.
 # Each is a frozen, hashable Stmt.fn with a numpy host ``__call__``; both render
 # lanes live in ``pyab._ARRAY_OP_LOWERINGS`` and ``numpy_source._builtin_renderers``.
 # Several produce a 0-d int sizing a downstream dynamic axis (DimAtom source).
@@ -1621,7 +1651,7 @@ class DynZerosOp:
 
 @dataclass(frozen=True)
 class DynEyeTensorOp:
-    """The vmap identity of a multi-axis dimension binder, a matrix or tensor seed.
+    """It builds the vmap identity of a multi-axis dimension binder as a matrix or tensor seed.
 
     Emits ``np.eye(∏dᵢ).reshape(∏dᵢ, d₀, d₁, …)``, with each ``dᵢ`` read from
     ``refs[i].shape[axes[i]]``.
@@ -1712,7 +1742,7 @@ class MulAxisDimOp:
 
 @dataclass(frozen=True)
 class CompRankOp:
-    """The complement rank ``ambient − δ`` as a 0-d int — sizes the FFS complement (Ker/CoKer) axis."""
+    """The complement rank ``ambient − rank`` as a 0-d int — sizes the complement (Ker/CoKer) axis."""
 
     ambient: int
 
@@ -1732,7 +1762,7 @@ class HStackOp:
 
 @dataclass(frozen=True)
 class ColStackOp:
-    """Stack 1-D coordinate vectors as the columns of a matrix (the ``ListBasis`` matrix)."""
+    """Stack 1-D coordinate vectors as the columns of a matrix."""
 
     def __call__(self, *cols: np.ndarray) -> np.ndarray:
         """Evaluate the op on concrete numeric operands."""
@@ -1847,11 +1877,10 @@ class LastColsOp:
         return np.asarray(A)[:, int(rank):]
 
 
-# --- Batch-3 relocated generic array / linalg builtins ----------------------
+# --- Generic array / linalg builtins ----------------------------------------
 # Subspace project/embed, Kronecker assembly, inverse-transpose / basis-compose,
 # the SPD operator square root, numeric rank, and metric orthonormalization —
-# bodies moved verbatim from grassmann's ``lower/represent.py`` (pure numpy, no
-# grassmann types).  Both lanes render (pyab ``_ARRAY_OP_LOWERINGS`` + numpy
+# pure numpy host bodies.  Both lanes render (pyab ``_ARRAY_OP_LOWERINGS`` + numpy
 # ``_builtin_renderers``).
 
 
@@ -1859,7 +1888,7 @@ class LastColsOp:
 class ProjectOp:
     """``Pᵀ @ v`` — project ambient coords onto the orthonormal sub-basis (drop comp).
 
-    ``v`` may be a multi-axis ambient tensor (e.g. ``V⊗ᵏ`` stored ``(n,…,n)``); it is
+    ``v`` may be a multi-axis ambient tensor ``(n, …, n)``; it is
     raveled to the ambient (column) coordinate before the projection.
     """
 
@@ -1873,7 +1902,7 @@ class EmbedOp:
     """``P @ vsub`` — pad sub-coords into the ambient (zeros in the complement).
 
     The ambient result is reshaped to the ambient space's multi-axis layout
-    (``shape``), e.g. ``V⊗ᵏ`` ⇒ ``(n,…,n)``.
+    (``shape``), a multi-axis ambient tensor ``(n, …, n)``.
     """
 
     shape: tuple[int, ...] = ()
@@ -2008,14 +2037,14 @@ def _full_rank(A: np.ndarray) -> bool:
 
 @dataclass(frozen=True)
 class AssertOp:
-    """Passthrough predicate check over bound inputs (the D-scope asserts).
+    """Passthrough predicate check over bound inputs.
 
-    Validates ``kind`` against the bound inputs and **returns the first
-    input unchanged**, so a downstream consumer data-depends on the assert
-    (preserving Stmt ordering).  Kinds:
+    It validates ``kind`` against the bound inputs and returns the first input
+    unchanged, so a downstream consumer data-depends on the assert and Stmt ordering
+    is preserved. The supported kinds are:
 
     * ``"shape_eq"``       — ``x.shape == rest[0].shape``
-    * ``"rank_eq"``        — ``int(rest[0]) == int(rest[1])`` (δ vs asserted)
+    * ``"rank_eq"``        — ``int(rest[0]) == int(rest[1])`` (rank vs asserted)
     * ``"spd"``            — ``x`` is symmetric positive-definite
     * ``"square_full_rank"`` — ``x`` is square and full rank
     * ``"in_span"``        — ``x`` lies in the column span of ``rest[0]`` (exact projection)
@@ -2128,7 +2157,7 @@ class MoveaxisOp:
 
 
 # ---------------------------------------------------------------------------
-# Control-flow ops (Plan B step 3): Call + While
+# Control-flow ops: Call + While
 # ---------------------------------------------------------------------------
 #
 # ``SwitchOp`` (the conditional) is the only pre-existing control-flow op.  These
@@ -2138,7 +2167,7 @@ class MoveaxisOp:
 # run on the bound *numeric* operands at :meth:`Program.run` time (the same
 # contract as every other Stmt fn), so the wrapped functions see floats, not
 # symbolic cells.  Like ``TensordotOp`` / ``MoveaxisOp`` they are round-trip-
-# tested vocabulary — not yet emitted by any sampler; Plan C's Monte-Carlo demo
+# tested vocabulary — not yet emitted by any front end; Plan C's Monte-Carlo demo
 # is the intended first exerciser.
 #
 # Note: a sub-:class:`Program` can already be a ``Stmt.fn`` directly (``_run_stmt``
@@ -2246,24 +2275,22 @@ class IdentityOp:
 
 @dataclass(frozen=True)
 class EinsumOp:
-    """Stmt-compatible runtime einsum.
+    """Stmt-compatible runtime einsum with a captured numeric right-hand side.
 
-    At Stmt-build time we replace a heavy ``np.einsum(spec, lhs_RF,
-    rhs)`` over object-dtype :class:`RationalFunction` cells with a
-    single :class:`Stmt` whose output SymArray is fresh atom RFs and
-    whose run-time callable evaluates the einsum on the bound numeric
-    LHS array (and the captured numeric RHS).  Cuts the build-time
-    symbolic blow-up from ``Σ_k RF * float`` over object dtype to a
+    At Stmt-build time a heavy ``np.einsum(spec, lhs_RF, rhs)`` over object-dtype
+    :class:`RationalFunction` cells is replaced by a single :class:`Stmt` whose output
+    SymArray is fresh atom RFs and whose run-time callable evaluates the einsum on the
+    bound numeric LHS array together with the captured numeric RHS. This cuts the
+    build-time symbolic blow-up from ``Σ_k RF * float`` over object dtype down to a
     pure-numeric ``np.einsum`` at :meth:`Program.run` time.
 
-    ``spec`` is the einsum subscript string (e.g. ``"mk...,kn->mn..."``).
-    ``rhs`` is captured by the Op (numeric ndarray); the Stmt's only
-    symbolic input is the LHS tensor.  Not used for contractions
-    where both operands are symbolic — those still need RF arithmetic.
+    ``spec`` is the einsum subscript string (e.g. ``"mk...,kn->mn..."``), and ``rhs``
+    is captured by the op as a numeric ndarray, so the Stmt's only symbolic input is
+    the LHS tensor. It is not used for contractions where both operands are symbolic,
+    which still need :class:`RationalFunction` arithmetic.
 
-    Hashable: ``rhs`` is wrapped in ``rhs_bytes`` so the dataclass is
-    `frozen` + ``eq=True`` consistent with :class:`Program.fingerprint`
-    (slice C).
+    The op is hashable: ``rhs`` is wrapped as ``rhs_bytes`` so the frozen dataclass
+    has a value-stable identity usable as a cache key.
     """
 
     spec: str
@@ -2305,17 +2332,17 @@ def runtime_einsum(
 ) -> np.ndarray | SymArray:
     """Defer a symbolic ``einsum(spec, lhs, rhs)`` to a runtime :class:`EinsumOp` statement.
 
-    ``rhs`` must already be numeric.  Behaviour by ``lhs``:
+    ``rhs`` must already be numeric. The behaviour depends on ``lhs``:
 
-    * ``program is None`` or numeric ``lhs`` → eager ``np.einsum`` (the
-      float path is untouched).
-    * **bulk** ``lhs`` (a deferred whole-tensor SymArray) → offload-keeps-
-      bulk: emit one :class:`EinsumOp` Stmt that takes the whole tensor as
-      input and a **bulk** output, returned as a bulk :class:`SymArray`.
-      The ``×M`` chain never materialises.
-    * materialised symbolic ``lhs`` (RF cells, e.g. geometry atoms) →
-      offload to a per-cell-atom Stmt and return the ndarray, as before
-      (consumed-per-cell intermediates like the φ-jet stay materialised).
+    * When ``program`` is ``None`` or ``lhs`` is numeric, it runs ``np.einsum``
+      eagerly, leaving the float path untouched.
+    * A bulk ``lhs`` (a deferred whole-tensor SymArray) offloads while staying bulk:
+      it emits one :class:`EinsumOp` Stmt taking the whole tensor as input and
+      producing a bulk output, returned as a bulk :class:`SymArray`, so the ``×M``
+      chain never materialises.
+    * A materialised symbolic ``lhs`` (RF cells, e.g. model-input atoms) offloads to a
+      per-cell-atom Stmt and returns the ndarray, keeping consumed-per-cell
+      intermediates such as the single-operand einsum materialised.
     """
     rhs = np.asarray(rhs)
     if isinstance(lhs, SymArray) and lhs._bulk is not None:
@@ -2330,9 +2357,9 @@ def runtime_einsum(
     lhs = np.asarray(lhs)
     if program is None or lhs.dtype != object:
         return np.einsum(spec, lhs, rhs)
-    # Budget-zero retention: keep the φ-jet contraction symbolic over its object
-    # cells (vertex / DoF atoms) so the parameterization comes through built from
-    # vertices, instead of offloading the LHS to a numeric Stmt.
+    # Budget-zero retention: keep the single-operand (derivative-expansion) einsum
+    # contraction symbolic over its object cells (vertex / parameter atoms) so the
+    # parameterization comes through built from vertices, instead of offloading the LHS to a numeric Stmt.
     if not program.budget.defer_phi_jet:
         return np.einsum(spec, lhs, rhs)
     sa = SymArray(lhs, program=program)
@@ -2362,7 +2389,7 @@ def cells_use_only_stmt_atoms(arr: np.ndarray, env: SymbolEnv) -> bool:
 
     Such cells are opaque at build time — their value exists only once
     the producing :class:`Stmt` runs — so deferring a computation over
-    them to another numeric Stmt loses NO polynomial visibility.  Cells
+    them to another numeric Stmt loses no polynomial visibility.  Cells
     carrying any model generator (``vertex`` / ``point`` / ``coeff``
     provenance) fail the gate: downstream consumers may rely on exact
     rational structure in those, so callers must keep the symbolic path.
@@ -2414,7 +2441,7 @@ def _einsum_bag_threshold() -> int:
 
 # Contraction paths depend only on (spec, optimize, operand shapes), never on values, but
 # ``np.einsum(..., optimize=True)`` recomputes the path on EVERY call — ~28 µs of pure
-# planning that dominated symbolic-Vandermonde builds (hundreds of thousands of identical
+# planning that dominated large symbolic builds (hundreds of thousands of identical
 # small einsums at high degree). Cache the path by that key and pass it back: numpy
 # then skips the planning and runs the SAME contraction order ⇒ bit-identical results.
 _EINSUM_PATH_CACHE: dict[tuple[str, object, tuple[tuple[int, ...], ...]], Any] = {}
@@ -2437,18 +2464,17 @@ def _cached_einsum(spec: str, operands: tuple[np.ndarray, ...], optimize: object
 class EinsumStmtOp:
     """Stmt-compatible einsum over an arbitrary number of symbolic operands.
 
-    Generalisation of :class:`EinsumOp`: where ``EinsumOp`` captures
-    exactly one numeric RHS into ``rhs_bytes``, this op captures
-    nothing — every operand is an input :class:`SymArrayRef` on the
-    :class:`Stmt`, so ``spec`` alone identifies the contraction.
+    This generalises :class:`EinsumOp`: where ``EinsumOp`` captures exactly one
+    numeric RHS into ``rhs_bytes``, this op captures nothing — every operand is an
+    input :class:`SymArrayRef` on the :class:`Stmt`, so ``spec`` alone identifies the
+    contraction.
 
-    Used when ≥2 operands are symbolic (i.e., object-dtype cells
-    flowing through an einsum after the §7.10.6 freeze rule).  For
-    the one-symbolic-one-numeric case prefer :class:`EinsumOp` so the
-    numeric RHS is embedded in the Stmt's hash.
+    It is used when two or more operands are symbolic, i.e. object-dtype cells flowing
+    through an einsum after the freeze rule. For the one-symbolic-one-numeric case
+    prefer :class:`EinsumOp`, which embeds the numeric RHS in the Stmt's hash.
 
-    Hashable: ``spec`` + ``optimize`` form a small frozen dataclass
-    consistent with :class:`Program.fingerprint` (slice C).
+    The op is hashable: ``spec`` and ``optimize`` form a small frozen dataclass with a
+    value-stable identity usable as a cache key.
     """
 
     spec: str
@@ -2460,22 +2486,19 @@ class EinsumStmtOp:
 
 @dataclass(frozen=True)
 class SwitchOp:
-    """Stmt-compatible runtime switch: pick a branch by integer scrutinee.
+    """Stmt-compatible runtime switch that picks a branch by integer scrutinee.
 
-    The Stmt's inputs are ``(scrutinee_int, branch_0, branch_1, …)``;
-    at run time the op returns ``branch[int(scrutinee_int)]``.
+    The Stmt's inputs are ``(scrutinee_int, branch_0, branch_1, …)``, and at run time
+    the op returns ``branch[int(scrutinee_int)]``.
 
-    Used to lower :meth:`SymbolicInterpreter.select_x` over an
-    :class:`IntAtom` scrutinee: when ``select_x`` is called with an
-    IntAtom, it eagerly evaluates each branch (so any RF arithmetic
-    happens up-front), then emits a single :class:`Stmt` whose ``fn``
-    is this op.  The output is a fresh :class:`SymArray` of atoms
-    with the shape of one branch.
+    It lowers a front-end select over an :class:`IntAtom` scrutinee: called with an
+    IntAtom, the select eagerly evaluates each branch so any RF arithmetic happens
+    up-front, then emits a single :class:`Stmt` whose ``fn`` is this op. The output is
+    a fresh :class:`SymArray` of atoms with the shape of one branch.
 
-    Hashable / frozen so :class:`Program.fingerprint` (slice C) can
-    cache compiled forms.  Stateless — the branch ordering matches
-    the canonical orientation order of the entity type at the call
-    site.
+    The op is frozen and hashable, so compiled forms can be cached. It is stateless:
+    the branch ordering matches the canonical order of the selector's domain at the
+    call site.
     """
 
     n_branches: int
@@ -2531,8 +2554,9 @@ StmtFn: TypeAlias = Union[
     IdentityOp, AssertOp, SwitchOp, CallOp, WhileOp,
 ]
 
-#: The same vocabulary as a runtime ``isinstance`` tuple — derived from :data:`StmtFn`,
-#: so the two can never drift.
+#: The op classes named by :data:`StmtFn`, collected into a tuple for
+#: :func:`isinstance` checks. It is computed from the union, so it lists exactly
+#: those classes and no others.
 STMT_FN_OPS: tuple[type, ...] = get_args(StmtFn)
 
 #: Everything a :attr:`Stmt.fn` may hold: one of polyarray's own ops, a nested
@@ -2544,10 +2568,10 @@ StmtOp: TypeAlias = Union[StmtFn, "Program", Callable[..., Any], None]
 def is_builtin_op(fn: StmtOp) -> TypeGuard[StmtFn]:
     """Return whether ``fn`` is one of polyarray's own ops (:data:`StmtFn`).
 
-    The narrowing gate in front of an exhaustive ``match``: everything else a
-    ``Stmt.fn`` may hold — a sub-:class:`Program`, a ``vmap`` closure, a front-end op
-    class, a plain callable, ``None`` — is genuinely open and must be handled *before*
-    this check, not inside the match.
+    It is the narrowing gate placed in front of an exhaustive ``match``: everything
+    else a ``Stmt.fn`` may hold — a sub-:class:`Program`, a ``vmap`` closure, a
+    front-end op class, a plain callable, ``None`` — is genuinely open and must be
+    handled *before* this check, not inside the match.
 
     Parameters
     ----------
@@ -2642,7 +2666,7 @@ def _einsum_label_dims(
 ) -> dict[str, int]:
     """Map each non-ellipsis label in the spec to the operand axis size it carries.
 
-    Operands may be ``SymArray`` (including BULK ones): shapes are read through
+    Operands may be ``SymArray``, including bulk ones: shapes are read through
     :func:`_op_shape`, which answers from the placeholder and never materialises cells.
     """
     label_dim: dict[str, int] = {}
@@ -2666,7 +2690,7 @@ def _estimate_einsum_output_terms(
     """Upper-bound per-output-cell monomial count after the contraction.
 
     The bound is ``(prod of contracted-axis sizes) × (prod of input
-    cell complexities)``.  For the post-§7.10.6 case where every
+    cell complexities)``.  For the case where every
     input is a frozen atom, the operand complexity factor collapses
     to 1 and the bound is just the contracted-axis product.
     """
@@ -2708,8 +2732,8 @@ def _einsum_output_shape(
     Handles explicit-output (``"ij,jk->ik"``) and implicit-output
     (``"ij,jk"``) specs, plus ellipsis-bearing parts.  Ellipsis dims
     are taken from whichever operand carries them; ellipses across
-    operands must be consistent (numpy broadcasting rules — slice 1
-    doesn't reproduce that, just trusts the operand that has the
+    operands must be consistent (numpy broadcasting rules — not
+    reproduced here, which just trusts the operand that has the
     fullest ellipsis).
     """
     input_parts, output_part = _einsum_parse_spec(spec)
@@ -2783,32 +2807,30 @@ def runtime_einsum_multi(
 ) -> np.ndarray | SymArray:
     """Multi-operand symbolic einsum with size-aware materialisation.
 
-    Estimates the per-output-cell monomial count from the contracted
-    axes and input cell complexities.  If the bound is at most
-    :data:`CHARTLIB_EINSUM_BAG_THRESHOLD` (default 64), runs
-    ``np.einsum`` over the object-dtype operands directly (RF path —
-    symbolic structure preserved).  Otherwise emits an
-    :class:`EinsumStmtOp` :class:`Stmt` whose outputs are fresh atom
-    RFs of shape ``out_shape``.
+    It estimates the per-output-cell monomial count from the contracted axes and the
+    input cell complexities. When the bound is at most the
+    ``CHARTLIB_EINSUM_BAG_THRESHOLD`` default of 64, it runs ``np.einsum`` over the
+    object-dtype operands directly, preserving symbolic RF structure; otherwise it
+    emits an :class:`EinsumStmtOp` :class:`Stmt` whose outputs are fresh atom RFs of
+    shape ``out_shape``.
 
-    ``force_defer=True`` skips the size estimate + eager short-circuit
-    for the object-dtype, program-present, NON-bulk case, so the
-    contraction ALWAYS emits a fresh-atom :class:`EinsumStmtOp`
-    regardless of the estimated size (used when a caller must keep an
-    operand symbolic and deferred — e.g. the symbolic-``K`` recombine
-    lane — rather than densifying it into ``np.einsum``).  It does NOT
-    affect the bulk branch (already force-defers) nor the all-numeric /
-    no-program fallthrough (cannot defer without a program).
+    ``force_defer=True`` skips the size estimate and eager short-circuit for the
+    object-dtype, program-present, non-bulk case, so the contraction always emits a
+    fresh-atom :class:`EinsumStmtOp` regardless of the estimated size. A caller uses
+    it to keep an operand symbolic and deferred — the symbolic-``K`` recombine lane,
+    say — rather than densifying it into ``np.einsum``. It does not affect the bulk
+    branch, which already force-defers, nor the all-numeric or no-program
+    fallthrough, which cannot defer without a program.
 
-    All-numeric operands and no-program calls fall through to bare
-    ``np.einsum`` (mirrors :func:`runtime_einsum`).
+    All-numeric operands and no-program calls fall through to bare ``np.einsum``, as
+    in :func:`runtime_einsum`.
 
-    Bulk-aware: if any operand is a bulk :class:`SymArray` (a deferred whole
-    tensor), the contraction offloads-keeps-bulk — every operand flows as a
-    Stmt input (a bulk one via its ``_bulk`` handle, a whole-tensor input)
-    and the output is bulk.  The size estimate is NEVER run on a bulk
-    operand (it would read placeholder cells / force materialisation); bulk
-    presence forces the offload branch directly.
+    The routine is bulk-aware: if any operand is a bulk :class:`SymArray` (a deferred
+    whole tensor), the contraction offloads while staying bulk — every operand flows
+    as a Stmt input, a bulk one through its ``_bulk`` handle as a whole-tensor input,
+    and the output is bulk. The size estimate never runs on a bulk operand, since it
+    would read placeholder cells and force materialisation; the presence of a bulk
+    operand forces the offload branch directly.
     """
     if program is not None and any(
         isinstance(o, SymArray) and o._bulk is not None for o in operands
@@ -2862,16 +2884,12 @@ def freeze_array_bulk(
     program: Program | None,
     name: str = "frozen",
 ) -> np.ndarray | SymArray:
-    """Bulk variant: emit a single :class:`Stmt` for the whole tensor.
+    """Freeze a whole tensor with a single :class:`Stmt`, the bulk variant of :func:`freeze_array`.
 
-    Equivalent in run-time semantics to :func:`freeze_array` but
-    amortises emit-stmt overhead — for tensors with many cells (e.g.
-    a Lagrange ``source_ref[k]`` shape ``(M, N, d, d)`` with
-    ``N=125``), per-cell freeze costs ~1 ms × N cells in Python
-    overhead.  ``freeze_array_bulk`` allocates a single Stmt whose
-    output is a SymArray of fresh atoms with the same shape; at
-    :meth:`Program.run` time the whole tensor is evaluated in one
-    pass.
+    It matches :func:`freeze_array` in run-time semantics but amortises the emit-stmt
+    overhead: instead of one freeze Stmt per cell, it allocates a single Stmt whose
+    output is a SymArray of fresh atoms with the same shape, and at :meth:`Program.run`
+    time the whole tensor is evaluated in one pass.
 
     Parameters
     ----------
@@ -2887,16 +2905,16 @@ def freeze_array_bulk(
     Returns
     -------
     np.ndarray or SymArray
-        CARRIER-PRESERVING: a :class:`SymArray` in gives a ``SymArray`` back (riding
-        ``program``); a raw ndarray in gives cells back.  So a caller that already threads a
-        ``SymArray`` never has to unwrap ``.cells`` to freeze it — that unwrap drops the owning
-        ``Program`` and is exactly what the ``SYM-CELLS-UNWRAP`` rule forbids in the consumer
-        repos.  Numeric / no-program / float-dtype arrays pass through unchanged.
+        The carrier is preserved: a :class:`SymArray` in gives a ``SymArray`` back,
+        still riding ``program``, and a raw ndarray in gives cells back. A caller that
+        already threads a ``SymArray`` therefore never has to unwrap ``.cells`` to
+        freeze it, an unwrap that would drop the owning :class:`Program`. Numeric,
+        no-program, and float-dtype arrays pass through unchanged.
 
     Raises
     ------
     ValueError
-        When ``arr`` is a ``SymArray`` riding a *different* program.  Such an array is REFUSED
+        When ``arr`` is a ``SymArray`` riding a *different* program.  Such an array is refused
         rather than silently re-homed: its cells may name that program's Stmt outputs, and
         relabelling them onto ``program`` strands the Stmts that produce them (the "generator has
         no binding" failure).  Use :meth:`Program.graft` first, which brings those Stmts along.
@@ -2939,7 +2957,7 @@ def freeze_array(
 
     The freeze keeps subsequent symbolic arithmetic small.  At
     evaluation time, the captured cell is computed once (against the
-    bound vertex/DoF inputs) and substituted for the atom — same final
+    bound inputs) and substituted for the atom — same final
     answer, much smaller intermediate expressions.
 
     Returns the (possibly modified) ndarray; the original is not
@@ -3118,34 +3136,30 @@ def _stmt_out_label(prefix: str, out_name: str, idx: tuple[int, ...]) -> str:
 
 @dataclass
 class Stmt:
-    """An imperative IR statement.
+    """An imperative IR statement: a call whose returns become named SymArrays.
 
-    ``fn`` is the actual Python callable invoked at run time
-    (``numpy.linalg.qr``, ``numpy.sqrt``, or another :class:`Program`).
-    For slice A every Stmt-fn is either ``None`` (a no-op statement
-    used purely to splice rational expressions — *this is rare*) or a
-    sub-:class:`Program`.
+    Its shape is::
 
-    ``in_`` is a list of :class:`Ref`s describing where this Stmt's
-    inputs come from.
+        in_ (Refs)  ->  fn(...)  ->  out (SymArrays of fresh atom RFs)
 
-    ``out`` is a tuple of :class:`SymArray`s — one per fn return, in
-    fn-return order.  Each SymArray's cells are fresh atom RFs
-    allocated on the program's :class:`SymbolEnv`.
+    ``fn`` is the Python callable invoked at run time — one of polyarray's typed ops,
+    a plain callable, or another :class:`Program`. It may also be ``None``, a no-op
+    statement used purely to splice rational expressions, which is rare.
 
-    ``note`` is a human-readable provenance string.
+    ``in_`` is a tuple of :class:`Ref` objects describing where this Stmt's inputs
+    come from. ``out`` is a tuple of :class:`SymArray` objects, one per fn return in
+    fn-return order, each holding fresh atom RFs allocated on the program's
+    :class:`SymbolEnv`. ``note`` is a human-readable provenance string.
 
-    ``provenance`` is an optional *structured* :class:`Provenance` describing
-    what produced this Stmt (e.g. a lowering front-end's algebra-centric node /
-    basis-choice record).  It is **purely descriptive metadata**: it is never
-    read by :meth:`run`/evaluation, so a program with ``provenance=None`` (the
-    default) is byte-identical to one before this field existed.  Preserved
-    across :meth:`Program.copy` (hence through ``partial_eval``).
+    ``provenance`` is an optional structured :class:`Provenance` describing what
+    produced this Stmt. It is purely descriptive metadata, never read by :meth:`run`
+    or evaluation, so a program with ``provenance=None`` (the default) evaluates
+    identically, and it is preserved across :meth:`Program.copy` (hence through
+    ``partial_eval``).
 
-    ``inline`` controls sub-Program composition (§1.3).  When ``True``
-    the sub-program's rational outputs are spliced into the parent at
-    construction time and this Stmt is dropped from the parent's
-    statement list — see :func:`call_subprogram_inline`.
+    ``inline`` controls sub-Program composition: when ``True`` the sub-program's
+    rational outputs are spliced into the parent at construction time and this Stmt is
+    dropped from the parent's statement list (see :func:`call_subprogram_inline`).
     """
 
     fn: Callable[..., Any] | Program | None
@@ -3169,16 +3183,16 @@ class Program:
     appended via :meth:`add_stmt`.
 
     The :class:`SymbolEnv` is owned by the program and shared across
-    every cell uttered against it.
+    every cell built against it.
 
-    Plain-Python execution: :meth:`run` walks ``statements`` in order,
+    Execution is plain Python: :meth:`run` walks ``statements`` in order,
     builds a numeric binding for every Stmt-out cell, then evaluates
     each output's :class:`RationalFunction` cells against the
     accumulated bindings.
 
     :meth:`copy` returns an independent copy of the program (deep-clones
     state, rebinds back-references on internal SymArrays) so that a
-    sub-:class:`SymbolicInterpreter` can extend without disturbing the
+    sub-front end can extend without disturbing the
     original.
     """
 
@@ -3195,7 +3209,7 @@ class Program:
         self.input_arrays: dict[str, SymArray] = {}
         for inp in self.inputs:
             if is_dynamic(inp.shape):
-                # Stage C: a dynamic (DimAtom-sized) input cannot enumerate
+                # A dynamic (DimAtom-sized) input cannot enumerate
                 # per-cell atoms — allocate one whole-tensor bulk handle whose
                 # symbolic shape carries the DimAtom axes (resolved at run
                 # time from the provided array; see build_runtime_bindings).
@@ -3211,7 +3225,7 @@ class Program:
         self.statements: list[Stmt] = []
         self.outputs: dict[str, SymArray] = {}
         # An explicit `budget=` always wins; otherwise consult the ambient `budget_override`
-        # context (oracle's sparsity mask requests the inline-covariant lane), else the default.
+        # context (a sparsity mask requests the inline higher-order-derivative lane), else the default.
         self.budget: SymbolicBudget = (
             budget if budget is not None
             else (_BUDGET_OVERRIDE.get() or SymbolicBudget())
@@ -3243,8 +3257,8 @@ class Program:
 
         Re-declaring the same name with the same domain is a no-op
         (returns the existing atom).  A clash with a different domain
-        raises ``ValueError`` — orientation atoms allocated by
-        :meth:`SymbolicInterpreter.int_atom` get a deterministic
+        raises ``ValueError`` — selector atoms allocated by
+        a front-end integer-atom allocation get a deterministic
         domain per cell-type, so a clash indicates a real bug.
         """
         existing = self.int_atoms.get(name)
@@ -3279,25 +3293,30 @@ class Program:
         return idx
 
     def graft(self, foreign: SymArray, *, note: str = "graft") -> SymArray:
-        """Re-home a value COMPUTED ON ANOTHER program onto ``self`` — WITH its producing Stmts.
+        """Re-home a value computed on another program onto ``self``, bringing its producing Stmts along.
 
-        ``foreign`` is a :class:`SymArray` whose cells are :class:`RationalFunction`s over
-        ``foreign.program``'s generators — some of which may be **Stmt outputs** (deferred numeric ops:
-        matrix inverse / matmul, a grassmann-lowered sub-Program, …), not just shared input atoms. A bare
-        ``SymArray(foreign.cells, program=self)`` relabel carries the CELLS but strands those producing
-        Stmts on the by-product program, so a later lowering of ``self`` references generators ``self``
-        never produces ("no binding"). :meth:`graft` instead emits ``foreign.program`` as ONE sub-Program
-        :class:`Stmt` of ``self`` (the same mechanism a grassmann-lowered DOF body uses to compose onto the
-        shared sampling program), whose fresh atom outputs carry ``foreign``'s value on ``self`` — so the
-        whole foreign Stmt DAG runs when ``self`` runs/lowers, and the fresh outputs are dedup'd by
-        ``self``'s env (several grafts of like-named by-product programs do not collide).
+        ``foreign`` is a :class:`SymArray` whose cells are :class:`RationalFunction`s
+        over ``foreign.program``'s generators, some of which may be Stmt outputs —
+        deferred numeric ops such as a matrix inverse or matmul, or a lowered
+        sub-Program — not just shared input atoms. A bare
+        ``SymArray(foreign.cells, program=self)`` relabel carries the cells but strands
+        those producing Stmts on the source program, so a later lowering of ``self``
+        references generators ``self`` never produces (the "no binding" failure).
+        :meth:`graft` instead emits ``foreign.program`` as one sub-Program
+        :class:`Stmt` of ``self`` — the same mechanism a lowered sub-program body uses
+        to compose onto the shared program — whose fresh atom outputs carry
+        ``foreign``'s value on ``self``. The whole foreign Stmt DAG then runs when
+        ``self`` runs or lowers, and the fresh outputs are deduplicated by ``self``'s
+        env, so several grafts of like-named source programs do not collide.
 
-        ``foreign.program`` and ``self`` must be built over the SAME shared symbolic inputs (e.g. the
-        cell-vertex atoms of one ``make_symbolic_geometry`` reference): the sub-Program is fed ``foreign``'s
-        own input atoms relabeled onto ``self``, so ``self`` resolves their leaf generators (``V_0_0``…) by
-        name when it lowers — a generator ``self`` cannot produce surfaces downstream as an unbound generator.
-        A program-less ``foreign`` (numeric, or already inline on ``self``) needs no Stmts and is a plain
-        relabel. Idempotent on ``self``'s own arrays (``foreign.program is self`` ⇒ returned unchanged).
+        ``foreign.program`` and ``self`` must be built over the same shared symbolic
+        inputs, such as the atoms of one shared input source: the sub-Program is fed
+        ``foreign``'s own input atoms relabeled onto ``self``, so ``self`` resolves
+        their leaf generators (``V_0_0``…) by name when it lowers, and a generator
+        ``self`` cannot produce surfaces downstream as an unbound generator. A
+        program-less ``foreign`` — numeric, or already inline on ``self`` — needs no
+        Stmts and is a plain relabel. The operation is idempotent on ``self``'s own
+        arrays: ``foreign.program is self`` returns it unchanged.
         """
         src = foreign.program
         if src is self:
@@ -3317,7 +3336,7 @@ class Program:
         view.outputs = {"grafted": SymArray(foreign.cells, program=view, name="grafted")}
         # Operands feeding the sub-Program's inputs (by position): each is `src`'s own input atoms RELABELED
         # onto `self`. The two programs are BUILT OVER THE SAME shared symbolic inputs (e.g. the cell-vertex
-        # atoms of one ``make_symbolic_geometry`` reference), so `src`'s input generators (``V_0_0``…) are the
+        # atoms of one shared input source), so `src`'s input generators (``V_0_0``…) are the
         # SAME names `self` produces — `self` resolves them by name when it lowers, without `self` needing to
         # DECLARE those inputs itself (its own value kernel binds them at compile). A `src` input whose
         # generators `self` cannot produce is a genuine mismatch, caught downstream as an unbound generator.
@@ -3340,13 +3359,13 @@ class Program:
         Allocates one fresh atom RF per cell of every declared output
         shape on ``self.env`` (provenance ``"stmt_out"``), builds the
         Stmt, appends it to :attr:`statements`, and returns a tuple of
-        :class:`SymArray`s back-referenced to ``self``.  Downstream
+        :class:`SymArray` objects back-referenced to ``self``.  Downstream
         rational arithmetic uses the returned cells as ordinary
         RationalFunction generators — that is how rational-valued code
         *after* an imperative statement keeps being rational.
 
-        Inputs that are bare :class:`SymArray`s are auto-wrapped in
-        :class:`SymArrayRef`.  Inputs that are already :class:`Ref`s
+        Inputs that are bare :class:`SymArray` objects are auto-wrapped in
+        :class:`SymArrayRef`.  Inputs that are already :class:`Ref` objects
         flow through verbatim.
 
         Raises :class:`ValueError` if ``fn`` is ``None`` (use
@@ -3487,12 +3506,12 @@ class Program:
         its Stmt-output atoms via :meth:`SymArray.evaluate` without
         going through full :meth:`run`.
 
-        ``only`` (a set of statement indices) runs ONLY those statements,
+        ``only`` (a set of statement indices) runs only those statements,
         in program order — the dependency-cone lane
         (:func:`~polyarray.simplify.evaluate_cone`): a caller that wants one
         SymArray's value without executing unrelated statements (e.g. a
         singular op elsewhere in the program) passes the target's cone.
-        ``None`` (the default) runs every statement, byte-identical to before.
+        ``None`` (the default) runs every statement.
         """
         bindings = self._bindings_from_values(values)
         # Runtime dimension table: maps a producing output ``(stmt_idx,
@@ -3500,8 +3519,8 @@ class Program:
         # ``OutSpec.shape`` carrying a :class:`DimAtom` (whose ``source`` is
         # that output) resolves to a concrete shape.  Built ONLY for programs
         # that actually carry a dynamic shape; static programs pass ``None``
-        # so ``_run_stmt`` skips all per-output dim bookkeeping (B5) — the
-        # static path stays byte-identical AND free of per-output overhead.
+        # so ``_run_stmt`` skips all per-output dim bookkeeping — the
+        # static path stays identical AND free of per-output overhead.
         # The `only=` (cone) lane always uses the table: it may run mid-build (from
         # `evaluate_cone` inside a partially-built program), so it must NOT read/write the
         # whole-program `_has_dynamic_shape` memo (a partial program would cache a stale
@@ -3510,7 +3529,7 @@ class Program:
         dim_bindings: dict[DimSource, int] | None = (
             {} if (only is not None or self._has_dynamic_shape()) else None
         )
-        # Stage C: before walking statements, bind each dynamic INPUT.  Read
+        # Before walking statements, bind each dynamic INPUT.  Read
         # the provided array's actual shape, record each DimAtom axis into
         # dim_bindings (keyed by the DimAtom's ("in", name, axis) source so a
         # later dynamic OutSpec.shape / sibling resolves against it), and bind
@@ -3527,7 +3546,7 @@ class Program:
                     )
                 for axis, dim in enumerate(inp.shape):
                     if isinstance(dim, DimAtom):
-                        # An input axis sourced from a prior Stmt's output (e.g. an FFS-typed
+                        # An input axis sourced from a prior Stmt's output (e.g. an
                         # input Var sized by the factorization's canonical rank atom,
                         # ``source[0] == "stmt"``) is NOT bound from the fed array's shape:
                         # the producing Stmt records it later in ``_run_stmt``.  Binding it
@@ -3580,8 +3599,8 @@ class Program:
         via the cells' actual generator names (so atom names assigned
         by ``allocate_input``'s fresh suffixing are respected).  Any
         *extra* entry in ``values`` that doesn't match a declared input
-        is treated as a "geometry-side" input (typically a
-        :attr:`Geometry.sym_inputs` entry that flowed in through a
+        is treated as a "model-side" input (typically a
+        symbolic-input entry that flowed in through a
         :class:`SymArrayRef`); those entries are flattened by
         ``f"{name}_{k}"`` per cell of the value, matching the
         convention used by :meth:`SymArray.evaluate`.
@@ -3594,7 +3613,7 @@ class Program:
                 raise KeyError(f"missing value for input {inp.name!r}")
             # Dynamic (DimAtom-sized) inputs are bulk; their whole-tensor value
             # and DimAtom axis sizes are bound in build_runtime_bindings (C3),
-            # not per-cell here.  Mark declared so the geometry-side fallthrough
+            # not per-cell here.  Mark declared so the model-inputs-side fallthrough
             # below leaves them alone, and skip the static per-cell binding.
             if is_dynamic(inp.shape):
                 continue
@@ -3650,7 +3669,7 @@ class Program:
 
         ``dim_bindings`` (when supplied) records each scalar output's int
         value keyed by ``(stmt_idx, out_idx)`` so a later dynamic shape can
-        resolve a :class:`DimAtom` (B4).  ``None`` (the legacy default)
+        resolve a :class:`DimAtom`.  ``None`` (the default)
         skips all dim bookkeeping.
         """
         if stmt.fn is None:
@@ -3668,7 +3687,7 @@ class Program:
             self._bind_output(bound, outs[k], bindings, dim_bindings)
             # Record any scalar (0-d) output as a candidate runtime
             # dimension, keyed by its producing output position.  Only
-            # 0-d ints can size an axis (the SVD ``rank`` / δ_f output).
+            # 0-d ints can size an axis (the SVD ``rank`` output).
             if dim_bindings is not None:
                 arr = np.asarray(outs[k])
                 if arr.ndim == 0:
@@ -3742,7 +3761,7 @@ class Program:
 
         For a *dynamic* bulk output (an axis sized by a :class:`DimAtom`),
         the declared ``_bulk.shape`` is resolved against ``dim_bindings``
-        before validating the produced tensor's shape (B4).
+        before validating the produced tensor's shape.
         """
         if bound._bulk is not None:
             arr = np.asarray(value)
@@ -3838,7 +3857,7 @@ def _eval_cell(cell: Cell, bindings: dict[str, float]) -> float:
 # codegen-and-cache ``eval_numeric_fast``. The codegen amortizes over MANY runs of the same
 # program, but the structural-mask probe (:func:`polyarray.schur._structural_mask`) runs a
 # program only 3× — where compiling every RF (``builtins.compile`` + ``_poly_term_strings``)
-# is most of a degree-5 P(T) build for nothing. Values are byte-identical, so
+# is most of a degree-5 build for nothing. Values are identical, so
 # the probed mask is unchanged. Module-scoped: symbolic builds are single-threaded.
 _PROBE_DIRECT_EVAL = False
 
@@ -3847,8 +3866,8 @@ _PROBE_DIRECT_EVAL = False
 def probe_direct_eval() -> Iterator[None]:
     """Make the program runner evaluate cells directly, without per-cell codegen.
 
-    For probes run only a handful of times, where compiling an evaluator costs more than it
-    saves. See :data:`_PROBE_DIRECT_EVAL`.
+    This suits probes run only a handful of times, where compiling an evaluator costs
+    more than it saves. See :data:`_PROBE_DIRECT_EVAL`.
     """
     global _PROBE_DIRECT_EVAL
     prev = _PROBE_DIRECT_EVAL
@@ -3860,12 +3879,13 @@ def probe_direct_eval() -> Iterator[None]:
 
 
 def _eval_rf(rf: RationalFunction, bindings: dict[str, float]) -> float:
-    """Numeric eval of a :class:`RationalFunction`.
+    """Evaluate a :class:`RationalFunction` to a float.
 
-    Uses :meth:`RationalFunction.eval_numeric_fast` (codegen-and-cache) by default, or
-    :meth:`~RationalFunction.eval_numeric_direct` (no per-RF ``compile``) inside a
-    :func:`probe_direct_eval` scope — see :data:`_PROBE_DIRECT_EVAL`.  On the rare
-    missing-binding path (a programming error) we re-raise with a friendlier message.
+    By default it uses :meth:`RationalFunction.eval_numeric_fast` (codegen-and-cache),
+    or :meth:`~RationalFunction.eval_numeric_direct` (no per-RF ``compile``) inside a
+    :func:`probe_direct_eval` scope — see :data:`_PROBE_DIRECT_EVAL`. On the rare
+    missing-binding path, a programming error, it re-raises with a message listing the
+    missing generators.
     """
     try:
         return (rf.eval_numeric_direct(bindings) if _PROBE_DIRECT_EVAL
@@ -3898,15 +3918,15 @@ def vmap(
 
     Use this as the ``fn`` of a :class:`Stmt` so that an M-element
     per-point computation extends the parent program with one Stmt
-    rather than M sub-program calls.  Today this is a Python loop;
-    a torch / jax backend can swap in their native ``vmap``.
+    rather than M sub-program calls.  It runs as a Python loop;
+    a torch or jax backend could supply its native ``vmap``.
 
     ``in_axes`` and ``out_axes`` may be a single int (broadcast to
     every input / output) or a per-input / per-output tuple.  An
     in-axis entry of ``None`` means "broadcast as-is" — the same
-    array is fed to every iteration without slicing (used to share a
-    static input like vertex coordinates across all M points while
-    only ξ varies).  If ``body`` has exactly one output, the callable
+    array is fed to every iteration without slicing (used to share one
+    static operand across all M rows while only the batched operand
+    varies).  If ``body`` has exactly one output, the callable
     returns a bare ndarray; otherwise it returns a tuple in
     body-output insertion order.
     """
