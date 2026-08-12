@@ -29,11 +29,13 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install package and test deps
-        run: pip install -e ".[dev]"
+        # flint is included: the exact-fold suite asserts exact-rational results
+        # (1/3, x + 1), which only hold on the flint backend; without it the
+        # sympy RR fallback yields floats and those tests fail.
+        run: pip install -e ".[dev,flint]"
       - name: Run tests
         run: pytest -q
-        # torch- and PyArrayBackend-dependent tests skip via importorskip; the
-        # core suite runs on the pure-Python backends.
+        # torch- and PyArrayBackend-dependent tests skip via importorskip.
 
   docs:
     name: docs (zero-warning build)
