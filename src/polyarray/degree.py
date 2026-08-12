@@ -1,11 +1,12 @@
 """Whole-program polynomial-degree estimation.
 
 :func:`program_degree` walks a :class:`~polyarray.ir.Program`'s statement graph and
-propagates a polynomial degree per value from a per-input ``seed``, answering "what
-polynomial degree is the program's output in the seeded variables?" — the question a
-degree chooser asks. Consumers seed their domain knowledge and get
-back a single float, ``inf`` meaning "not a polynomial of the seeds" (rational /
-algebraic / unknown — the caller supplies its own order there).
+propagates a polynomial degree per value from a per-input ``seed``, answering the
+question "what polynomial degree does the program's output have in the seeded
+variables?" A caller that must pick an approximation or integration order seeds its own
+domain knowledge and gets back a single float. A result of ``inf`` means the output is
+not a polynomial of the seeds — it is rational, algebraic, or unknown — and the caller
+supplies its own order there.
 
 Each op contributes a degree to its output from its operands' degrees. The estimate is
 a sound over-estimate — products sum, sums take the max — because only under-estimation

@@ -1228,7 +1228,9 @@ def schur_inverse(matrix: np.ndarray, top_left: int) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        ``M^{-1}`` via ``S = D - C A^{-1} B``::
+        ``M^{-1}``, formed from the Schur complement ``S = D - C A^{-1} B``:
+
+        .. code-block:: text
 
             [[A^{-1} + A^{-1} B S^{-1} C A^{-1}, -A^{-1} B S^{-1}],
              [-S^{-1} C A^{-1},                  S^{-1}]]
