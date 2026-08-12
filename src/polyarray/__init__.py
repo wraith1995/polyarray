@@ -1,13 +1,22 @@
 """polyarray — the standalone symbolic-numeric array IR.
 
-This package is the single source of truth for the
-``Program`` / ``Stmt`` / ``SymArray`` / ``RationalFunction`` IR plus all
-polynomial backends (sympy / native_py / native_value / cython cpp) and
-the analyze / partial_eval IR passes.
+polyarray is an imperative array IR in which numeric and symbolic values share one
+representation. A :class:`Program` is an ordered list of :class:`Stmt` statements over
+:class:`SymArray` values, and a ``SymArray`` is either an array of cells or a single bulk
+tensor; a cell is an exact :class:`RationalFunction`, a plain float, or a reference to a
+prior result::
 
-The IR is executable as-is: build a :class:`Program`, then call
-``program.run({name: array})`` to get ``{name: ndarray}``.  See
-``PUBLIC_API.md`` for the committed surface.
+    Program   ──▶  Stmt, Stmt, …  ──▶  named outputs
+    SymArray  =  array of cells  |  bulk tensor
+      cell    =  RationalFunction (exact)  |  float (numeric)  |  Ref (prior output)
+
+The package is the single source of truth for this IR together with its polynomial
+backends (sympy, native_py, native_value, cython cpp) and the ``analyze`` and
+``partial_eval`` passes over programs.
+
+The IR is executable as-is: build a :class:`Program` and call
+``program.run({name: array})`` to get back ``{name: ndarray}``. See ``PUBLIC_API.md`` for
+the committed surface.
 """
 from __future__ import annotations
 

@@ -1,31 +1,37 @@
-"""Optional: lower a :class:`polyarray.Program` to PyArrayBackend (PyAB) IR.
+"""Lower a :class:`polyarray.Program` to PyArrayBackend (PyAB) IR.
 
 A :class:`~polyarray.ir.Program` can be *run* (:meth:`Program.run`) or emitted as
 standalone numpy source (:func:`polyarray.numpy_source.to_numpy_source`).  This
-module lowers it instead to **PyArrayBackend IR** — the ``pyarraybackend.ir``
+module lowers it a third way — to **PyArrayBackend IR**, the ``pyarraybackend.ir``
 node vocabulary — so it can be compiled with PyAB's torch backend (Inductor /
 ``@torch.compile``) or its numpy backend.
 
-Two ways to use the result, mirroring the two things you do with a lowered
-program:
+The lowered program is used in one of two modes::
+
+    Program ──lower──▶ PyAB IR
+      ├─ standalone   as_function_def → one FunctionDefStmt (def f(…))
+      │                                 → backend compile → module.f(…)
+      └─ embedded     call_lowered → the callable emitted once, plus a placed
+                                     call at the current build point, inside a
+                                     larger PyAB program
 
 * **Standalone** — :func:`as_function_def` emits the program as one PyAB
   ``FunctionDefStmt`` (a ``def f(...)``); hand it (and any helper defs) to
   ``pyarraybackend.backends.torch_backend.compile`` and call ``module.f(...)``.
   :func:`compile_torch` / :func:`compile_numpy` are one-call conveniences.
 
-* **Embedded** — the program is a *per-cell kernel* you want to invoke from
-  inside a **larger PyAB program** (e.g. a lowered kernel
-  called by an assembly program).  :func:`call_lowered` emits the callable once
-  and a *placed* call at the current build point.  The call site chooses:
+* **Embedded** — the program is a *per-cell kernel* invoked from inside a larger
+  PyAB program (for example a lowered kernel called by an assembly program).
+  :func:`call_lowered` emits the callable once and a *placed* call at the current
+  build point.  The call site chooses the placement:
 
     * ``place="plain"`` — a direct ``CallExpr``.
-    * ``place="vmap"``  — wrap in a ``VMapHop`` (→ ``torch.vmap``); the kernel
+    * ``place="vmap"``  — a ``VMapHop`` wrapper (→ ``torch.vmap``); the kernel
       runs batched over the leading (or ``in_dims``-chosen) axis.
-    * ``place="fuse"``  — emit the call inside a ``FusionRegionExpr``
+    * ``place="fuse"``  — the call inside a ``FusionRegionExpr``
       (→ ``@torch.compile``), fusing it with surrounding IR into one kernel.
 
-  ``place="vmap"`` and ``place="fuse"`` compose — a fused region may contain a
+  ``place="vmap"`` and ``place="fuse"`` compose: a fused region may contain a
   vmapped call.
 
 Small QR interception
@@ -161,11 +167,11 @@ __all__ = [
 Target = Literal["torch", "numpy"]
 Placement = Literal["plain", "vmap", "fuse"]
 
-#: An op-lowering hook: ``(op, builder, arg_exprs, lowerer)`` to one expression per op
-#: output.  Keyed by op *class name* so a front end can lower its own statement ops
-#: without polyarray importing them, mirroring ``to_numpy_source``'s ``op_renderers``.
-#: Spelled loosely at run time because pyab is an optional dependency; the precise
-#: shape is the one written above.
+#: An op-lowering hook mapping ``(op, builder, arg_exprs, lowerer)`` to one expression per
+#: op output.  It is keyed by op *class name*, so a front end can lower its own statement
+#: ops without polyarray importing them, mirroring ``to_numpy_source``'s ``op_renderers``.
+#: The type is spelled loosely at run time because pyab is an optional dependency; the
+#: precise shape is the one written above.
 type OpLowering = Callable[..., list[Any]]
 
 #: What :func:`prepare` reports about the simplifications it applied, keyed by pass name.
@@ -174,12 +180,13 @@ type PrepReport = dict[str, int | str | bool]
 
 @dataclass(frozen=True)
 class SmallQrOpts:
-    """Policy for intercepting small fixed-size ``QrOp`` as scalar Householder.
+    """Policy governing when a small fixed-size ``QrOp`` is intercepted as scalar Householder QR.
 
-    ``max_dim`` — intercept iff ``max(m, n) <= max_dim`` and the operand shape
-    is statically known.  ``enabled=False`` always emits a ``linalg.qr`` call.
-    Only reduced/complete real QR with ``m >= n`` is intercepted; other cases
-    fall through to the ``linalg.qr`` ``CallExpr``.
+    Interception fires when ``max(m, n) <= max_dim`` and the operand shape is
+    statically known; setting ``enabled=False`` always emits a ``linalg.qr``
+    call instead.  Only reduced or complete real QR with ``m >= n`` is
+    intercepted, and every other case falls through to the ``linalg.qr``
+    ``CallExpr``.
     """
 
     max_dim: int = 4
@@ -188,14 +195,14 @@ class SmallQrOpts:
 
 @dataclass(frozen=True)
 class LowerOpts:
-    """Knobs for :func:`lower_program_into` and friends.
+    """Options controlling :func:`lower_program_into` and the functions built on it.
 
     ``target`` selects the array namespace emitted for ops that have no
     backend-agnostic IR node (``linalg.det/inv/solve/qr``, ``sqrt``/``abs``/
-    ``sign``/``moveaxis``): ``"torch"`` → ``torch.*``, ``"numpy"`` → ``np.*``.
-    Must match the backend you compile with.  ``small_qr`` controls small-QR
-    interception.  ``op_lowerings`` supplies renderers for front-end Stmt ops
-    keyed by class name.
+    ``sign``/``moveaxis``): ``"torch"`` emits ``torch.*`` and ``"numpy"`` emits
+    ``np.*``, and it must match the backend the program is compiled with.
+    ``small_qr`` carries the small-QR interception policy, and ``op_lowerings``
+    supplies renderers for front-end Stmt ops keyed by class name.
     """
 
     target: Target = "torch"
@@ -264,13 +271,13 @@ def _static_eye(low: _Lowerer, n_expr: PyExprs) -> PyExprs:
 
 
 def _render_transpose(op: TransposeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``A.T`` — full-reverse transpose (``axes=None``)."""
+    """Emit the full-reverse transpose ``A.T`` (``axes=None``)."""
     c = low.core
     return [c.TransposeExpr(a=args[0], axes=None)]
 
 
 def _render_sinv_full(op: SinvFullOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``out[i,j] = 1/Sᵢ`` on the diagonal for ``i < rank`` else 0 (an ``nrows×ncols`` array).
+    """Emit the ``nrows×ncols`` array holding ``1/Sᵢ`` on the diagonal for ``i < rank`` and 0 elsewhere.
 
     Built as ``where(eye_nm, recip_row[:,None], 0)`` where ``recip_row`` is ``1/Sᵢ`` masked to
     zero beyond ``rank`` (and guarded against 1/0 by substituting 1 in the masked band),
@@ -354,13 +361,13 @@ def _render_block_diag(op: BlockDiagOp, builder: StmtBuilder, args: list[PyExprs
 
 
 def _render_block_repeat(op: BlockRepeatOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``n`` block-diagonal copies of ``A`` = ``kron(eye(n), A)`` (static ``n``)."""
+    """Emit ``n`` block-diagonal copies of ``A`` as ``kron(eye(n), A)`` (static ``n``)."""
     eye = _static_eye(low, low.core.IntLit(value=int(op.n)))
     return [low._ns_call("kron", (eye, args[0]))]
 
 
 def _render_dyn_block_repeat(op: DynBlockRepeatOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``int(n)`` block-diagonal copies of ``A`` = ``kron(eye(int(n)), A)`` (runtime ``n``)."""
+    """Emit ``int(n)`` block-diagonal copies of ``A`` as ``kron(eye(int(n)), A)`` (runtime ``n``)."""
     c = low.core
     nn = c.CallExpr(fn=c.Var(name="int"), args=(args[1],))
     eye = _static_eye(low, nn)
@@ -373,19 +380,19 @@ def _render_dyn_block_repeat(op: DynBlockRepeatOp, builder: StmtBuilder, args: l
 
 
 def _render_dyn_eye(op: DynEyeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """Runtime ``eye(ref.shape[axis])`` sized by ``ref``'s (un-batched) axis."""
+    """Emit a runtime ``eye(ref.shape[axis])`` sized by ``ref``'s (un-batched) axis."""
     return [_static_eye(low, _axis_len(low, args[0], int(op.axis)))]
 
 
 def _render_dyn_zeros(op: DynZerosOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``zeros((d₀, d₁, …))`` with each ``dᵢ`` a runtime axis of ``refs[i]``."""
+    """Emit ``zeros((d₀, d₁, …))`` where each ``dᵢ`` is a runtime axis of ``refs[i]``."""
     c = low.core
     shape = tuple(_axis_len(low, args[i], int(ax)) for i, ax in enumerate(op.axes))
     return [c.ZerosExpr(shape=shape, dtype=low._dtype_f64())]
 
 
 def _render_dyn_eye_tensor(op: DynEyeTensorOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``eye(∏dᵢ).reshape(∏dᵢ, d₀, …)`` with each ``dᵢ`` a runtime axis of ``refs[i]``."""
+    """Emit ``eye(∏dᵢ).reshape(∏dᵢ, d₀, …)`` where each ``dᵢ`` is a runtime axis of ``refs[i]``."""
     c = low.core
     dims = [_axis_len(low, args[i], int(ax)) for i, ax in enumerate(op.axes)]
     prod: Any = c.IntLit(value=1)
@@ -415,7 +422,7 @@ def _render_sum_shape(op: SumShapeOp, builder: StmtBuilder, args: list[PyExprs],
 
 
 def _render_sum_dim(op: SumDimOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``Σ mats[i].shape[axis]`` as a runtime 0-d int."""
+    """Emit ``Σ mats[i].shape[axis]`` as a runtime 0-d int."""
     c = low.core
     out: Any = c.IntLit(value=0)
     for x in args:
@@ -424,7 +431,7 @@ def _render_sum_dim(op: SumDimOp, builder: StmtBuilder, args: list[PyExprs], low
 
 
 def _render_prod_dim(op: ProdDimOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``∏ mats[i].shape[axis]`` as a runtime 0-d int."""
+    """Emit ``∏ mats[i].shape[axis]`` as a runtime 0-d int."""
     c = low.core
     out: Any = c.IntLit(value=1)
     for x in args:
@@ -433,21 +440,21 @@ def _render_prod_dim(op: ProdDimOp, builder: StmtBuilder, args: list[PyExprs], l
 
 
 def _render_scale_axis_dim(op: ScaleAxisDimOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``n · mat.shape[axis]`` as a runtime 0-d int."""
+    """Emit ``n · mat.shape[axis]`` as a runtime 0-d int."""
     c = low.core
     return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.IntLit(value=int(op.n)),
                          rhs=_axis_len(low, args[0], int(op.axis)))]
 
 
 def _render_mul_axis_dim(op: MulAxisDimOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``int(n) · mat.shape[axis]`` as a runtime 0-d int."""
+    """Emit ``int(n) · mat.shape[axis]`` as a runtime 0-d int."""
     c = low.core
     n = c.CallExpr(fn=c.Var(name="int"), args=(args[0],))
     return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=n, rhs=_axis_len(low, args[1], int(op.axis)))]
 
 
 def _render_comp_rank(op: CompRankOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``ambient − int(rank)`` as a runtime 0-d int."""
+    """Emit ``ambient − int(rank)`` as a runtime 0-d int."""
     c = low.core
     rank = c.CallExpr(fn=c.Var(name="int"), args=(args[0],))
     return [c.BinaryExpr(op=c.BinaryOp.SUB, lhs=c.IntLit(value=int(op.ambient)), rhs=rank)]
@@ -467,13 +474,13 @@ def _render_col_stack(op: ColStackOp, builder: StmtBuilder, args: list[PyExprs],
 
 
 def _render_scale(op: ScaleOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``factor · x``."""
+    """Emit the scaled array ``factor · x`` (static factor)."""
     c = low.core
     return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=c.FloatLit(value=float(op.factor)), rhs=args[0])]
 
 
 def _render_scale_by(op: ScaleByOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``s · x`` (runtime scalar)."""
+    """Emit ``s · x`` with ``s`` a runtime scalar."""
     c = low.core
     return [c.BinaryExpr(op=c.BinaryOp.MUL, lhs=args[1], rhs=args[0])]
 
@@ -495,12 +502,12 @@ def _render_concat(op: ConcatOp, builder: StmtBuilder, args: list[PyExprs], low:
 
 
 def _render_axis_len(op: AxisLenOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``x.shape[axis]`` as a 0-d int."""
+    """Emit ``x.shape[axis]`` as a 0-d int."""
     return [_axis_len(low, args[0], int(op.axis))]
 
 
 def _render_reshape(op: ReshapeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``A.reshape(shape)`` (static shape)."""
+    """Emit ``A.reshape(shape)`` with a static shape."""
     c = low.core
     return [c.ReshapeExpr(a=args[0], shape=tuple(c.IntLit(value=int(d)) for d in op.shape))]
 
@@ -538,7 +545,7 @@ def _render_last_cols(op: LastColsOp, builder: StmtBuilder, args: list[PyExprs],
 
 
 def _render_project(op: ProjectOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``P.T @ v.reshape(-1)`` — project ambient coords onto the sub-basis."""
+    """Project ambient coordinates onto the sub-basis as ``P.T @ v.reshape(-1)``."""
     c = low.core
     p_t = c.TransposeExpr(a=args[0], axes=None)
     v_flat = c.ReshapeExpr(a=args[1], shape=(c.IntLit(value=-1),))
@@ -546,7 +553,7 @@ def _render_project(op: ProjectOp, builder: StmtBuilder, args: list[PyExprs], lo
 
 
 def _render_embed(op: EmbedOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``(P @ vsub).reshape(shape)`` — pad sub-coords into the ambient layout."""
+    """Embed the sub-coordinates into the ambient layout as ``(P @ vsub).reshape(shape)``."""
     c = low.core
     mm = c.BinaryExpr(op=c.BinaryOp.MATMUL, lhs=args[0], rhs=args[1])
     if op.shape:
@@ -555,7 +562,7 @@ def _render_embed(op: EmbedOp, builder: StmtBuilder, args: list[PyExprs], low: _
 
 
 def _render_kron(op: KronOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """Chained Kronecker product ``kron(kron(a0, a1), …)``."""
+    """Emit the chained Kronecker product ``kron(kron(a0, a1), …)``."""
     acc = args[0]
     for m in args[1:]:
         acc = low._ns_call("kron", (acc, m))
@@ -588,13 +595,13 @@ def _render_kron_free(op: KronFreeOp, builder: StmtBuilder, args: list[PyExprs],
 
 
 def _render_inv_transpose(op: InvTransposeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``inv(A).T`` — the dual-basis inverse-transpose."""
+    """Emit the inverse-transpose ``inv(A).T`` (the dual basis)."""
     c = low.core
     return [c.TransposeExpr(a=low._ns_call("linalg.inv", (args[0],)), axes=None)]
 
 
 def _render_compose_via_std(op: ComposeViaStdOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
-    """``solve(R_to, R_from)`` — compose two changes-of-basis through the std rep."""
+    """Compose two changes-of-basis through the standard representation as ``solve(R_to, R_from)``."""
     return [low._ns_call("linalg.solve", (args[0], args[1]))]
 
 
@@ -691,17 +698,17 @@ _ARRAY_OP_LOWERINGS: dict[type, OpLowering] = {
 
 def _fp_bound_names(core: ModuleType, params: tuple[PyExprs, ...],
                     body: tuple[PyStmts, ...]) -> set[str]:
-    """Collect every name bound inside a def: params, assignment targets, binders, nested defs.
+    """Collect every name bound inside a def — parameters, assignment targets, binders, and nested defs.
 
     Everything else is free — module globals such as ``torch`` or ``np``, and already-emitted
     helper callees — and must keep its spelling in the fingerprint.
 
-    ⚠ This set is UNSCOPED — a binder anywhere in the body marks its spelling bound for the
-    WHOLE body, so an outer FREE global sharing a nested binder's spelling would be
+    This set is *unscoped*: a binder anywhere in the body marks its spelling bound for the
+    whole body, so an outer free global sharing a nested binder's spelling would be
     alpha-normalized and two different globals could fingerprint alike. Today's emitters
-    build no nested defs/lambdas (the only ``FunctionDefStmt``s are the module-level helper
-    and entry), so the situation is unreachable; :func:`_helper_fingerprint` REFUSES on a
-    nested def or lambda rather than rely on that, which makes the claim unconditional.
+    build no nested defs or lambdas — the only ``FunctionDefStmt``s are the module-level helper
+    and entry — so that situation is unreachable, and :func:`_helper_fingerprint` refuses on a
+    nested def or lambda rather than rely on it, which makes the claim unconditional.
     """
     bound = {p.name for p in params}
 
@@ -744,7 +751,7 @@ def _helper_fingerprint(core: ModuleType, params: tuple[PyExprs, ...],
     so equal fingerprints ⇒ alpha-equivalent pure functions over the same module
     globals ⇒ one def can serve every call site. Returns ``None`` (⇒ no interning) on
     any leaf outside the known vocabulary — an unknown object could hide identity that
-    the stream would erase. Also refuses on a NESTED def/lambda, whose binders would make
+    the stream would erase. Also refuses on a nested def/lambda, whose binders would make
     :func:`_fp_bound_names`' unscoped set alpha-normalize an outer free global of the same
     spelling (unreachable with today's emitters; refusing keeps the invariant
     unconditional rather than contingent on them).
@@ -845,20 +852,20 @@ def _helper_fingerprint(core: ModuleType, params: tuple[PyExprs, ...],
 
 #: Node budget for :func:`_helper_fingerprint`'s structural walk.
 #:
-#: A fingerprint exists ONLY to intern a helper, so — exactly as with the ``RecursionError`` guard
-#: above — it must never be the thing that makes a compile fail or hang. That guard bounds DEPTH;
-#: this bounds SIZE. A helper whose body fits the budget fingerprints in milliseconds; one an order
-#: of magnitude past it takes minutes and gigabytes, which is a hang, not a slow path. Refusing
-#: costs a duplicate helper; not refusing costs the build.
+#: A fingerprint exists only to intern a helper, so — exactly as with the ``RecursionError`` guard
+#: above — it must never be the thing that makes a compile fail or hang. That guard bounds depth;
+#: this one bounds size. A helper whose body fits the budget fingerprints in milliseconds, while one
+#: an order of magnitude past it takes minutes and gigabytes, which is a hang, not a slow path.
+#: Refusing costs a duplicate helper; not refusing costs the build.
 _FP_MAX_NODES = 2_000_000
 
 
 class _FpRefuse(Exception):
-    """A helper body with no stable structural serialization — skip interning."""
+    """Signals a helper body with no stable structural serialization, so interning is skipped."""
 
 
 class _FpTooLarge(_FpRefuse):
-    """A helper body too large to fingerprint within :data:`_FP_MAX_NODES` — skip interning."""
+    """Signals a helper body too large to fingerprint within :data:`_FP_MAX_NODES`, so interning is skipped."""
 
 
 # ---------------------------------------------------------------------------
@@ -873,11 +880,13 @@ class _FpTooLarge(_FpRefuse):
 
 
 class _ScalarGrid:
-    """A statement output emitted as an ``np.ndarray`` of scalar exprs (one per cell), NOT a stacked tensor.
+    """A statement output carried as an ``np.ndarray`` of scalar exprs, one per cell.
 
-    Returned in a ``_render_op`` payload (``"single"``/``"exprs"``) and recognised by
-    :meth:`_Lowerer._bind_payload`, which binds each scalar to its own ``Var`` and points that cell's
-    generator at it — so no ``(n_cells, *S)`` buffer is realised and downstream reads are scalar.
+    Each cell stays an independent scalar expression rather than an element of one stacked
+    tensor.  A ``_render_op`` payload (``"single"`` / ``"exprs"``) returns the grid, and
+    :meth:`_Lowerer._bind_payload` recognises it, binds each scalar to its own ``Var``, and
+    points that cell's generator at it — so no ``(n_cells, *S)`` buffer is realised and
+    downstream reads are scalar.
     """
 
     __slots__ = ("grid",)
@@ -887,10 +896,12 @@ class _ScalarGrid:
 
 
 def _scalarize_max() -> int:
-    """Give the size cap under which a statement output is scalarized.
+    """Return the size cap under which a statement output is scalarized.
 
-    Max product of a Stmt output's static shape for which it is emitted as a scalar grid rather than a
-    stacked tensor (env ``POLYARRAY_SCALARIZE_MAX``; default ``0`` = never scalarize, keep tensor form).
+    The cap is the largest product of a Stmt output's static shape for which the output is
+    emitted as a scalar grid rather than a stacked tensor.  It is read from the environment
+    variable ``POLYARRAY_SCALARIZE_MAX``, defaulting to ``0``, which never scalarizes and keeps
+    the tensor form.
     """
     v = os.environ.get("POLYARRAY_SCALARIZE_MAX")
     if v is not None:
@@ -1045,9 +1056,10 @@ class _Lowerer:
 
     def _bind_payload(self, stmt_idx: int, out_idx: int, bound: SymArray,
                       payload: PyExprs, base: str) -> None:
-        """Bind one statement output.
+        """Bind one statement output, either as a stacked tensor Var or as a scalar grid.
 
-        A stacked tensor Var, or (``_ScalarGrid``) a grid of per-cell scalar Vars with no tensor buffer.
+        A plain payload binds to one stacked tensor ``Var``; a :class:`_ScalarGrid` payload
+        binds to a grid of per-cell scalar ``Var``s with no tensor buffer.
         """
         if isinstance(payload, _ScalarGrid):
             self._bind_grid(stmt_idx, out_idx, bound, payload.grid, base)
@@ -1070,11 +1082,12 @@ class _Lowerer:
 
     def _bind_grid(self, stmt_idx: int, out_idx: int, bound: SymArray,
                    grid: np.ndarray, base: str) -> None:
-        """Bind a SCALARIZED output.
+        """Bind a scalarized output as a grid of per-cell scalar Vars.
 
-        Assign each grid element to its own scalar Var, record the grid (so a scalarized consumer reads it
-        component-wise), and point each output cell's generator at its Var — so NO ``(n_cells, *S)`` buffer
-        is realised. A tensor consumer (rare) triggers a lazy stack in :meth:`_ref_expr`.
+        Each grid element is assigned to its own scalar ``Var``, the grid is recorded so a
+        scalarized consumer reads it component-wise, and each output cell's generator is pointed
+        at its ``Var`` — so no ``(n_cells, *S)`` buffer is realised.  A tensor consumer (rare)
+        triggers a lazy stack in :meth:`_ref_expr`.
         """
         cells = bound.cells
         if grid.shape != cells.shape:
@@ -1276,27 +1289,30 @@ class _Lowerer:
 
     def _switch_expr(self, fn: SwitchOp, args: list[PyExprs],
                      scrutinee_ref: Ref | None = None) -> PyExprs:
-        """Canonical :class:`~polyarray.ir.SwitchOp` lowering — ``branch[scrutinee]``.
+        """Lower a :class:`~polyarray.ir.SwitchOp` to ``branch[scrutinee]``.
 
-        Two lanes, chosen by whether the scrutinee is STATICALLY a concrete int:
+        The lane is chosen by whether the scrutinee is statically a concrete int::
 
-        * **Concrete-int fast path** — the scrutinee ref is a :class:`~polyarray.ir.Const`
-          holding an integer scalar (a bound compile-time value, NOT a batched/dynamic
-          ref). Emit the direct branch pick ``branches[k]`` — preserving that branch's
-          exact shape AND dtype (heterogeneous branches are fine; no f64 cast).
+            scrutinee is a Const int  ──▶  concrete-int fast path
+            otherwise                 ──▶  one-hot, vmap-safe default
 
-        * **One-hot vmap-safe default** — for a dynamic/batched scrutinee (an
-          :class:`~polyarray.ir.IntAtomRef` — the per-cell selector id, a BATCHED
-          integer tensor under ``torch.vmap``) the direct pick's ``int(scrutinee)`` /
-          advanced index is illegal (it ``.item()``s a batched tensor). Instead stack
-          the ``N`` branches → ``(N, *S)``, build a one-hot ``arange(N) == scrutinee``
-          (broadcasts a batched 0-d scrutinee to a batched ``(N,)`` selector), cast to
-          f64, and contract the branch axis by ``einsum('n,n...->...')`` — pure
-          arithmetic, so it lowers under ``torch.vmap`` (and works unbatched too).
-          This is the safe default whenever the scrutinee is NOT a static ``Const``:
-          pyab cannot know if the caller will vmap, and the one-hot is universally
-          correct (it inherently needs the uniform branch shape that the vmap case has).
-          Branch order matches the scrutinee domain.
+        On the *concrete-int fast path* the scrutinee ref is a
+        :class:`~polyarray.ir.Const` holding an integer scalar — a bound compile-time value,
+        not a batched or dynamic ref — so the direct branch pick ``branches[k]`` is emitted,
+        preserving that branch's exact shape and dtype (heterogeneous branches are fine, with
+        no f64 cast).
+
+        The *one-hot vmap-safe default* handles a dynamic or batched scrutinee (an
+        :class:`~polyarray.ir.IntAtomRef` — the per-cell selector id, a batched integer tensor
+        under ``torch.vmap``), where the direct pick's ``int(scrutinee)`` or advanced index is
+        illegal because it ``.item()``s a batched tensor.  It stacks the ``N`` branches into
+        ``(N, *S)``, builds a one-hot ``arange(N) == scrutinee`` (broadcasting a batched 0-d
+        scrutinee to a batched ``(N,)`` selector), casts to f64, and contracts the branch axis
+        by ``einsum('n,n...->...')`` — pure arithmetic, so it lowers under ``torch.vmap`` and
+        works unbatched too.  This is the safe default whenever the scrutinee is not a static
+        ``Const``: pyab cannot know whether the caller will vmap, and the one-hot is
+        universally correct, since it inherently needs the uniform branch shape that the vmap
+        case supplies.  Branch order matches the scrutinee domain.
         """
         c = self.core
         if isinstance(scrutinee_ref, Const):
@@ -1347,7 +1363,7 @@ class _Lowerer:
         return self.core.ReduceExpr(a=a, op=op, axis=None, keepdims=False)
 
     def _svd_rank(self, s_var: PyExprs, max_mn: int, rcond: float | None) -> PyExprs:
-        """Rank = number of singular values above numpy's matrix_rank tolerance."""
+        """Return the rank as the number of singular values above numpy's matrix_rank tolerance."""
         c = self.core
         smax = self.b.assign_new(self._reduce(s_var, c.ReduceOp.MAX), base="smax")
         if rcond is None:
@@ -1377,7 +1393,7 @@ class _Lowerer:
 
     def _gsvd(self, fn: GSvdOp, args: list[PyExprs], out: tuple[SymArray, ...],
               in_refs: Sequence[Ref]) -> list[PyExprs]:
-        """Metric-aware GSVD as a composite of cholesky / svd / solve + rank split.
+        """Emit the metric-aware GSVD as a composite of cholesky, svd, solve, and a rank split.
 
         Mirrors :meth:`polyarray.ir.GSvdOp.__call__` exactly: whiten ``A`` by the
         Cholesky factors of the two metrics, SVD, threshold the rank, de-whiten,
@@ -1495,15 +1511,16 @@ class _Lowerer:
             return None
 
     def try_small_qr(self, a_expr: PyExprs, mode: str = "reduced") -> tuple[PyExprs, PyExprs] | None:
-        """Inline an unrolled Householder QR of the CURRENTLY-rendered op's operand.
+        """Inline an unrolled Householder QR of the currently-rendered op's operand.
 
-        Arith/``where``/``stack`` only — NO ``linalg.qr`` call, so it neither graph-breaks
-        ``torch.compile`` nor calls LAPACK. Returns ``None`` to fall back to a ``linalg.qr`` call.
+        The emitted code is arithmetic, ``where``, and ``stack`` only, with no ``linalg.qr``
+        call, so it neither graph-breaks ``torch.compile`` nor calls LAPACK; ``None`` is
+        returned to fall back to a ``linalg.qr`` call.
 
-        Shared by :meth:`_qr` (``QrOp``) and op-carried ``__pyab_lower__`` hooks so BOTH avoid
-        the QR graph break. The operand shape is read off the current
-        output tuple (``self._current_out``); intercept iff it is statically small (``max(m, n) <=
-        small_qr.max_dim``, ``m >= n``) and small-QR is enabled.
+        Both :meth:`_qr` (for ``QrOp``) and op-carried ``__pyab_lower__`` hooks share this so
+        each avoids the QR graph break.  The operand shape is read off the current output tuple
+        (``self._current_out``), and interception fires when it is statically small
+        (``max(m, n) <= small_qr.max_dim``, ``m >= n``) and small-QR is enabled.
         """
         sq = self.opts.small_qr
         m, n = _static_matrix_shape(self._current_out)
@@ -1530,13 +1547,13 @@ class _Lowerer:
     def _want_scalarize(self, shape: tuple[int, ...] | None) -> bool:
         """Report whether the current output should be scalarized.
 
-        True iff scalarization is enabled, ``shape`` is statically known and small enough
-        (``prod(shape) <= POLYARRAY_SCALARIZE_MAX``), and the current output is NOT bulk.
+        This holds when scalarization is enabled, ``shape`` is statically known and small enough
+        (``prod(shape) <= POLYARRAY_SCALARIZE_MAX``), and the current output is not bulk.
 
-        A bulk output is read as a WHOLE tensor by its consumers (via ``bulkmap``), so scalarizing it would
-        only force an immediate re-stack — no fewer buffers, and it splits what Inductor would otherwise keep
-        as one clean output loop.
-        Scalarize only outputs whose consumers read cells (→ scalar Vars) so the tensor never forms.
+        A bulk output is read as a whole tensor by its consumers (via ``bulkmap``), so
+        scalarizing it would only force an immediate re-stack — no fewer buffers — and would
+        split what Inductor would otherwise keep as one clean output loop.  Only an output whose
+        consumers read cells (as scalar Vars) is scalarized, so the tensor never forms.
         """
         if self._scalarize_max <= 0 or shape is None:
             return False
@@ -1551,15 +1568,17 @@ class _Lowerer:
     def scalar_grid(self, grid: np.ndarray) -> _ScalarGrid:
         """Wrap an ``np.ndarray`` of scalar exprs as a scalarized output.
 
-        For op-carried ``__pyab_lower__`` hooks to return without importing pyab internals.
+        This lets an op-carried ``__pyab_lower__`` hook return a scalar grid without importing
+        pyab internals.
         """
         return _ScalarGrid(grid)
 
     def _operand_grid(self, ref: Ref) -> np.ndarray:
-        """Resolve an operand ``ref`` to an ``np.ndarray`` of scalar exprs — one per element.
+        """Resolve an operand ``ref`` to an ``np.ndarray`` of scalar exprs, one per element.
 
-        So a scalarized op reads its inputs component-wise (no intermediate tensor). Feeds a scalarized
-        producer (``grid_out``) straight through; otherwise reads a tensor/const/cells element-by-element.
+        This lets a scalarized op read its inputs component-wise with no intermediate tensor.  A
+        scalarized producer (``grid_out``) feeds straight through; any other ref is read as a
+        tensor, const, or cell array element by element.
         """
         c = self.core
         if isinstance(ref, Const):
@@ -1807,13 +1826,15 @@ class _Lowerer:
     def _leaf_access(self, cell: Cell) -> tuple[PyExprs, str, tuple[int, ...]] | None:
         """Return the tensor base and integer indices of a cell that is a pure subscript.
 
-        If ``cell`` renders to a pure subscript of a tensor ``Var`` — ``X[i0, i1, …]`` with integer
-        indices, or a bare ``X`` — return ``(base_var_expr, base_name, index_ints)``; else ``None``.
+        When ``cell`` renders to a pure subscript of a tensor ``Var`` — ``X[i0, i1, …]`` with
+        integer indices, or a bare ``X`` — the result is ``(base_var_expr, base_name,
+        index_ints)``; otherwise it is ``None``.
 
-        Used by :meth:`_try_view_stack` to recognise a scalar ``stack`` that is really a VIEW of an
-        existing tensor. A bare-atom :class:`RationalFunction` renders (via :meth:`_rf_expr`) to exactly
-        its generator's expression, which for an input/Stmt-output atom is ``genmap[atom] = X[idx]``; a
-        polynomial renders to arithmetic and returns ``None``.
+        :meth:`_try_view_stack` uses this to recognise a scalar ``stack`` that is really a view
+        of an existing tensor.  A bare-atom :class:`RationalFunction` renders (via
+        :meth:`_rf_expr`) to exactly its generator's expression, which for an input or
+        Stmt-output atom is ``genmap[atom] = X[idx]``, while a polynomial renders to arithmetic
+        and yields ``None``.
         """
         c = self.core
         if not isinstance(cell, RationalFunction):
@@ -1827,19 +1848,23 @@ class _Lowerer:
         return None
 
     def _try_view_stack(self, cells: np.ndarray) -> PyExprs | None:
-        """Emit a VIEW in place of a nested ``stack`` of SCALAR leaves.
+        """Emit a view in place of a nested ``stack`` of scalar leaves.
 
-        Peephole: emit a VIEW (a slice, or a ``stack`` of whole tensors) instead of a nested ``stack`` of
-        SCALAR leaves when ``cells`` is exactly a natural-order arrangement of existing tensor ``Var``(s).
+        This peephole emits a view — a slice, or a ``stack`` of whole tensors — instead of a
+        nested ``stack`` of scalar leaves when ``cells`` is exactly a natural-order arrangement
+        of existing tensor ``Var``(s).
 
-        The scalar-stack form otherwise realises one buffer PER ELEMENT (under ``vmap`` → one copy loop per
-        cell), which dominates the generated code (the whole array rebuilt element-by-element).
-        A view is a single op Inductor folds away. Provably semantics-preserving — every element emitted IS
-        the same tensor element. Returns the view expr, or ``None`` to fall back to the scalar stack.
-        Two shapes are recognised (else bail):
-          (1) every cell is the IDENTITY access of ONE base ``X`` (``cell[idx] == X[idx]``) → ``X[:s0, :s1, …]``.
-          (2) 2-D where each COLUMN ``j`` is a whole 1-D base ``X_j`` at indices ``0..m-1`` (symmetrically each
-              ROW) → ``stack([X_0[:m], …], axis=1)``.
+        The scalar-stack form otherwise realises one buffer per element (under ``vmap``, one copy
+        loop per cell), which dominates the generated code by rebuilding the whole array element
+        by element.  A view is a single op Inductor folds away, and it is provably
+        semantics-preserving, since every element emitted is the same tensor element.  The view
+        expr is returned, or ``None`` to fall back to the scalar stack.  Two shapes are
+        recognised, and anything else bails:
+
+          1. Every cell is the identity access of one base ``X`` (``cell[idx] == X[idx]``),
+             giving ``X[:s0, :s1, …]``.
+          2. A 2-D arrangement where each column ``j`` is a whole 1-D base ``X_j`` at indices
+             ``0..m-1`` (symmetrically each row), giving ``stack([X_0[:m], …], axis=1)``.
         """
         c = self.core
         cells = np.asarray(cells, dtype=object)
@@ -1986,10 +2011,10 @@ def _ret_value(core: ModuleType, out_exprs: list[PyExprs]) -> PyExprs:
 
 
 def _static_matrix_shape(out: tuple[SymArray, ...]) -> tuple[int | None, int | None]:
-    """(m, n) of the QR operand, recovered from the produced Q output shape.
+    """Return ``(m, n)`` of the QR operand, recovered from the produced Q output shape.
 
-    ``QrOp`` reduced: Q is ``m x n``.  We read the output SymArray cell shapes:
-    Q (out[0]) has shape ``(m, n)``; R (out[1]) has shape ``(n, n)``.
+    For a reduced ``QrOp``, Q is ``m x n``.  The shapes are read from the output SymArray
+    cells: Q (``out[0]``) has shape ``(m, n)`` and R (``out[1]``) has shape ``(n, n)``.
     """
     try:
         q_shape = out[0].cells.shape
@@ -2002,10 +2027,11 @@ def _static_matrix_shape(out: tuple[SymArray, ...]) -> tuple[int | None, int | N
 
 
 def _einsum_unroll_max() -> int:
-    """Give the size cap under which a small einsum is unrolled.
+    """Return the size cap under which a small einsum is unrolled.
 
-    Max product of contracted-dim sizes for which a small einsum is unrolled into pointwise ops
-    (env `POLYARRAY_EINSUM_UNROLL_MAX`, default 64; `0` disables the unroll, keeping `torch.einsum`).
+    The cap is the largest product of contracted-dim sizes for which a small einsum is unrolled
+    into pointwise ops.  It is read from the environment variable ``POLYARRAY_EINSUM_UNROLL_MAX``,
+    defaulting to 64; ``0`` disables the unroll and keeps ``torch.einsum``.
     """
     v = os.environ.get("POLYARRAY_EINSUM_UNROLL_MAX")
     if v is not None:
@@ -2017,10 +2043,10 @@ def _einsum_unroll_max() -> int:
 
 
 def _ref_shape(ref: object) -> tuple[int, ...] | None:
-    """Give the static shape of an einsum operand :class:`Ref`.
+    """Return the static shape of an einsum operand :class:`Ref`.
 
-    A bulk or cell-array :class:`SymArrayRef`; ``None`` when not statically known (so the einsum unroll
-    bails to a plain ``torch.einsum``).
+    The ref is a bulk or cell-array :class:`SymArrayRef`, and the result is ``None`` when the
+    shape is not statically known, so the einsum unroll bails to a plain ``torch.einsum``.
     """
     b = getattr(ref, "_bulk", None)
     if b is not None:
@@ -2040,9 +2066,9 @@ def _resolve_einsum_ellipsis(
 ) -> tuple[list[list[str]], list[str]] | None:
     """Replace ``...`` in an einsum spec with concrete fresh labels.
 
-    Fresh labels (``~0``, ``~1``, …) via operand ranks, right-aligned (numpy broadcasting). Returns
-    ``(in_subs_resolved, out_sub_resolved)`` or ``None`` if unsupported (a repeated index within one
-    operand, or a rank/shape mismatch).
+    The fresh labels (``~0``, ``~1``, …) are sized from the operand ranks and right-aligned for
+    numpy broadcasting.  The result is ``(in_subs_resolved, out_sub_resolved)``, or ``None`` when
+    the spec is unsupported — a repeated index within one operand, or a rank or shape mismatch.
     """
     ell_ranks: list[int] = []
     for sub, shp in zip(in_subs, shapes):
@@ -2090,8 +2116,9 @@ def _einsum_index_sizes(
 ) -> tuple[list[list[str]], list[str], dict[str, int], list[str]] | None:
     """Resolve ``...``, then infer every index's extent from the operand and output shapes.
 
-    Reads the operand shapes AND the output shape. Returns ``(in2, out2, size, contracted)`` or ``None``
-    when unsupported / not statically inferable.
+    Both the operand shapes and the output shape are read.  The result is
+    ``(in2, out2, size, contracted)``, or ``None`` when the spec is unsupported or not statically
+    inferable.
     """
     res = _resolve_einsum_ellipsis(in_subs, out_sub, list(shapes))
     if res is None:
@@ -2122,11 +2149,12 @@ def _einsum_index_sizes(
 def _scalar_einsum(
     low: _Lowerer, spec: str, grids: Sequence[np.ndarray], out_shape: tuple[int, ...] | None,
 ) -> _ScalarGrid | None:
-    """Lower a small einsum to a GRID of scalar exprs.
+    """Lower a small einsum to a grid of scalar exprs.
 
-    Each output element an explicit sum-of-products over the operands' scalar grids. Fully scalar (no free
-    tensor axes), so under ``torch.vmap`` every element is a ``(n_cells,)`` value and the whole per-cell
-    body stays in one fused loop. ``None`` to fall back.
+    Each output element is an explicit sum-of-products over the operands' scalar grids.  The
+    result is fully scalar, with no free tensor axes, so under ``torch.vmap`` every element is a
+    ``(n_cells,)`` value and the whole per-cell body stays in one fused loop.  ``None`` falls
+    back.
     """
     import itertools
     c = low.core
@@ -2159,18 +2187,20 @@ def _scalar_einsum(
 def _fold_weighted_einsum(
     low: _Lowerer, spec: str, in_refs: Sequence[Ref], out_shape: tuple[int, ...] | None,
 ) -> PyExprs | None:
-    """Lower a contraction of a per-cell WEIGHT against a table.
+    """Lower a contraction of a per-cell weight against a table.
 
-    The WEIGHT is an operand indexed only by contracted axes, the table an operand carrying the free output
-    axes; the fold is ``Σ_contracted (Π weight scalars) · table[contracted]`` — the weight read
-    component-wise as SCALARS (never stacked into an ``(n_cells, K)`` tensor) and the table sliced at each
-    contracted index so the free axes stay ONE tensor.
+    The weight is an operand indexed only by contracted axes, and the table is an operand
+    carrying the free output axes; the fold is ``Σ_contracted (Π weight scalars) ·
+    table[contracted]``, with the weight read component-wise as scalars (never stacked into an
+    ``(n_cells, K)`` tensor) and the table sliced at each contracted index so the free axes stay
+    one tensor.
 
-    This is the common ``'qab,q->ab'`` fold. Stacking the weight into an
-    ``(n_cells, K)`` buffer forces Inductor to realise it — a fusion boundary that splits the per-cell body
-    into a second loop over cells. Reading it as scalars keeps the whole body in ONE loop. Returns
-    the tensor expr, or ``None`` (no all-contracted operand, or the single-table shape assumption fails) to
-    fall back to :func:`_unroll_einsum`. Handles exactly ONE table operand (the common single-table shape).
+    This is the common ``'qab,q->ab'`` fold.  Stacking the weight into an ``(n_cells, K)`` buffer
+    would force Inductor to realise it — a fusion boundary that splits the per-cell body into a
+    second loop over cells — whereas reading it as scalars keeps the whole body in one loop.  The
+    tensor expr is returned, or ``None`` — when there is no all-contracted operand, or the
+    single-table shape assumption fails — to fall back to :func:`_unroll_einsum`.  Exactly one
+    table operand is handled, the common single-table shape.
     """
     import itertools
     c = low.core
@@ -2225,16 +2255,16 @@ def _unroll_einsum(
     low: _Lowerer, spec: str, exprs: Sequence[PyExprs],
     shapes: Sequence[tuple[int, ...] | None], out_shape: tuple[int, ...] | None,
 ) -> PyExprs | None:
-    """Lower a SMALL einsum to a broadcast-multiply + an UNROLLED contraction sum.
+    """Lower a small einsum to a broadcast-multiply followed by an unrolled contraction sum.
 
-    Pure pointwise ops that Inductor fuses, instead of a ``torch.einsum`` (which it turns into an extern
-    ``bmm`` and/or a ``Reduction``, both hard fusion boundaries). Returns the expr, or ``None`` to fall
-    back to ``EinsumExpr``.
+    The emitted code is pure pointwise ops that Inductor fuses, instead of a ``torch.einsum``
+    (which it turns into an extern ``bmm`` and/or a ``Reduction``, both hard fusion boundaries).
+    The expr is returned, or ``None`` to fall back to ``EinsumExpr``.
 
-    Each operand is transposed + ``newaxis``-padded to a common ``[output dims, contracted dims]`` layout,
-    the operands are multiplied elementwise, and the trailing contracted axes are summed by EXPLICIT adds
-    over their (small, static) index ranges — no ``.sum``/reduction, no matmul. Gated on a statically-known
-    small contraction (``_einsum_unroll_max``).
+    Each operand is transposed and ``newaxis``-padded to a common ``[output dims, contracted
+    dims]`` layout, the operands are multiplied elementwise, and the trailing contracted axes are
+    summed by explicit adds over their small, static index ranges — no ``.sum`` or reduction, and
+    no matmul.  The path is gated on a statically-known small contraction (``_einsum_unroll_max``).
     """
     c = low.core
     umax = _einsum_unroll_max()
@@ -2363,14 +2393,14 @@ def _balanced(core: ModuleType, exprs: list[PyExprs], op: PyExprs) -> PyExprs:
 def _householder_qr_core(
     low: _Lowerer, access: Callable[[int, int], PyExprs], m: int, n: int
 ) -> tuple[list[list[PyExprs]], list[list[PyExprs]]]:
-    """Emit an unrolled Householder QR of an ``m x n`` (m>=n) matrix.
+    """Emit an unrolled Householder QR of an ``m x n`` (``m >= n``) matrix.
 
-    Returns the FULL ``Q`` (``m x m``) and ``R`` (``m x n``) as nested lists of scalar exprs (NOT
-    stacked). ``access(i, j)`` supplies each input entry (a tensor subscript or a scalar grid element).
-    Reproduces LAPACK/numpy's convention ``R[k,k] = -sign(x0)*||x||`` (``sign(0):=+1``). Every
-    intermediate is bound to a fresh scalar Var. Shared by the tensor emitter
-    (:func:`_emit_householder_qr`) and the scalar-grid one (:func:`_emit_householder_qr_grid`), which
-    apply the reduced/complete shaping.
+    The full ``Q`` (``m x m``) and ``R`` (``m x n``) are returned as nested lists of scalar exprs,
+    not stacked, with ``access(i, j)`` supplying each input entry (a tensor subscript or a scalar
+    grid element).  The convention ``R[k,k] = -sign(x0)*||x||`` (with ``sign(0) := +1``) reproduces
+    LAPACK and numpy, and every intermediate is bound to a fresh scalar Var.  The tensor emitter
+    (:func:`_emit_householder_qr`) and the scalar-grid one (:func:`_emit_householder_qr_grid`)
+    share this and apply the reduced/complete shaping.
     """
     c = low.core
     b = low.b
@@ -2468,10 +2498,10 @@ def _householder_qr_core(
 def _qr_scalar_grids(
     Q: list[list[PyExprs]], R: list[list[PyExprs]], m: int, n: int, mode: str, zero: PyExprs
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Shape the full ``Q``/``R`` scalar lists to the reduced/complete factor grids.
+    """Shape the full ``Q``/``R`` scalar lists into the reduced or complete factor grids.
 
-    ``Q^T`` sliced to ``ncols_q`` columns, ``R`` sliced to ``nrows_r`` rows with the strict lower triangle
-    set to ``zero``.
+    ``Q^T`` is sliced to ``ncols_q`` columns, and ``R`` is sliced to ``nrows_r`` rows with the
+    strict lower triangle set to ``zero``.
     """
     ncols_q = m if mode == "complete" else n
     q_grid = np.empty((m, ncols_q), dtype=object)
@@ -2489,10 +2519,10 @@ def _qr_scalar_grids(
 def _emit_householder_qr(
     low: _Lowerer, a_expr: PyExprs, m: int, n: int, mode: str
 ) -> tuple[PyExprs, PyExprs]:
-    """Emit the TENSOR form of the unrolled Householder QR.
+    """Emit the tensor form of the unrolled Householder QR.
 
-    Returns ``(Q_expr, R_expr)`` as stacked backend tensors (reduced ``m x n`` / ``n x n``, or full for
-    ``mode="complete"``). Reads the input matrix by subscript.
+    ``(Q_expr, R_expr)`` are returned as stacked backend tensors — reduced ``m x n`` / ``n x n``,
+    or full for ``mode="complete"`` — reading the input matrix by subscript.
     """
     c = low.core
     Q, R = _householder_qr_core(
@@ -2511,10 +2541,10 @@ def _emit_householder_qr(
 def _emit_householder_qr_grid(
     low: _Lowerer, access: Callable[[int, int], PyExprs], m: int, n: int, mode: str
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Emit the SCALAR-GRID form of the unrolled Householder QR.
+    """Emit the scalar-grid form of the unrolled Householder QR.
 
-    Returns ``(Q_grid, R_grid)`` as ``np.ndarray``s of scalar exprs (no ``stack``). ``access(i, j)``
-    supplies each input entry component-wise.
+    ``(Q_grid, R_grid)`` are returned as ``np.ndarray``s of scalar exprs, with no ``stack``, and
+    ``access(i, j)`` supplies each input entry component-wise.
     """
     Q, R = _householder_qr_core(low, access, m, n)
     return _qr_scalar_grids(Q, R, m, n, mode, low.core.FloatLit(value=0.0))
@@ -2733,7 +2763,7 @@ def _check_ir_oversized(program: Program, name: str) -> None:
     ``warn`` (one warning, the compile proceeds; the default), ``raise``
     (:class:`PyabIROversizedError`, abort now with a top-offenders breakdown), or ``off``. Rides
     :func:`polyarray.forward.analyze` (cheap on bulk programs, which it skips — the asymmetry is the
-    signal). The ANALYSIS never breaks a compile; only ``raise`` mode raises, and only deliberately.
+    signal). The analysis itself never breaks a compile; only ``raise`` mode raises, and only deliberately.
     """
     mode = _ir_ceiling_mode()
     if mode == "off":

@@ -7,24 +7,27 @@ degree chooser asks. Consumers seed their domain knowledge and get
 back a single float, ``inf`` meaning "not a polynomial of the seeds" (rational /
 algebraic / unknown — the caller supplies its own order there).
 
-Degree semantics per op category (sound over-estimation: products SUM, sums MAX;
-only UNDER-estimation is a correctness bug):
+Each op contributes a degree to its output from its operands' degrees. The estimate is
+a sound over-estimate — products sum, sums take the max — because only under-estimation
+is a correctness bug. The flat categories are::
 
-* the AFFINE-CONSTANT short-circuit — if EVERY operand is degree 0 the output is a
-  constant function of constants ⇒ degree 0, WHATEVER the op (this is what makes a
-  constant-input chain — SVD/QR/pinv fed by a constant matrix — degree 0 for free);
-* ``zero_ops`` — output depends on SHAPES/structure, not values ⇒ 0;
-* ``passthrough_ops`` — reorder / select / additive / scale-by-constant ⇒ MAX(operands);
-* ``multilinear_ops`` — products / contractions ⇒ SUM(operands);
-* ``CallOp`` — a vmap/llam wrapper is NOT opaque: unwrap the body Program
-  (:func:`polyarray.forward._body_of`) and recurse, seeding its inputs by position;
-* ``DetOp`` — det IS a polynomial of its entries: an ``(n, n)`` operand of degree ``d``
-  gives degree ``≤ n·d`` (a sum of n-fold entry products); an unknown/dynamic operand
-  shape falls back to ``inf``;
-* anything else on a seed-dependent operand ⇒ ``inf`` (Inv/Pinv/Solve/Sqrt/Svd/… —
-  genuinely rational or algebraic in the operand).
+    zero          output depends on shapes / structure, not values   ⇒ 0
+    passthrough   reorder / select / additive / scale-by-constant     ⇒ max(operands)
+    multilinear   products / contractions                             ⇒ sum(operands)
+    rational      genuinely rational / algebraic / non-polynomial     ⇒ inf on a seed
 
-The categories are keyed by op CLASS NAME and extendable per call (the
+Ahead of them sits the affine-constant short-circuit: when every operand is degree 0 the
+output is a constant function of constants and so is degree 0 whatever the op, which is what
+makes a constant-input chain — an SVD/QR/pinv fed by a constant matrix — degree 0 for free.
+Two ops carry richer handling than a flat category. ``DetOp`` is a polynomial of its
+entries, so an ``(n, n)`` operand of degree ``d`` gives degree ``≤ n·d`` (a sum of n-fold
+entry products), falling back to ``inf`` on an unknown or dynamic operand shape. ``CallOp``
+is not opaque: its vmap/llam wrapper body Program is unwrapped
+(:func:`polyarray.forward._body_of`) and recursed into, seeding its inputs by position.
+Anything else on a seed-dependent operand is ``inf`` (Inv/Pinv/Solve/Sqrt/Svd/…, genuinely
+rational or algebraic in the operand).
+
+The categories are keyed by op class name and extendable per call (the
 ``to_numpy_source(op_renderers=)`` pattern): front ends pass their own op names —
 their own ``_ProjectOp``/``_AddOp``/… — without polyarray importing them.
 

@@ -1,39 +1,40 @@
-"""Structural-zero sparsity propagation over a Program.
+"""Structural-zero sparsity propagation over a :class:`Program`.
 
-This is the *additive* sparsity pass.  It threads a structural-zero boolean mask (``True``
-= structurally zero) through ``program.statements`` in run order, computing a
-mask for every :class:`SymArray` — program inputs, each :class:`Stmt` output,
-and each program output.
+The pass threads a boolean mask (``True`` = structurally zero) through
+``program.statements`` in run order, producing one mask for every
+:class:`SymArray` — the program inputs, each :class:`Stmt` output, and each
+program output::
 
-Hard rules (obeyed exactly):
+    inputs ──▶ stmt ──▶ stmt ──▶ … ──▶ outputs
+     mask      mask     mask           mask
 
-* **Structural, never numeric.**  A mask bit is set only when the *algebra*
-  guarantees zero — ``simple_zero`` (rational lane) or a literal ``0.0`` (float
-  lane), via :func:`~polyarray.ir.cells_sparsity`.  False-*negatives* (a true
-  zero left marked unknown) are safe; false-*positives* (a non-zero marked zero)
-  are a correctness bug, so anything not modeled defaults to ``False`` (unknown).
-* **Never cross an opaque Stmt boundary.**  ``DetOp`` / ``InvOp`` / ``PinvOp`` /
-  ``SolveOp`` / ``SvdOp`` / ``GSvdOp`` / ``QrOp`` / ``SqrtOp`` / ``AbsOp`` /
-  ``SignOp`` / ``SwitchOp`` / ``CallOp`` / ``WhileOp`` / a sub-``Program`` /
-  any unmodeled op ⇒ the output mask **resets to all-False** (unknown).
-* **Bulk outputs** (``SymArray._bulk is not None``) carry no per-cell symbols;
-  their mask is all-False (unknown) unless derived from a modeled op's inputs.
-  We never call ``.cells`` on a bulk array (it would materialise / unpack).
+A bit is set only when the *algebra* guarantees zero — ``simple_zero`` on the
+rational lane or a literal ``0.0`` on the float lane, read by
+:func:`~polyarray.ir.cells_sparsity`.  The asymmetry is deliberate: a false
+*negative* (a true zero left marked unknown) is safe, whereas a false *positive*
+(a non-zero marked zero) is a correctness bug, so anything the pass does not
+model defaults to ``False`` (unknown).
 
-The pass is read-only on the program: it never mutates inputs, statements, cells
-or outputs.
+An opaque statement stops propagation.  ``DetOp``, ``InvOp``, ``PinvOp``,
+``SolveOp``, ``SvdOp``, ``GSvdOp``, ``QrOp``, ``SqrtOp``, ``AbsOp``, ``SignOp``,
+``SwitchOp``, ``CallOp``, ``WhileOp``, a sub-``Program``, or any unmodeled op
+resets its output mask to all-False (unknown).  A bulk output
+(``SymArray._bulk is not None``) carries no per-cell symbols, so its mask is
+all-False unless a modeled op derives it from the inputs; the pass never calls
+``.cells`` on a bulk array, which would materialise it.  Throughout, the program
+is read only — inputs, statements, cells, and outputs are never mutated.
 
 Modeled propagation rules
 -------------------------
 
-* ``A + B`` / ``A - B`` (:func:`add_mask`): zero where **both** zero.
-* ``A * B`` / Hadamard (:func:`mul_mask`): zero where **either** zero.
-* ``A @ B`` / ``TensordotOp`` (:func:`tensordot_mask`),
-  ``EinsumOp`` / ``EinsumStmtOp`` (:func:`einsum_mask`): ``out`` zero iff
-  **every** contributing product term has a zero operand — a boolean contraction
-  mirroring the op's axes / einsum subscripts.
-* ``MoveaxisOp`` (:func:`moveaxis_mask`): permute the mask.
-* ``IdentityOp`` / ``AssertOp``: passthrough (copy the input mask).
+* ``A + B`` / ``A - B`` (:func:`add_mask`): zero where **both** inputs are zero.
+* ``A * B`` / Hadamard (:func:`mul_mask`): zero where **either** input is zero.
+* ``A @ B`` / ``TensordotOp`` (:func:`tensordot_mask`) and
+  ``EinsumOp`` / ``EinsumStmtOp`` (:func:`einsum_mask`): an output cell is zero
+  when **every** contributing product term has a zero operand — a boolean
+  contraction mirroring the op's axes or einsum subscripts.
+* ``MoveaxisOp`` (:func:`moveaxis_mask`): permutes the mask.
+* ``IdentityOp`` / ``AssertOp``: pass the input mask straight through.
 """
 from __future__ import annotations
 
@@ -144,11 +145,11 @@ def mul_mask(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def tensordot_mask(a: np.ndarray, b: np.ndarray, axes: TensordotAxes) -> np.ndarray:
-    """Boolean ``np.tensordot`` contraction of two structural-zero masks.
+    """Contract two structural-zero masks as a boolean ``np.tensordot``.
 
-    ``out`` is structurally zero iff **every** contributing product pair has a
-    zero operand.  Equivalently ``out`` is *possibly* non-zero iff some
-    contracted index makes both operands non-zero — counted by a real-valued
+    An output cell is structurally zero iff **every** contributing product pair
+    has a zero operand.  Equivalently it is *possibly* non-zero iff some
+    contracted index makes both operands non-zero, counted by a real-valued
     ``tensordot`` over the non-zero indicators ``~mask``.
     """
     a_nz = (~np.asarray(a, dtype=bool)).astype(float)
@@ -158,11 +159,12 @@ def tensordot_mask(a: np.ndarray, b: np.ndarray, axes: TensordotAxes) -> np.ndar
 
 
 def einsum_mask(spec: str, *masks: np.ndarray, optimize: bool = True) -> np.ndarray:
-    """Boolean ``np.einsum`` contraction of several structural-zero masks.
+    """Contract several structural-zero masks as a boolean ``np.einsum``.
 
-    Mirrors the einsum: a contributing term is non-zero iff *all* its operand
-    factors are non-zero (product of ``~mask`` indicators is 1); the output cell
-    is structurally zero iff **no** contributing term is non-zero (count == 0).
+    Mirroring the einsum, a contributing term is non-zero iff *all* its operand
+    factors are non-zero — the product of ``~mask`` indicators is 1 — and the
+    output cell is structurally zero iff **no** contributing term is non-zero
+    (count == 0).
     """
     nz = [(~np.asarray(m, dtype=bool)).astype(float) for m in masks]
     count = np.einsum(spec, *nz, optimize=optimize)
@@ -202,13 +204,12 @@ def _array_mask(sa: SymArray) -> Mask:
 def block_zero_mask(symarray_or_cells: SymArray | np.ndarray) -> np.ndarray:
     """Read the structural-zero pattern of a matrix.
 
-    The convenience a Schur-inverse caller uses to choose the ``(p, q)``
-    split that maximises the zero block: ``True`` where the cell is structurally
-    zero (``simple_zero`` / literal ``0.0``).
-
-    Accepts a :class:`SymArray` or a raw cell ``ndarray``.  A *bulk* SymArray has
-    no per-cell symbols, so its pattern is all-False (unknown) — we never unpack
-    it to read a pattern that isn't there.
+    A Schur-inverse caller uses this to choose the ``(p, q)`` split that
+    maximises the zero block; a bit is ``True`` where the cell is structurally
+    zero (``simple_zero`` or a literal ``0.0``).  The argument is a
+    :class:`SymArray` or a raw cell ``ndarray``.  A *bulk* SymArray has no
+    per-cell symbols, so its pattern is all-False (unknown), never unpacked to
+    read a pattern that is not there.
     """
     if isinstance(symarray_or_cells, SymArray):
         if symarray_or_cells._bulk is not None:
@@ -244,11 +245,11 @@ class SparsityReport:
     _bulk_name_to_mask: dict[str, Mask] = field(default_factory=dict, repr=False)
 
     def output_mask(self, name: str) -> Mask:
-        """Mask for the named program output."""
+        """Return the mask for the named program output."""
         return self.output_masks[name]
 
     def input_mask(self, name: str) -> Mask:
-        """Mask for the named program input."""
+        """Return the mask for the named program input."""
         return self.input_masks[name]
 
     def mask_for(self, key: str | SymArray) -> Mask:
@@ -353,10 +354,10 @@ def _checked(m: Mask, osa: SymArray) -> Mask:
 def _apply_op(stmt: Stmt, in_masks: list[Mask]) -> list[Mask]:
     """Apply the modeled propagation rule for ``stmt.fn`` to its input masks.
 
-    ``stmt.fn`` is only half closed: a sub-:class:`~polyarray.ir.Program`, a ``vmap``
-    closure and a front-end op class are all legal and have no modeled rule here, so they
-    reset to unknown.  polyarray's OWN vocabulary is dispatched exhaustively by
-    :func:`_apply_builtin_op`.
+    ``stmt.fn`` is only half closed: a sub-:class:`~polyarray.ir.Program`, a
+    ``vmap`` closure, and a front-end op class are all legal and have no modeled
+    rule here, so they reset to unknown.  polyarray's own vocabulary is
+    dispatched exhaustively by :func:`_apply_builtin_op`.
     """
     outs = stmt.out
     unknown = [_false_mask(o) for o in outs]

@@ -1,21 +1,24 @@
 """Torch backend for batched execution of a :class:`~polyarray.ir.Program`.
 
-Lowers the program to torch through ``pyab`` and runs it batched with ``torch.vmap``.
-This is the torch counterpart of :func:`polyarray.batch.batched_run` (numpy). Rather than a hand-written
-torch evaluator, it uses the sanctioned lowering path: ``pyab.compile_torch(program)`` compiles the IR to a
-per-element torch function, and ``torch.vmap`` batches it over the leading axis — so the batching stays an
-IR concept and torch is reached only through ``pyab`` (torch/pyarraybackend are OPTIONAL deps, imported
-lazily; the core stack never imports torch).
+:func:`batched_torch` is the torch counterpart of :func:`polyarray.batch.batched_run`: it
+lowers a program to torch through ``pyab`` and runs it batched with ``torch.vmap``, so the
+batching stays an IR concept and torch is reached only through the one lowering path::
 
-On a GPU or large batch this can beat the numpy path; on tiny CPU arrays (a small per-point residual) it is
-roughly on par with :func:`batched_run`. ``pyab``'s torch backend bootstraps a ``torch.distributed`` process
-group from mpi4py at module load; :func:`ensure_torch_pg` pre-initializes a 1-rank ``gloo`` group so that
-bootstrap short-circuits (no mpi4py / MPI dependency for single-process use).
+    program ──pyab.compile_torch──▶ per-element torch fn ──torch.vmap──▶ batched over axis 0
 
-Requires ``torch`` and ``pyarraybackend``; raises :class:`RuntimeError` with a clear message if absent. Not
-every op has a ``pyab`` torch lowering — a front-end op supplies its own by carrying a ``__pyab_lower__``
-hook on its class (discovered by ``pyab``'s ``_render_op``); a missing lowering surfaces as the ``pyab``
-``NotImplementedError`` (a caller can fall back to ``batched_run``).
+``torch`` and ``pyarraybackend`` are optional dependencies, imported lazily; the core
+stack never imports torch. On a GPU or a large batch this path can beat the numpy path,
+and on tiny CPU arrays it runs roughly on par with :func:`batched_run`.
+
+``pyab``'s torch backend bootstraps a ``torch.distributed`` process group from mpi4py at
+module load. :func:`ensure_torch_pg` pre-initializes a 1-rank ``gloo`` group so that
+bootstrap short-circuits, removing the mpi4py and MPI dependency for single-process use.
+
+The backend requires ``torch`` and ``pyarraybackend`` and raises :class:`RuntimeError`
+with a clear message when either is absent. Not every op has a ``pyab`` torch lowering: a
+front-end op supplies its own by carrying a ``__pyab_lower__`` hook on its class, which
+``pyab``'s ``_render_op`` discovers, and a missing lowering surfaces as the ``pyab``
+``NotImplementedError``, which a caller can catch to fall back to :func:`batched_run`.
 """
 from __future__ import annotations
 
@@ -88,9 +91,9 @@ def ensure_torch_pg(port: int | None = None) -> None:
     """Pre-initialize a 1-rank ``gloo`` ``torch.distributed`` process group.
 
     ``pyab``'s torch backend calls ``ensure_pg()`` at generated-module load, which bootstraps the process
-    group from mpi4py. That check short-circuits when ``torch.distributed`` is already initialized (BEFORE
-    importing mpi4py), so initializing a 1-rank group here avoids the mpi4py / MPI dependency for
-    single-process use. Idempotent.
+    group from mpi4py. That check short-circuits when ``torch.distributed`` is already initialized, before
+    importing mpi4py, so initializing a 1-rank group here avoids the mpi4py / MPI dependency for
+    single-process use. It is idempotent.
 
     Parameters
     ----------

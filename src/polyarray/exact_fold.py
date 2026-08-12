@@ -1,52 +1,56 @@
 """Exact, non-sampling statement and entry folding for ``partial_eval_numeric``.
 
-This is the sound lane behind ``mode="exact"`` / ``mode="hybrid"``. The alternative,
-probe-and-freeze polynomial identity testing — random probe bindings plus
-``np.allclose`` — is probabilistic, not exact by construction, and so cannot carry a
+This is the sound lane behind ``mode="exact"`` and ``mode="hybrid"``. The alternative —
+probe-and-freeze polynomial identity testing, random probe bindings compared with
+``np.allclose`` — is probabilistic rather than exact by construction, so it cannot carry a
 certificate that a downstream invariance claim rides on.
 
-**Semantics.** The program's dependency graph is re-executed over EXACT values:
+The pass re-executes the program's dependency graph over exact values and sorts each
+statement into one of three verdicts::
 
-* a statement whose resolved operands are all NUMERIC runs its real ``fn`` — the same
-  deterministic evaluation ``Program.run`` would perform (the ``fold_numeric``
-  exactness contract), so QR/SVD on constant reference data stay foldable;
-* a statement with symbolic operands is executed over exact
-  :class:`~polyarray.rational.RationalFunction` cells (flint ``fmpq`` coefficients —
-  exact rational arithmetic) through a closed set of RATIONAL op twins: einsum /
-  tensordot / transpose / reshape / add / scale / concat / stack, and exact
-  field-arithmetic Gauss elimination for ``inv`` / ``inv-transpose`` / ``solve`` /
-  ``det``; sub-``Program`` / ``CallOp(Program)`` bodies are recursed;
-* everything else on a symbolic path — ``QrOp`` / ``SvdOp`` / ``SqrtOp`` /
-  control-flow / vmap closures / front-end ops polyarray does not own (they coerce
-  ``dtype=float`` and carry semantics of the layer above) — is OPAQUE: its outputs and
-  everything downstream are *unresolved*, never guessed.
+    operands all numeric        →  real fn          →  folded (outputs are constant)
+    symbolic, op has a twin      →  exact RF result  →  folded or refuted
+    symbolic, no rational twin    →  opaque           →  unresolved (downstream too)
 
-A statement all of whose output entries resolve to exact CONSTANTS is *folded* (the
-certificate is exact-by-construction: a rational normal form of total degree zero).
-A statement with a provably NON-constant output entry is *refuted* — soundly excluded
-from any probe fallback (this is precisely the case where colluding probes could have
-frozen a vertex-dependent value).  Only *unresolved* statements are eligible for the
-(warned) probe fallback in ``mode="hybrid"``.
+A statement whose resolved operands are all numeric runs its real ``fn``, the same
+deterministic evaluation ``Program.run`` would perform (the ``fold_numeric`` exactness
+contract), so a QR or SVD on constant reference data stays foldable. A statement with
+symbolic operands runs over exact :class:`~polyarray.rational.RationalFunction` cells —
+flint ``fmpq`` coefficients, exact rational arithmetic — through a closed set of rational
+op twins: einsum, tensordot, transpose, reshape, add, scale, concat and stack, plus exact
+field-arithmetic Gauss elimination for ``inv``, ``inv-transpose``, ``solve`` and ``det``;
+sub-``Program`` and ``CallOp(Program)`` bodies are recursed into. Everything else on a
+symbolic path — ``QrOp``, ``SvdOp``, ``SqrtOp``, control flow, vmap closures, and
+front-end ops polyarray does not own (they coerce ``dtype=float`` and carry the semantics
+of the layer above) — is opaque: its outputs and everything downstream of them are
+*unresolved*, never guessed.
 
-Entry-level folding (:func:`exact_fold_cells`) additionally normalizes each OUTPUT
-CELL as a rational function of the feed atoms — so an entry whose statement-level
-pieces vary but whose composition cancels (the motivating case) still certifies,
-without any statement being frozen.
+A statement all of whose output entries resolve to exact constants is *folded*, and its
+certificate is exact by construction: a rational normal form of total degree zero. A
+statement with a provably non-constant output entry is *refuted* and soundly excluded from
+any probe fallback — precisely the case where colluding probes could have frozen a
+vertex-dependent value. Only *unresolved* statements are eligible for the warned probe
+fallback under ``mode="hybrid"``.
 
-**Bounded cost — TWO knobs, both required.** ``work_budget`` (:class:`_Meter` work units,
-charged BETWEEN operations) bounds the pass as a whole, and ``max_sym_mass``
-(:data:`_MAX_SYM_MASS`) caps the monomial mass of ONE symbolic op's operands BEFORE it runs.
-The global budget alone is not enough: a single ``np.einsum`` / Gauss pass over object-dtype
-cells runs to completion once started, so a high-degree program could spend a long time inside
-one uninterrupted op while nominally under budget.  Rejected-by-size and out-of-budget statements
-both degrade to *unresolved* ⇒ the (loud) probe fallback — never a hang, never a guess.
+Entry-level folding (:func:`exact_fold_cells`) additionally normalizes each output cell as
+a rational function of the feed atoms, so an entry whose statement-level pieces vary but
+whose composition cancels still certifies without any statement being frozen.
 
-**The budget is DETERMINISTIC — work units, a function of the program alone, not wall-clock
-seconds, so a certificate is a property of the mathematics rather than the machine.**  The same
-program spends the same units on any box under any load, so a certificate means the same thing
-everywhere.  A generous wall-clock *backstop* exists only to catch a mis-calibrated cost model,
-and it is loud when it fires (:attr:`ExactState.hit_wall_clock`) precisely because it
-reintroduces machine dependence.
+Cost is bounded by two knobs, both required. ``work_budget`` (:class:`_Meter` work units,
+charged between operations) bounds the pass as a whole, and ``max_sym_mass``
+(:data:`_MAX_SYM_MASS`) caps the monomial mass of one symbolic op's operands before it
+runs. The global budget alone is not enough: a single ``np.einsum`` or Gauss pass over
+object-dtype cells runs to completion once started, so a high-degree program could spend a
+long time inside one uninterrupted op while nominally under budget. A statement rejected by
+size and a statement that runs out of budget both degrade to *unresolved*, and thence to
+the loud probe fallback — never a hang, never a guess.
+
+The budget is deterministic: it counts work units, a function of the program alone rather
+than of wall-clock seconds, so a certificate is a property of the mathematics rather than
+of the machine. The same program spends the same units on any box under any load, so a
+certificate means the same thing everywhere. A generous wall-clock *backstop* exists only
+to catch a mis-calibrated cost model, and it is loud when it fires
+(:attr:`ExactState.hit_wall_clock`) precisely because it reintroduces machine dependence.
 """
 from __future__ import annotations
 
@@ -254,11 +258,12 @@ def _wall_deadline(wall_backstop: float | None) -> float | None:
 
 
 class _Exhausted(Exception):
-    """Internal: the exact pass ran out of its budget.
+    """Internal signal that the exact pass ran out of its budget.
 
-    ``wall`` distinguishes the two exits — ``False`` is the ordinary deterministic work budget,
-    ``True`` is the backstop firing, which is a MEASUREMENT BUG (the cost model under-counted
-    this program) and is reported loudly rather than folded into the normal degrade path.
+    ``wall`` distinguishes the two exits. ``False`` is the ordinary deterministic work
+    budget. ``True`` is the wall-clock backstop firing, which is a measurement bug — the cost
+    model under-counted this program — and is reported loudly rather than folded into the
+    normal degrade path.
     """
 
     def __init__(self, wall: bool = False) -> None:
@@ -268,14 +273,16 @@ class _Exhausted(Exception):
 
 @dataclass
 class _Meter:
-    """Deterministic work accounting for ONE exact pass.
+    """Deterministic work accounting for one exact pass.
 
-    The unit is a monomial touched.  `charge` is called at each statement, each exact
-    evaluation/gcd, each Gauss column, each vmap slice, each folded cell.  One already-started
-    flint operation can still overrun: the budget bounds the work *started*, which is why
-    `_MAX_SYM_MASS` (per-op, checked BEFORE the op runs) is the other half of the cost story.
+    The unit is a monomial touched. ``charge`` is called at each statement, each exact
+    evaluation or gcd, each Gauss column, each vmap slice, and each folded cell. One
+    already-started flint operation can still overrun, so the budget bounds the work
+    *started*; that is why ``_MAX_SYM_MASS``, checked per op before the op runs, is the other
+    half of the cost story.
 
-    `limit <= 0` means unbounded (used by the calibration harness to measure a full pass).
+    A ``limit <= 0`` means unbounded, which the calibration harness uses to measure a full
+    pass.
     """
 
     limit: int
@@ -363,21 +370,25 @@ class _Reason:
 class ExactState:
     """Result of one exact pass over a program.
 
-    * ``known`` — atom / bulk name → exact-constant value (float or float ndarray),
-      exactly the shape ``simplify._record_known`` produces.
-    * ``sym`` — atom name → exact but NON-constant :class:`RationalFunction` over
-      the feed atoms (statement-level exact values, used by the entry-level cell fold).
-    * ``sym_bulk`` — bulk name → object ndarray of exact cells (float / RF).
-    * ``folded`` — statement indices folded exactly (every output entry constant).
-    * ``refuted`` — statement indices whose outputs are PROVABLY non-constant
-      (excluded from any probe fallback).
-    * ``unresolved`` — statement index → short reason (opaque op name, "work budget", …).
-    * ``spent`` / ``limit`` — work units consumed and allowed.  ``spent`` is a DETERMINISTIC
-      function of the program: two runs of the same pass spend the same amount,
-      which is what makes the certificate reproducible and is worth asserting
-      directly in a test.
-    * ``hit_wall_clock`` — the loud backstop fired, so this result is NOT reproducible and the
-      cost model under-counted this program.  Never expected; ``simplify`` warns.
+    * ``known`` maps each atom or bulk name to its exact constant value (a float or a float
+      ndarray), in exactly the shape ``simplify._record_known`` produces.
+    * ``sym`` maps each atom name to an exact but non-constant :class:`RationalFunction` over
+      the feed atoms; these statement-level exact values feed the entry-level cell fold.
+    * ``sym_bulk`` maps each bulk name to an object ndarray of exact cells (floats or
+      rational functions).
+    * ``folded`` holds the indices of the statements folded exactly, every output entry
+      constant.
+    * ``refuted`` holds the indices of the statements whose outputs are provably
+      non-constant, which excludes them from any probe fallback.
+    * ``unresolved`` maps a statement index to a short reason it could not be resolved (an
+      opaque op name, ``"work budget"``, and so on).
+    * ``spent`` and ``limit`` are the work units consumed and allowed; ``spent`` is a
+      deterministic function of the program, so two runs of the same pass spend the same
+      amount, which makes the certificate reproducible and is worth asserting directly in a
+      test.
+    * ``hit_wall_clock`` records that the loud backstop fired, so the result is not
+      reproducible and the cost model under-counted this program; it is never expected, and
+      ``simplify`` warns.
     """
 
     known: dict[str, Any] = field(default_factory=dict)
@@ -458,11 +469,11 @@ def _sym_mass(values: ExactValue | list[ExactValue], cap: int) -> int:
 
 
 def _charge(meter: _Meter | None, units: int) -> None:
-    """Spend ``units`` on ``meter`` when there is one (``None`` = an unbudgeted call).
+    """Spend ``units`` on ``meter`` when there is one; a ``None`` meter is an unbudgeted call.
 
-    The granularity is PER OPERATION: the charge lands before each exact evaluation / gcd /
-    Gauss column / vmap slice, so one already-started flint operation can still overrun —
-    accepted; the budget bounds the work *started*.
+    The granularity is per operation: the charge lands before each exact evaluation, gcd,
+    Gauss column or vmap slice, so one already-started flint operation can still overrun.
+    That is accepted, because the budget bounds the work *started*.
     """
     if meter is not None:
         meter.charge(units)
@@ -478,11 +489,11 @@ def _constant_value(rf: RationalFunction, meter: _Meter | None = None) -> float 
     a constant such as ``(1/3)·p/p``. Two exactly different values prove non-constancy;
     equal values are only a hint, and the normal form still decides.
 
-    BUDGET-AWARE: every expensive step (each exact evaluation, the gcd) is CHARGED to the
-    meter, which raises :class:`_Exhausted` when the budget is gone — a pathological cell (an
-    enormous uncancelled high-degree normal form) must degrade to *unresolved* (⇒ the
-    warned probe fallback), never hang the gate.  The charge is this cell's own monomial mass,
-    because that is what both the evaluation and the gcd scale with.
+    Every expensive step — each exact evaluation and the gcd — is charged to the meter,
+    which raises :class:`_Exhausted` when the budget is gone, so a pathological cell (an
+    enormous uncancelled high-degree normal form) degrades to *unresolved* and the warned
+    probe fallback rather than hanging the gate.  The charge is this cell's own monomial
+    mass, because that is what both the evaluation and the gcd scale with.
     """
     if rf.is_zero():
         return 0.0                           # exact structural zero (num ≡ 0)
@@ -538,10 +549,10 @@ class _Env:
     atom: dict[str, ExactCell] = field(default_factory=dict)
     bulk: dict[str, np.ndarray] = field(default_factory=dict)
     outs: dict[tuple[int, int], ExactValue] = field(default_factory=dict)
-    #: Atoms KNOWN to be unresolvable — a sub-program input bound to an OPAQUE operand
-    #: (:func:`_bind_body_inputs`).  Explicit rather than "absent from ``atom``", because an
-    #: absent generator is otherwise read as a FEED atom and left live, which would hand back a
-    #: value symbolically depending on an operand we never resolved.
+    #: Atoms known to be unresolvable, from a sub-program input bound to an opaque operand
+    #: (:func:`_bind_body_inputs`).  The set is explicit rather than "absent from ``atom``",
+    #: because an absent generator is otherwise read as a feed atom and left live, which would
+    #: hand back a value depending symbolically on an operand the lane never resolved.
     opaque: set[str] = field(default_factory=set)
 
 
@@ -643,11 +654,11 @@ def _fe_is_zero(x: ExactCell) -> bool:
 def _exact_inv(a: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
     """Exact Gauss–Jordan inverse over the rational-function field.
 
-    Pivots are chosen exactly (structurally non-zero — a non-zero rational function
-    is a unit of the field); the resulting entries are the inverse AS RATIONAL
-    FUNCTIONS, i.e. the identity ``A·A⁻¹ = I`` holds identically wherever
-    ``det A ≠ 0`` — the correct generic-inverse semantics for identity
-    certification.  Raises on an exactly singular matrix.
+    Pivots are chosen exactly, structurally non-zero, since a non-zero rational function is a
+    unit of the field. The resulting entries are the inverse as rational functions, so the
+    identity ``A·A⁻¹ = I`` holds identically wherever ``det A ≠ 0`` — the correct
+    generic-inverse semantics for identity certification. Raises on an exactly singular
+    matrix.
     """
     a = np.asarray(a, dtype=object)
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
@@ -751,26 +762,25 @@ def _exact_pinv(a: np.ndarray, meter: _Meter | None = None) -> np.ndarray:
 def _exact_assert(fn: AssertOp, args: list[Any], meter: _Meter | None) -> list[Any]:
     """Reproduce :class:`~polyarray.AssertOp` over symbolic operands.
 
-    ``AssertOp`` returns its first input unchanged; the predicate is a guard. This twin
-    reproduces the value and re-checks every predicate that is decidable over the
-    rational-function field, raising — hence going opaque, never silently passing — when a
-    decidable check fails:
+    ``AssertOp`` returns its first input unchanged and its predicate is a guard. This twin
+    reproduces that value and re-checks every predicate decidable over the rational-function
+    field, raising — hence going opaque, never silently passing — when a decidable check
+    fails:
 
-    * ``shape_eq``          — structural, always decidable;
-    * ``rank_eq``           — decidable when both operands resolve to exact constants; else
-                              opaque (a rank is an integer, so a non-constant one is a bug,
-                              not a case to guess through);
-    * ``square_full_rank``  — squareness structurally, full rank as the exact ``det ≠ 0``
-                              (GENERIC rank — the ``_exact_inv`` semantics);
-    * ``spd``               — exact SYMMETRY (decidable: ``A = Aᵀ`` as rational functions) plus
-                              generic non-singularity.  **Positive-definiteness itself is a
-                              real INEQUALITY, not decidable over the rational-function field**,
-                              so the twin does not certify it.  This is the one place the exact
-                              lane is weaker than the numeric op it stands in for; it is a
-                              build-time certificate over a symbolic cell, and the runtime
-                              ``AssertOp`` still runs the true test on real data whenever the
-                              statement survives (a symbolic, non-constant operand is *refuted*,
-                              never folded away).  Flagged for review rather than hidden.
+    * ``shape_eq`` is structural and always decidable.
+    * ``rank_eq`` is decidable when both operands resolve to exact constants, and otherwise
+      goes opaque, because a rank is an integer and a non-constant one is a bug rather than a
+      case to guess through.
+    * ``square_full_rank`` checks squareness structurally and full rank as the exact
+      ``det ≠ 0`` — the generic rank, the ``_exact_inv`` semantics.
+    * ``spd`` checks exact symmetry, decidable as ``A = Aᵀ`` over rational functions, plus
+      generic non-singularity. **Positive-definiteness is itself a real inequality, not
+      decidable over the rational-function field**, so the twin does not certify it. This is
+      the one place the exact lane is weaker than the numeric op it stands in for: it is a
+      build-time certificate over a symbolic cell, and whenever the statement survives the
+      runtime ``AssertOp`` still runs the true test on real data — a symbolic, non-constant
+      operand is *refuted*, never folded away. The gap is flagged for review rather than
+      hidden.
     """
     x = np.asarray(args[0])
     if fn.kind == "shape_eq":
@@ -907,14 +917,15 @@ def _is_exact_zero(val: ExactValue) -> bool:
 def _zero_absorbing(fn: StmtFn) -> bool:
     """Report whether ``fn`` is multilinear in each operand.
 
-    Multilinearity is what makes one exactly-zero operand force
-    an exactly-zero result, whatever the other operands hold (even unresolved ones)?
+    Multilinearity is what makes one exactly-zero operand force an exactly-zero result,
+    whatever the other operands hold, even unresolved ones.
 
-    This is the only shape of "reason about an op without all of its inputs" this lane admits, and
-    it is an identity rather than an inference: each output entry of a multilinear op is a sum of
-    products carrying exactly one factor from each operand, so a zero factor annihilates every
-    term.  It is emphatically NOT a blanket "zeros pass through opaque ops" — ``QrOp(0)`` is a
-    degenerate factorization, not zero, and every algebraic/order op below says so.
+    This is the only shape of "reason about an op without all of its inputs" this lane
+    admits, and it is an identity rather than an inference: each output entry of a
+    multilinear op is a sum of products carrying exactly one factor from each operand, so a
+    zero factor annihilates every term.  It is emphatically not a blanket "zeros pass through
+    opaque ops" — ``QrOp(0)`` is a degenerate factorization, not zero, and every algebraic or
+    order op below says so.
 
     Parameters
     ----------
@@ -928,8 +939,9 @@ def _zero_absorbing(fn: StmtFn) -> bool:
 
     Notes
     -----
-    EXHAUSTIVE over :data:`~polyarray.ir.StmtFn` (``assert_never``): a new op must state which side
-    it is on, because answering ``True`` wrongly would fabricate a zero.
+    The match is exhaustive over :data:`~polyarray.ir.StmtFn`, closed by ``assert_never``, so
+    a new op must state which side it is on, because answering ``True`` wrongly would
+    fabricate a zero.
     """
     match fn:
       # --- multilinear: one zero operand ⇒ zero result ----------------------------
@@ -980,19 +992,21 @@ def _zero_absorbing(fn: StmtFn) -> bool:
 def _tolerates_opaque_operand(fn: StmtOp) -> bool:
     """Report whether this statement may still be executed with an unresolved operand.
 
-    Two arguments, and the open half of ``Stmt.fn`` is handled first (`polyarray/CLAUDE.md`):
+    Two arguments allow it, and the open half of ``Stmt.fn`` is handled first (see
+    ``polyarray/CLAUDE.md``):
 
-    * LIVENESS — a sub-:class:`~polyarray.ir.Program`, or a REBUILDABLE ``vmap`` closure over
-      one (:func:`_vmap_closure`): the operand may simply be DEAD in the body, and that is
-      decided by EXECUTING it (:func:`_bind_body_inputs` marks the unresolved input's atoms
-      unresolvable, so anything reading them goes opaque and only a body whose declared outputs
-      resolve anyway returns a value).  This is the same liveness argument :func:`_run_program`
-      already makes for an opaque STATEMENT inside a body, applied to its inputs.  The vmap case
-      says nothing extra about the body — it is still per-slice :func:`_run_program`, with the
-      unresolved operand handed to EVERY slice unresolved (:func:`_run_vmap`);
-    * MULTILINEARITY — a builtin :func:`_zero_absorbing` op: an exactly-zero factor annihilates
-      the result, so the unresolved factor cannot matter.  The caller checks the zero actually
-      exists before executing.
+    * **Liveness** covers a sub-:class:`~polyarray.ir.Program`, or a rebuildable ``vmap``
+      closure over one (:func:`_vmap_closure`): the operand may simply be dead in the body,
+      which is decided by executing it. :func:`_bind_body_inputs` marks the unresolved
+      input's atoms unresolvable, so anything reading them goes opaque and only a body whose
+      declared outputs resolve anyway returns a value. This is the same liveness argument
+      :func:`_run_program` already makes for an opaque statement inside a body, applied here
+      to its inputs. The vmap case says nothing extra about the body — it is still per-slice
+      :func:`_run_program`, with the unresolved operand handed to every slice unresolved
+      (:func:`_run_vmap`).
+    * **Multilinearity** covers a builtin :func:`_zero_absorbing` op: an exactly-zero factor
+      annihilates the result, so the unresolved factor cannot matter. The caller checks that
+      the zero actually exists before executing.
 
     Parameters
     ----------
@@ -1007,9 +1021,9 @@ def _tolerates_opaque_operand(fn: StmtOp) -> bool:
 
     Notes
     -----
-    ⚠ The two are NOT interchangeable, and the caller must not treat them as one permission: the
-    liveness cases never permit inventing a value for the unresolved operand (see the guard on the
-    zero short-circuit in :func:`_exec_stmt`).
+    The two are not interchangeable, and the caller must not treat them as one permission:
+    the liveness cases never permit inventing a value for the unresolved operand (see the
+    guard on the zero short-circuit in :func:`_exec_stmt`).
     """
     if isinstance(fn, Program):
         return True
@@ -1361,27 +1375,27 @@ def _run_vmap(
 ) -> list[Any] | None:
     """Descend exactly into a vmap closure, the batched twin of :func:`_run_program`.
 
-    Reproduces ``ir.vmap``'s own semantics exactly (slice each batched operand along its
-    ``in_axes`` entry, run the body per slice, ``np.stack`` on ``out_axes``), but over exact
-    values, so the certificate extends through the closure boundary.
+    This reproduces ``ir.vmap``'s own semantics exactly — slice each batched operand along
+    its ``in_axes`` entry, run the body per slice, ``np.stack`` on ``out_axes`` — but over
+    exact values, so the certificate extends through the closure boundary.
 
-    COST IS BOUNDED BEFORE THE LOOP STARTS (the stall rule — an uninterruptible flint op
-    ignores any budget): the batched operands' total monomial mass must fit ``max_sym_mass``
-    (it is the SUM over the slices, so the whole descent stays inside the one box the caller
-    budgeted for this statement), AND the batch size must fit :data:`_MAX_VMAP_BATCH` (each
-    slice pays the body's fixed per-statement overhead).  The budget is additionally charged
-    INSIDE the loop, once per slice.  Every rejection degrades to *unresolved* ⇒ the warned
+    Cost is bounded before the loop starts, because an uninterruptible flint op ignores any
+    budget once running: the batched operands' total monomial mass must fit ``max_sym_mass``
+    (it is the sum over the slices, so the whole descent stays inside the one box the caller
+    budgeted for this statement), and the batch size must fit :data:`_MAX_VMAP_BATCH` (each
+    slice pays the body's fixed per-statement overhead). The budget is additionally charged
+    inside the loop, once per slice. Every rejection degrades to *unresolved* and the warned
     probe fallback — never a hang, never a guess.
 
-    An UNRESOLVED operand (``_OPAQUE``) is admitted, on LIVENESS only
-    (:func:`_tolerates_opaque_operand`): it cannot be sliced — neither its value nor its batch
-    length is known — so it is handed to EVERY slice unresolved, exactly as it arrived, and
-    :func:`_bind_body_inputs` marks that body input's atoms unresolvable.  Only a body whose
-    declared outputs resolve without them returns a value, which is the proof that the operand was
-    dead.  Nothing about the body is assumed — in particular NOT multilinearity, so a zero in
-    another operand buys nothing here; a body that reads the unresolved input simply stays
-    unresolved.  It also contributes no batch size: at least one RESOLVED batched operand must
-    fix ``batch`` (else the arity check below refuses).
+    An unresolved operand (``_OPAQUE``) is admitted on liveness only
+    (:func:`_tolerates_opaque_operand`): it cannot be sliced, since neither its value nor its
+    batch length is known, so it is handed to every slice unresolved exactly as it arrived,
+    and :func:`_bind_body_inputs` marks that body input's atoms unresolvable. Only a body
+    whose declared outputs resolve without them returns a value, which is the proof that the
+    operand was dead. Nothing about the body is assumed — in particular not multilinearity,
+    so a zero in another operand buys nothing here, and a body that reads the unresolved input
+    simply stays unresolved. Such an operand also contributes no batch size: at least one
+    resolved batched operand must fix ``batch``, or the arity check below refuses.
     """
     body, in_axes, out_axes = closure
     if len(args) != len(in_axes) or len(in_axes) != len(body.inputs):
@@ -1642,21 +1656,21 @@ def exact_partial_eval(
     program: Program, *, work_budget: int | None = None, max_sym_mass: int = _MAX_SYM_MASS,
     wall_backstop: float | None = None,
 ) -> ExactState:
-    """One exact pass over ``program``: fold / refute / leave-unresolved each Stmt.
+    """Run one exact pass over ``program``, folding, refuting or leaving each statement unresolved.
 
-    Cost is bounded by BOTH knobs: ``work_budget`` (deterministic work units, charged between
-    operations — see :class:`_Meter`) and ``max_sym_mass`` (:data:`_MAX_SYM_MASS` — the monomial
-    mass one symbolic op's operands may carry, checked BEFORE the op runs, because a single
-    object-dtype einsum / Gauss pass cannot be interrupted mid-flight).
+    Cost is bounded by both knobs: ``work_budget`` (deterministic work units, charged between
+    operations — see :class:`_Meter`) and ``max_sym_mass`` (:data:`_MAX_SYM_MASS`, the
+    monomial mass one symbolic op's operands may carry, checked before the op runs because a
+    single object-dtype einsum or Gauss pass cannot be interrupted mid-flight).
 
-    The budget is a function of the PROGRAM, not of the machine: the same program spends the
+    The budget is a function of the program, not of the machine: the same program spends the
     same units under any load, so the resulting certificate is reproducible.  ``wall_backstop``
     is a generous seconds cap that only guards a mis-calibrated cost model; when it fires the
-    result IS machine-dependent, so it is recorded on :attr:`ExactState.hit_wall_clock` and
-    `simplify` turns it into a loud ``NonDeterministicFoldWarning``.  ``None`` disables it.
+    result is machine-dependent, so it is recorded on :attr:`ExactState.hit_wall_clock` and
+    ``simplify`` turns it into a loud ``NonDeterministicFoldWarning``.  ``None`` disables it.
 
-    Never raises on op content — every failure mode degrades to ``unresolved``
-    (which ``mode="hybrid"`` hands to the loud probe fallback).
+    This never raises on op content: every failure mode degrades to ``unresolved``, which
+    ``mode="hybrid"`` hands to the loud probe fallback.
     """
     from .simplify import _record_known
 
@@ -1760,14 +1774,14 @@ def exact_fold_cells(
     work_budget: int | None = None, max_sym_mass: int = _MAX_SYM_MASS,
     wall_backstop: float | None = None,
 ) -> np.ndarray:
-    """ENTRY-LEVEL exact fold of an output cell array.
+    """Fold an output cell array exactly, one entry at a time.
 
-    Each cell is normalized as a rational function of the FEED atoms by substituting
-    the exact (possibly non-constant) statement values from ``state``; a cell whose
-    normal form has total degree zero is replaced by its exact constant.  Cells that
-    cannot be normalized (opaque statements in their cone) or that are genuinely
-    non-constant are left UNTOUCHED — including object identity when nothing folds
-    (the ``_fold_cells`` structure-transparency contract).
+    Each cell is normalized as a rational function of the feed atoms by substituting the
+    exact (possibly non-constant) statement values from ``state``, and a cell whose normal
+    form has total degree zero is replaced by its exact constant. Cells that cannot be
+    normalized (opaque statements in their cone) or that are genuinely non-constant are left
+    untouched, down to object identity when nothing folds (the ``_fold_cells``
+    structure-transparency contract).
     """
     cells = np.asarray(cells)
     if cells.dtype.kind == "f":

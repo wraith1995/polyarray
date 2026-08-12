@@ -1,30 +1,33 @@
-"""Post-build partial evaluation of a Program (the `simplify` pass).
+"""Post-build partial evaluation of a :class:`Program` — the ``simplify`` pass.
 
-``fold_numeric`` / ``bind_inputs`` are the numeric-propagation floor of the
-pass.
+The pass re-interprets a program against a *partial* numeric environment and returns a fresh
+program computing the same outputs with every build-time-known value already substituted in.
+``fold_numeric`` and ``bind_inputs`` are its numeric-propagation floor; ``specialize`` layers
+optional symbolic substitution and post-build budget moderation on top.
 
-The pass re-interprets a Program against a *partial* numeric environment,
-seeded by ``bind`` (empty for a bare ``fold_numeric``).  It maintains a growing
-``known: dict[atom_name -> float]`` of every generator whose value is determined
-at build time, then:
+The floor runs against a growing ``known: dict[atom_name -> float]`` of every generator whose
+value is determined at build time, seeded from ``bind`` (empty for a bare ``fold_numeric``)::
 
-* executes every Stmt whose inputs all resolve numeric (cascading: a folded
-  Stmt's outputs enter ``known`` and unlock downstream Stmts), dropping it;
-* folds ``known`` into every surviving Stmt's input refs and every program
-  output cell (a fully-bound cell becomes a float; a partially-bound cell
-  becomes a smaller RF over the leftover gens — the "leave residual symbols"
-  case);
-* drops inputs replaced by a concrete ``bind`` value.
+    for each Stmt, in order:
+        inputs all resolve numeric?  ── yes ─→ execute it, its outputs enter
+                                               ``known``, drop the Stmt
+                                    ── no  ─→ keep it, fold ``known`` into its refs
+    then: fold ``known`` into every program output cell
+          drop every input a concrete ``bind`` replaced
 
-It never mutates shared state: ``Program.copy`` shares cell arrays and ref
-tuples, so the pass builds *fresh* folded cells/refs rather than rewriting in
-place.  Exactness: ``fold_numeric(p, bind=b).run(rest) == p.run({**b, **rest})``.
+Folding a statement cascades: its outputs unlock downstream statements whose inputs then
+resolve numeric. A fully-bound output cell becomes a float; a partially-bound cell becomes a
+smaller rational function over the leftover generators, leaving residual symbols in place.
 
-Conservative by construction — anything not confidently foldable (bulk / dynamic
-outputs, control-flow ops) is kept symbolic, so the worst case degrades to
-``copy()``.  A partially-numeric sub-Program / ``CallOp`` Stmt is *descended*
-into: its body is recursively specialized with the numeric operands bound,
-shrinking the Stmt to the still-symbolic operands.
+The pass never mutates shared state. ``Program.copy`` shares cell arrays and ref tuples, so it
+builds *fresh* folded cells and refs rather than rewriting in place. Exactness holds
+throughout: ``fold_numeric(p, bind=b).run(rest)`` equals ``p.run({**b, **rest})``.
+
+It is conservative by construction. Anything not confidently foldable — a bulk or dynamic
+output, a control-flow op — stays symbolic, so the worst case degrades to ``copy()``. A
+partially-numeric sub-program or ``CallOp`` statement is instead *descended* into: its body is
+recursively specialized with the numeric operands bound, shrinking the statement to its
+still-symbolic operands.
 """
 from __future__ import annotations
 
@@ -142,20 +145,27 @@ def _cells_touch_known(cells: np.ndarray, known: Mapping[str, float]) -> bool:
 
 
 def _fold_cells(cells: np.ndarray, known: Mapping[str, float]) -> np.ndarray:
-    """Fold ``known`` into an ndarray of cells via partial ``RF.eval``.
+    """Fold ``known`` into an ndarray of cells by partially evaluating each cell.
 
-    Returns a float array when every cell becomes numeric, else an object array
-    of floats / smaller RationalFunctions (residual symbols).
+    A :class:`RationalFunction` cell becomes a float once all its generators are bound and a
+    smaller rational function over the leftover generators otherwise.
 
-    STRUCTURE-TRANSPARENT no-op: when no cell references a folded (``known``) generator
-    the fold changes nothing, so the ORIGINAL ``cells`` object is returned unchanged —
-    never a fresh copy.  This keeps ``id(cells)`` stable across the fold, which a
-    downstream identity-based structural read depends on: a downstream
-    degree walker (``polyarray.program_degree``) links a Stmt's producer to its
-    consumer by ``id(ref._cells) == id(out._cells)`` and, on a miss, falls back to scoring
-    the cells' generators by NAME — a fallback that can silently drop a generator's
-    degree and mis-score the result.  A fold
-    that substitutes nothing must therefore leave the cell array's identity intact.
+    Returns
+    -------
+    numpy.ndarray
+        A float array when every cell becomes numeric, else an object array of floats and
+        smaller rational functions holding the residual symbols.
+
+    Notes
+    -----
+    The fold is transparent to structure. When no cell references a generator in ``known`` it
+    substitutes nothing, so the original ``cells`` object is returned as-is rather than a fresh
+    copy, keeping ``id(cells)`` stable. A downstream identity-based structural read depends on
+    that stability: the degree walker (``polyarray.program_degree``) links a statement's
+    producer to its consumer by ``id(ref._cells) == id(out._cells)`` and, on a miss, falls back
+    to scoring the cells' generators by name — a fallback that can silently drop a generator's
+    degree and mis-score the result. A fold that substitutes nothing must therefore leave the
+    cell array's identity intact.
     """
     if cells.dtype.kind == "f":
         return cells.copy()
@@ -180,15 +190,15 @@ def _fold_cells(cells: np.ndarray, known: Mapping[str, float]) -> np.ndarray:
 
 
 def _numify_constant_cells(cells: np.ndarray) -> np.ndarray:
-    """Reduce CONSTANT ``RationalFunction`` cells (no live generators) to plain floats.
+    """Reduce constant :class:`RationalFunction` cells, those with no live generators, to plain floats.
 
-    A structural fold that collapsed a cell to a constant should present it AS numeric: a
-    fully-constant array then has float dtype, so :meth:`SymArray.evaluate` reads it directly
-    (``dtype.kind == 'f'``) WITHOUT requiring the program's now-unused input bindings — the
-    ``partial_eval_numeric`` intent that "unused inputs simply go unread". A cell that still
-    carries a live generator is left as an ``RF``, so a cell-dependent array stays object-dtype
-    and ``evaluate({})`` still raises — which a downstream constancy check reads as "does not
-    fold to a constant".
+    A structural fold that collapsed a cell to a constant should present it as numeric. A
+    fully-constant array then carries float dtype, so :meth:`SymArray.evaluate` reads it
+    directly (``dtype.kind == 'f'``) without the program's now-unused input bindings, matching
+    the ``partial_eval_numeric`` intent that unused inputs simply go unread. A cell that still
+    carries a live generator stays a :class:`RationalFunction`, so a cell-dependent array keeps
+    object dtype and ``evaluate({})`` still raises — which a downstream constancy check reads as
+    "does not fold to a constant".
     """
     if cells.dtype.kind == "f":
         return cells
@@ -227,10 +237,11 @@ def _fold_ref(
     prog: Program, ref: Ref, stmt_idx: int,
     known: Mapping[str, float], idx_map: Mapping[int, int],
 ) -> Ref:
-    """Rewrite a surviving statement's input ref.
+    """Rewrite a surviving statement's input ref against ``known``.
 
-    Numeric where the value is determined, else a symbolically folded version, with
-    ``OutputRef`` statement indices remapped onto the surviving statement list.
+    The ref becomes numeric where its value is determined, and a symbolically folded version
+    otherwise, with any ``OutputRef`` statement index remapped onto the surviving statement
+    list through ``idx_map``.
     """
     if isinstance(ref, IntAtomRef):
         return ref
@@ -253,7 +264,22 @@ def _fold_ref(
 def _seed_bind(
     prog: Program, bind: Mapping[str, npt.ArrayLike],
 ) -> tuple[dict[str, float], set[str]]:
-    """Seed ``known`` from concrete ``bind`` arrays; return (known, dropped)."""
+    """Seed ``known`` from the concrete arrays in ``bind``.
+
+    Each bound input's per-cell generator atom takes the matching array entry as its value.
+
+    Returns
+    -------
+    tuple
+        The seeded ``known`` map and the set of bound input names to drop.
+
+    Raises
+    ------
+    NotImplementedError
+        For a bulk or dynamic input, which cannot be seeded cell by cell.
+    ValueError
+        When a bound array's shape does not match the input's cell shape.
+    """
     known: dict[str, float] = {}
     dropped: set[str] = set()
     for name, val in bind.items():
@@ -450,17 +476,18 @@ def _substitute_dims(
 def _descent_body(fn: StmtOp) -> tuple[Program, Callable[[Program], StmtOp]] | None:
     """Return a directly-positional body program plus a re-wrapper, or ``None``.
 
-    Only the cases where operands map to the body's inputs by position with matching
-    shapes, and where swapping ``fn`` is exactly equivalent, are descendable:
+    A statement is descendable only where its operands map to the body's inputs by position
+    with matching shapes and swapping ``fn`` for the specialized body is exactly equivalent.
+    Two cases qualify: a raw sub-:class:`Program`, which :meth:`Program._run_stmt` runs via
+    ``zip(inputs, ops)``, and a :class:`CallOp` wrapping a program, whose ``_invoke`` maps
+    operands by position too. Each returns the body together with a rewrapper that restores the
+    original wrapping.
 
-    * a raw sub-:class:`Program` (``_run_stmt`` runs it via ``zip(inputs, ops)``);
-    * a :class:`CallOp` wrapping a Program (``_invoke`` maps by position too).
-
-    A genuine ``vmap`` closure is **not** descendable here: its operands carry a
-    batch axis (and ``in_axes=None`` broadcasts), so they do NOT match the body
-    inputs by shape, and replacing the closure with the bare body would drop the
-    batching.  Such Stmts (and ``WhileOp``, opaque callables) return ``None`` and
-    stay symbolic — the conservative degrade.
+    A genuine ``vmap`` closure is not descendable here: its operands carry a batch axis (and
+    ``in_axes=None`` broadcasts), so they do not match the body inputs by shape, and replacing
+    the closure with the bare body would drop the batching. Such statements — along with
+    ``WhileOp`` and opaque callables — return ``None`` and stay symbolic, the conservative
+    degrade.
     """
     if isinstance(fn, Program):
         return fn, (lambda body: body)
@@ -478,12 +505,11 @@ def _try_descend(
     depth: int,
     seen: frozenset[int],
 ) -> tuple[Any, tuple[Any, ...]] | None:
-    """Attempt P6 partial descent on a surviving Stmt ``s``.
+    """Attempt partial descent on a surviving statement ``s``.
 
-    Returns ``(new_fn, new_in)`` when ``s`` has a descendable body, SOME (not
-    all, not none) of its operands resolve numeric, and the specialized body
-    drops exactly those operands' inputs.  Returns ``None`` to fall back to the
-    plain symbolic ref-fold in every other case.
+    Returns ``(new_fn, new_in)`` when ``s`` has a descendable body, some — not all, not none —
+    of its operands resolve numeric, and the specialized body drops exactly those operands'
+    inputs. Returns ``None`` in every other case, falling back to the plain symbolic ref-fold.
     """
     info = _descent_body(s.fn)
     if info is None:
@@ -549,15 +575,16 @@ def _vmap_closure_of(fn: StmtOp) -> tuple[StmtOp, Callable[[StmtOp], StmtOp]] | 
 
 
 def _drop_unread_inputs(prog: Program) -> Program:
-    """``prog`` with every input NO statement and NO output references removed.
+    """Return ``prog`` with every input that no statement and no output references removed.
 
-    A DEAD input can be the only reason an enclosing Stmt does not fold: a closure that
-    declares an input it never reads has a non-numeric operand, so the whole Stmt is kept
-    symbolic even though the input is unused. Dropping it is value-preserving by definition:
-    nothing reads it.
+    An unread input can be the only reason an enclosing statement does not fold: a closure that
+    declares an input it never reads has a non-numeric operand, so the whole statement stays
+    symbolic even though the input is unused. Dropping it is value-preserving by definition,
+    since nothing reads it.
 
-    Referencing is decided on ATOMS (:func:`symarray_atoms` over every Stmt operand and every
-    output), not on a syntactic scan, so an input reached through a folded cell still counts.
+    A reference is decided over atoms — :func:`symarray_atoms` across every statement operand
+    and every output — rather than by a syntactic scan, so an input reached through a folded
+    cell still counts as read.
     """
     if not prog.inputs:
         return prog
@@ -588,28 +615,34 @@ def _fold_vmap_body(
     fn: StmtOp, depth: int, seen: frozenset[int],
     operand_values: list[np.ndarray | None] | None = None,
 ) -> tuple[StmtOp, list[bool] | None]:
-    """Constant-fold the numeric subcomputations INSIDE a vmap body, keeping the batching.
+    """Constant-fold the numeric subcomputations inside a vmap body, keeping the batching.
 
-    :func:`_descent_body` deliberately refuses to descend a vmap closure, because swapping the
-    closure for the bare body would drop the per-point batching. But the body's INTERNAL Stmts
-    whose inputs are all build-time-numeric — e.g. a QR/SVD on a FIXED constant operand,
-    data-INDEPENDENT of the per-point vmap args — can still be folded to
-    constants without touching the batching. Recurse the floor-fold into the body; if it folded
-    anything away, rewrap the folded body in an equivalent vmap closure. Falls back to ``fn``
-    unchanged whenever nothing folds or anything looks off — always a sound no-op degrade
-    (identity/sharing preserved when there is nothing to gain).
+    :func:`_descent_body` refuses to descend a vmap closure, because swapping the closure for
+    the bare body would drop the per-point batching. The body's internal statements whose
+    inputs are all build-time-numeric — a QR or SVD on a fixed constant operand, independent of
+    the per-point vmap arguments — can still fold to constants without touching the batching.
+    This recurses the floor-fold into the body and, if it folded anything away, rewraps the
+    folded body in an equivalent vmap closure. It falls back to ``fn`` unchanged whenever
+    nothing folds or anything looks off, a sound no-op degrade that preserves the original
+    identity and sharing when there is nothing to gain.
 
-    ``operand_values`` — the caller's already-resolved Stmt operands, ``None``
-    where an operand is not build-time numeric. An operand whose ``in_axes`` entry is ``None`` is
-    **not batched**: the very same array is handed to every slice of the body, so substituting its
-    value INTO the body is value-preserving by the definition of ``vmap``, and the batched
-    (``in_axes`` integer) operands are untouched. Doing so is what lets the floor-fold see a
-    closed-over operand that the body does not actually read, so that operand becomes a
-    build-time constant hidden behind a closure.
+    Parameters
+    ----------
+    operand_values
+        The caller's already-resolved statement operands, ``None`` where an operand is not
+        build-time numeric. An operand whose ``in_axes`` entry is ``None`` is not batched: the
+        same array is handed to every slice of the body, so substituting its value into the
+        body is value-preserving by the definition of ``vmap``, while the batched (integer
+        ``in_axes``) operands are untouched. That substitution is what lets the floor-fold see a
+        closed-over operand the body does not actually read, turning it into a build-time
+        constant hidden behind a closure.
 
-    Returns ``(fn', keep)``: ``keep`` is ``None`` when the operand list is unchanged, else a
-    per-operand mask the caller applies (a bound operand is no longer an input of the body, so it
-    must leave the Stmt too, or the ``in_axes`` would misalign).
+    Returns
+    -------
+    tuple
+        ``(fn', keep)``. ``keep`` is ``None`` when the operand list is unchanged, else a
+        per-operand mask the caller applies: a bound operand is no longer an input of the body,
+        so it must leave the statement too or the ``in_axes`` would misalign.
     """
     info = _vmap_closure_of(fn)
     if info is None or depth >= _MAX_DESCENT_DEPTH:
@@ -667,9 +700,10 @@ def specialize(
     sparsity: bool = False,
     budget: SimplifyBudget | None = None,
 ) -> Program:
-    """Specialize ``program`` against optional ``subs`` and ``bind`` values.
+    """Specialize ``program`` against optional ``subs`` and ``bind`` values, preserving its exact results.
 
-    Exactness-preserving throughout.
+    Substitution runs first, then the ``bind``-seeded numeric-fold floor, then the optional
+    post-build ``budget`` moderation; every step preserves the program's exact results.
 
     Parameters
     ----------
@@ -787,10 +821,10 @@ def _specialize(
 
 
 def fold_numeric(program: Program) -> Program:
-    """Constant-fold + dead-stmt elimination with no substitution.
+    """Constant-fold a program and drop the dead statements, with no substitution.
 
-    ``specialize`` with an empty ``bind`` — folds only subcomputations that are
-    already numeric in the program (a fully-symbolic program is a no-op copy).
+    This is :func:`specialize` with an empty ``bind``: it folds only the subcomputations
+    already numeric in the program, so a fully-symbolic program returns as a no-op copy.
     """
     return specialize(program)
 
@@ -839,27 +873,27 @@ def _read_stmt_outs(stmt: Stmt, bindings: Mapping[str, Any]) -> list[np.ndarray]
 
 
 class NonExactFoldWarning(UserWarning):
-    """A build-time constant was certified non-exactly, by random-probe identity testing.
+    """Warning that a build-time constant was certified non-exactly, by random-probe identity testing.
 
-    Raised (as a warning) whenever ``mode="hybrid"`` freezes a statement the exact
-    lane could not normalize — the certificate for those statements is probabilistic
-    (measure-zero failure), not exact-by-construction.  Silence with
-    ``mode="probe"`` (accept probing), or forbid with ``mode="exact"``.
+    It is raised whenever ``mode="hybrid"`` freezes a statement the exact lane could not
+    normalize: the certificate for those statements is probabilistic, with measure-zero
+    failure, rather than exact-by-construction. Silence it with ``mode="probe"`` to accept
+    probing, or forbid the freeze with ``mode="exact"``.
     """
 
 
 class NonDeterministicFoldWarning(NonExactFoldWarning):
-    """The exact lane's WALL-CLOCK BACKSTOP fired, so this result is machine-dependent.
+    """Warning that the exact lane's wall-clock backstop fired, leaving the result machine-dependent.
 
     The exact lane is budgeted in deterministic work units precisely so that a certificate
-    means the same thing on every machine.  The clock survives only as a backstop against a
-    mis-calibrated cost model on a pathological program — and if it fires, the very property
-    the work budget exists to provide is gone: re-run on a faster box and more may certify.
+    means the same thing on every machine. The clock survives only as a backstop against a
+    mis-calibrated cost model on a pathological program, and if it fires the very property the
+    work budget exists to provide is gone: a re-run on a faster machine may certify more.
 
-    It is a :class:`NonExactFoldWarning` subclass so that every existing consumer of
-    fold provenance (notably a certificate cache that decides the ``exact`` bit by
-    walking this hierarchy) treats it as non-exact without changes.  Seeing it means the cost
-    model needs fixing, not the budget raising.
+    It subclasses :class:`NonExactFoldWarning` so that every existing consumer of fold
+    provenance — notably a certificate cache that decides the ``exact`` bit by walking this
+    hierarchy — treats it as non-exact without changes. Seeing it means the cost model needs
+    fixing, not the budget raising.
     """
 
 
@@ -867,12 +901,12 @@ _PARTIAL_EVAL_MODES = ("exact", "hybrid", "probe")
 
 
 def _resolve_legacy_time_budget(time_budget: float | None) -> float | None:
-    """Translate a ``time_budget=`` into a wall-clock BACKSTOP, loudly.
+    """Translate a ``time_budget=`` into a wall-clock backstop, loudly.
 
-    ``time_budget`` is ACCEPTED because the committed surface carries it and it has external
-    consumers, but it no longer selects what the exact lane folds — that is ``work_budget``,
-    in deterministic work units.  It sizes the backstop instead: it still guarantees the call
-    terminates, which is the reason callers pass it.  Passing it warns, because it no longer
+    ``time_budget`` is accepted because the committed surface carries it and it has external
+    consumers, but it no longer selects what the exact lane folds — that is ``work_budget``, in
+    deterministic work units. It sizes the backstop instead, still guaranteeing the call
+    terminates, which is the reason callers pass it. Passing it warns, because it no longer
     bounds what folds.
     """
     if time_budget is None:
@@ -888,10 +922,10 @@ def _resolve_legacy_time_budget(time_budget: float | None) -> float | None:
 
 
 def _resolve_partial_eval_mode(mode: str | None) -> str:
-    """``mode`` (or the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default) validated.
+    """Validate ``mode``, falling back to the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default.
 
-    The explicit parameter is the API; the env var only moves the DEFAULT
-    (``None``) — an explicit argument always wins.
+    The explicit parameter is the API; the environment variable only moves the default used
+    when ``mode`` is ``None``, so an explicit argument always wins.
     """
     if mode is None:
         mode = os.environ.get("POLYARRAY_PARTIAL_EVAL_MODE", "hybrid")
@@ -905,7 +939,7 @@ def _warn_probe_freezes(
     program: Program, probe_frozen: set[int], reasons: Mapping[int, str],
     *, probes: int, rtol: float,
 ) -> None:
-    """One aggregated :class:`NonExactFoldWarning` naming the probe-frozen sites."""
+    """Emit one aggregated :class:`NonExactFoldWarning` naming the probe-frozen sites."""
     if not probe_frozen:
         return
     def _site(i: int) -> str:
@@ -947,38 +981,37 @@ def _partial_eval_numeric(
 ) -> tuple[Program, dict, Any]:
     """Fold every statement whose outputs are invariant under the program's symbolic inputs.
 
-    Invariance is certified by exact normalization, by probing, or by both, per ``mode``.
+    Invariance is certified by exact normalization, by probing, or by both, according to
+    ``mode``. Where ``fold_numeric`` folds only numeric-closed subcomputations — those with no
+    symbolic ancestor in the dataflow — this pass folds the strictly larger class whose outputs
+    merely do not *depend* on the symbolic inputs. The canonical case is a chain
+    ``inv(A) → A·inv(A)``, identically ``I`` for every ``A``: dataflow calls it symbolic,
+    identity testing calls it constant.
 
-    ``fold_numeric`` folds only numeric-closed subcomputations — those with no symbolic
-    ancestor in the dataflow. This pass folds the strictly larger class whose outputs merely
-    do not *depend* on the symbolic inputs. The canonical case is a chain ``inv(A) →
-    A·inv(A)``, identically ``I`` for every ``A``: dataflow says symbolic, identity testing
-    says constant.
+    ``mode`` selects how invariance is certified (see :func:`partial_eval_numeric` for the
+    public contract):
 
-    ``mode`` (see :func:`partial_eval_numeric` for the public contract):
+    * ``"exact"`` uses :mod:`polyarray.exact_fold` alone, certifying constancy from the exact
+      rational normal form of each output entry (flint ``fmpq`` arithmetic,
+      exact-by-construction). An entry that cannot be normalized, such as an opaque op on the
+      symbolic path, is simply left unfolded.
+    * ``"hybrid"`` runs exact first, then falls back to the probe pass for the statements the
+      exact lane left unresolved, raising one aggregated :class:`NonExactFoldWarning` for every
+      such non-exact freeze. Statements the exact lane refuted as provably non-constant are
+      never probed, which closes the colluding-probe false-freeze hole.
+    * ``"probe"`` freezes silently: it draws ``probes`` random input bindings over
+      ``[0.6, 1.6]`` and freezes every statement output that is finite and equal
+      (``rtol``/``atol``) across runs. This is probabilistic, with measure-zero false freezes
+      rather than exact-by-construction, for diagnostic or performance call sites that do not
+      need exactness.
 
-    * ``"exact"``  — :mod:`polyarray.exact_fold` only: constancy certified by the
-      exact rational normal form of each output entry (flint ``fmpq`` arithmetic;
-      exact-by-construction). Entries that cannot be normalized (opaque ops on the
-      symbolic path) are simply NOT folded.
-    * ``"hybrid"`` — exact first; statements the exact lane left *unresolved* fall
-      back to the probe pass, and every such non-exact freeze raises one
-      aggregated :class:`NonExactFoldWarning`. Statements the exact lane REFUTED
-      (provably non-constant) are never probed — this is what closes the
-      colluding-probe false-freeze hole.
-    * ``"probe"``  — silent probe-and-freeze: ``probes`` random
-      input bindings over ``[0.6, 1.6]``, freeze every Stmt output bit-finite and
-      equal (``rtol``/``atol``) across runs. Probabilistic (measure-zero false
-      freezes), NOT exact-by-construction — for diagnostic / performance
-      call sites that don't need exactness.
+    Folding is at statement granularity: an intermediate that genuinely varies stays symbolic
+    even when a downstream output is invariant, and that downstream statement still folds on its
+    own. The exact lane's entry-level fold in :func:`partial_eval_numeric_symarray` additionally
+    certifies cell-level cancellations.
 
-    Folding is at statement granularity: an intermediate that genuinely varies stays
-    symbolic even when a downstream output is invariant, and the downstream statement still
-    folds on its own. The exact lane's entry-level fold in
-    :func:`partial_eval_numeric_symarray` additionally certifies cell-level cancellations.
-
-    Static inputs only (a ``DimAtom``-shaped input raises ``NotImplementedError``).
-    Inputs are never dropped — unused ones simply go unread at ``run`` time.
+    Static inputs only; a ``DimAtom``-shaped input raises :class:`NotImplementedError`. Inputs
+    are never dropped, and unused ones simply go unread at ``run`` time.
     """
     if probes < 2:
         raise ValueError(f"partial_eval_numeric needs ≥ 2 probes, got {probes}")
@@ -1090,31 +1123,31 @@ def partial_eval_numeric(
 ) -> Program:
     """Fold every statement whose outputs are invariant under the program's symbolic inputs.
 
-    See :func:`_partial_eval_numeric` for the mechanics.
+    See :func:`_partial_eval_numeric` for the mechanics. ``mode`` selects how invariance is
+    certified:
 
-    ``mode`` selects HOW invariance is certified:
+    * ``"exact"`` certifies from the exact rational normal form alone
+      (:mod:`polyarray.exact_fold`, exact-by-construction), leaving non-normalizable statements
+      symbolic.
+    * ``"hybrid"``, the default, certifies exactly where it can and falls back to the probe
+      pass for opaque or unresolved statements only, raising an aggregated
+      :class:`NonExactFoldWarning` that names the probe-frozen sites. Statements the exact lane
+      proved non-constant are never probe-frozen.
+    * ``"probe"`` freezes silently and probabilistically, for diagnostic or performance sites
+      that do not need exactness.
 
-    * ``"exact"``  — exact rational normal form only (:mod:`polyarray.exact_fold`;
-      exact-by-construction). Non-normalizable statements are left symbolic.
-    * ``"hybrid"`` (the default) — exact where possible; the probe pass is
-      the fallback for opaque/unresolved statements ONLY, and every probe-based
-      freeze raises an aggregated :class:`NonExactFoldWarning` naming the sites.
-      Statements the exact lane proved NON-constant are never probe-frozen.
-    * ``"probe"``  — silent probe-and-freeze
-      (probabilistic; for diagnostic/performance sites that don't need exactness).
-
-    ``mode=None`` reads the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default (else
-    ``"hybrid"``); the explicit parameter always wins.  ``probes`` configures the
-    probe count of the probe/hybrid-fallback lanes.  ``work_budget`` (DETERMINISTIC
-    work units, charged BETWEEN operations) and ``max_sym_mass`` (the monomial mass one
-    symbolic op's operands may carry, checked BEFORE it runs — an object-dtype einsum / Gauss
-    pass is uninterruptible once started) JOINTLY bound the exact lane: oversized or
-    out-of-budget statements degrade to the (warned) probe fallback rather than hang.
-    ``max_sym_mass=None`` uses ``exact_fold._MAX_SYM_MASS``; ``work_budget=None`` uses the
+    ``mode=None`` reads the ``POLYARRAY_PARTIAL_EVAL_MODE`` env default, else ``"hybrid"``, and
+    an explicit parameter always wins. ``probes`` sets the probe count of the probe and
+    hybrid-fallback lanes. ``work_budget`` (deterministic work units, charged between
+    operations) and ``max_sym_mass`` (the monomial mass one symbolic op's operands may carry,
+    checked before it runs, since an object-dtype einsum or Gauss pass is uninterruptible once
+    started) jointly bound the exact lane: an oversized or out-of-budget statement degrades to
+    the warned probe fallback rather than hang. ``max_sym_mass=None`` uses
+    ``exact_fold._MAX_SYM_MASS``, and ``work_budget=None`` uses the
     ``POLYARRAY_EXACT_WORK_BUDGET`` env knob, else ``exact_fold._DEFAULT_WORK_BUDGET``.
 
-    The budget is work, NOT seconds: what certifies is a function of the program alone, so the
-    same input yields the same certificate on any machine under any load.  See
+    The budget is work, not seconds: what certifies is a function of the program alone, so the
+    same input yields the same certificate on any machine under any load. See
     :class:`NonDeterministicFoldWarning` for the one case where that guarantee lapses.
     """
     new, _known, _state = _partial_eval_numeric(
@@ -1166,7 +1199,7 @@ def partial_eval_numeric_symarray(
 # ---------------------------------------------------------------------------
 
 def _as_rf(value: Cell) -> RationalFunction:
-    """Coerce a cell value (RF / numeric) to a :class:`RationalFunction`."""
+    """Coerce a cell value, a :class:`RationalFunction` or a number, to a :class:`RationalFunction`."""
     if isinstance(value, RationalFunction):
         return value
     if isinstance(value, (int, float)):
@@ -1177,11 +1210,11 @@ def _as_rf(value: Cell) -> RationalFunction:
 def _build_subs_map(
     in_sa: SymArray, expr: SymArray | np.ndarray,
 ) -> tuple[dict[str, RationalFunction], np.ndarray]:
-    """Map each cell-atom of the substituted input to its replacement RF.
+    """Map each cell atom of the substituted input to its replacement rational function.
 
-    Returns ``(gen_name -> repl_rf, composed_input_cells)`` where the second is
-    the input's cells with each atom replaced by its expression cell (used to
-    rewrite any direct ``InputRef`` to the dropped input).
+    Returns ``(gen_name -> repl_rf, composed_input_cells)``, where the second element is the
+    input's cells with each atom replaced by its expression cell, used to rewrite any direct
+    ``InputRef`` to the dropped input.
     """
     if in_sa._bulk is not None:
         raise NotImplementedError("substitute of a bulk/dynamic input is unsupported")
@@ -1206,7 +1239,7 @@ def _build_subs_map(
 
 
 def _compose_cells(cells: np.ndarray, subs_map: Mapping[str, RationalFunction]) -> np.ndarray:
-    """Apply :meth:`RationalFunction.compose_multi` to every RF cell."""
+    """Apply :meth:`RationalFunction.compose_multi` to every :class:`RationalFunction` cell."""
     cells = np.asarray(cells)
     if cells.dtype.kind == "f":
         return cells.copy()
@@ -1264,7 +1297,7 @@ def substitute(program: Program, subs: Mapping[str, SymArray | np.ndarray]) -> P
 
     ``subs`` maps an input name to a :class:`SymArray` (per-cell, shape-matched)
     or a :class:`RationalFunction` (broadcast to every cell) whose generators are
-    the program's OTHER existing input atoms.  Each substituted input's per-cell
+    the program's other existing input atoms.  Each substituted input's per-cell
     atom ``g`` is replaced everywhere it appears — program outputs and Stmt-input
     ``SymArrayRef`` / ``RationalRef`` / ``InputRef`` cells — via
     :meth:`RationalFunction.compose`, after which the input is dropped from
@@ -1344,10 +1377,10 @@ def _symarray_atoms(sa: SymArray) -> set[str]:
     ⚠ ``RationalFunction.gens`` is the generator list of the cell's **ring**, not the set of
     generators the cell's value actually varies with.  A cell of total degree zero in every
     generator — ``is_constant()``, or the zero polynomial, for which ``is_constant()`` is
-    ``False`` only because ``_total_degree`` spells the zero polynomial ``-1`` — has the SAME
+    ``False`` only because ``_total_degree`` spells the zero polynomial ``-1`` — has the same
     value under every binding, so it reads none of its ring's generators and contributes no
     atom.  Both tests are exact and structural (a total-degree test on the numerator and
-    denominator), never a sample, so excluding such a cell removes atoms the value PROVABLY
+    denominator), never a sample, so excluding such a cell removes atoms the value provably
     does not depend on: strictly more precise, and never a claim of independence that cannot be
     proved.  Without it, a constant that merely rides on a ring built around a ``vertex`` /
     ``point`` feed reads as feed-dependent, and every dependency question downstream —
@@ -1439,32 +1472,32 @@ def dependency_cone(program: Program, target: SymArray) -> set[int]:
 def is_structurally_constant(program: Program, target: SymArray) -> bool:
     """Decide, by dependency rather than sampling, whether ``target`` is a build-time constant.
 
-    Walks ``target``'s dependency cone (:func:`dependency_cone` — the set of Stmts
-    feeding ``target``) and returns ``True`` iff the cone is a *closed constant
-    subprogram*:
+    This walks ``target``'s dependency cone — the set of statements feeding it, from
+    :func:`dependency_cone` — and returns ``True`` exactly when that cone is a *closed constant
+    subprogram*, meaning both of:
 
-    1. **No Stmt input is an** :class:`~polyarray.ir.InputRef` (a reference to a declared
-       program input) — nor an :class:`~polyarray.ir.IntAtomRef` (a runtime-bound integer),
-       both of which are values supplied at run time; and
-    2. **no cell generator anywhere in the cone** (nor in ``target`` itself) has a
-       provenance ``kind`` other than ``"stmt_out"`` — i.e. no ``vertex`` / ``point`` /
-       ``coeff`` / ``param_dof`` / ``per_point`` (feed) atom is read.  *Read*, not merely
-       named: the generators come from :func:`_symarray_atoms`, which excludes a cell of
-       total degree zero (see its note) — such a cell holds the same value under every
-       binding, so a feed generator sitting in its RING is not a dependency.
+    1. No statement input is an :class:`~polyarray.ir.InputRef` (a reference to a declared
+       program input) or an :class:`~polyarray.ir.IntAtomRef` (a runtime-bound integer), both
+       of which are values supplied at run time.
+    2. No cell generator anywhere in the cone, nor in ``target`` itself, has a provenance
+       ``kind`` other than ``"stmt_out"`` — that is, no ``vertex``, ``point``, ``coeff``,
+       ``param_dof`` or ``per_point`` feed atom is read. It must be *read*, not merely named:
+       the generators come from :func:`_symarray_atoms`, which excludes a cell of total degree
+       zero (see its note), since such a cell holds the same value under every binding and a
+       feed generator sitting in its ring is then not a dependency.
 
-    **Soundness.**  A cone with no live-input reference and only ``stmt_out`` generators
+    The test is sound. A cone with no live-input reference and only ``stmt_out`` generators
     depends on nothing outside itself: its leaves are nullary constant ops (``ConstOp`` /
-    ``EyeOp`` …), every intermediate atom is produced by a prior Stmt *in the cone*, and no
-    generator traces to a program feed.  Its value is therefore identical under every
-    binding — a build-time constant that folds without any sampling.  This is EXACT, not
-    heuristic: it never mistakes a feed-varying operator for a constant.
+    ``EyeOp`` …), every intermediate atom is produced by a prior statement *in the cone*, and no
+    generator traces to a program feed. Its value is therefore identical under every binding, a
+    build-time constant that folds without any sampling. This is exact rather than heuristic,
+    and never mistakes a feed-varying operator for a constant.
 
-    **Conservative.**  Any ref type that cannot be positively classified as constant-safe
-    (an :class:`~polyarray.ir.OutputRef` — a prior in-cone Stmt output — or a
-    :class:`~polyarray.ir.Const` literal), or any generator whose provenance cannot be
-    looked up, forces ``False``.  We never claim constancy we cannot prove, so a value with
-    any live input dependency is reported non-constant.
+    The test is also conservative. Any ref type that cannot be positively classified as
+    constant-safe (an :class:`~polyarray.ir.OutputRef` — a prior in-cone statement output — or a
+    :class:`~polyarray.ir.Const` literal), or any generator whose provenance cannot be looked
+    up, forces ``False``. It never claims constancy it cannot prove, so a value with any live
+    input dependency is reported non-constant.
     """
     def _gens_ok(atoms: set) -> bool:
         for name in atoms:
@@ -1513,17 +1546,19 @@ def _read_symarray(program: Program, sa: SymArray, bindings: dict[str, float]) -
 
 
 def evaluate_cone(program: Program, target: SymArray, values: Mapping[str, Any]) -> np.ndarray:
-    """Evaluate ``target`` by running ONLY its dependency cone at ``values``.
+    """Evaluate ``target`` by running only its dependency cone at ``values``.
 
-    Statements outside :func:`dependency_cone` are NEVER executed — so a singular
-    / failing op elsewhere in ``program`` (a common hazard when probing a
-    partially-built shared program at a generic feed) cannot affect, or crash,
-    the evaluation of ``target``.  Returns ``target``'s float ndarray.
+    Statements outside :func:`dependency_cone` are never executed, so a singular or failing op
+    elsewhere in ``program`` — a common hazard when probing a partially-built shared program at
+    a generic feed — can neither affect nor crash the evaluation of ``target``.
 
-    Semantics: equal to ``target.evaluate(values)`` WHENEVER the full run would
-    succeed; but it also succeeds when the full run would raise on an unrelated
-    statement.  ``values`` must bind every program input (the unused ones simply
-    go unread).
+    Returns
+    -------
+    numpy.ndarray
+        ``target``'s float array. This equals ``target.evaluate(values)`` whenever the full run
+        would succeed, and it additionally succeeds when the full run would raise on an
+        unrelated statement. ``values`` must bind every program input; the unused ones simply go
+        unread.
     """
     cone = dependency_cone(program, target)
     bindings = program.build_runtime_bindings(values, only=cone)
