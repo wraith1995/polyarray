@@ -1,21 +1,21 @@
 """Post-build analysis and cost-driven partial evaluation of a :class:`Program`.
 
 Building a program under a :class:`~polyarray.ir.SymbolicBudget` decides how much
-symbolic structure it carries. This module is the half that runs afterwards: look at
-what was generated, and reshape it by choice.
+symbolic structure it carries. This module is the half that runs afterwards: it looks at
+what was generated and reshapes it by choice.
 
-* :func:`analyze` walks a Program (and every nested sub-Program / vmap body) and
-  reports structure + cost — statement counts, deferral/offload nodes, per-output
-  symbolic mass, and the generator-provenance histogram (vertex / point / coeff /
-  stmt_out / per_point).  This is the inspection tool the budget machinery exists
-  to feed: build big, then decide what matters.
+:func:`analyze` walks a Program (and every nested sub-Program / vmap body) and reports
+structure and cost — statement counts, deferral/offload nodes, per-output symbolic mass,
+and the generator-provenance histogram (vertex / point / coeff / stmt_out / per_point). It
+is the inspection tool the budget machinery exists to feed: build big, then decide what
+matters.
 
-* :func:`partial_eval` is the cost-driven transform: collapse every output cell
-  whose symbolic cost exceeds a chosen bound (capturing it as a fresh atom via an
-  ``IdentityOp`` Stmt), leaving cheaper cells symbolic.  It is the post-build
-  counterpart of the build-time defer-when-over-budget gate, and is
-  **exactness-preserving** — the captured cell is evaluated at ``run`` time, so
-  ``partial_eval(p).run(x) == p.run(x)`` for all ``x`` — it only changes *form*.
+:func:`partial_eval` is the cost-driven transform that collapses every output cell whose
+symbolic cost exceeds a chosen bound, capturing it as a fresh atom via an ``IdentityOp``
+Stmt and leaving cheaper cells symbolic. It is the post-build counterpart of the build-time
+defer-when-over-budget gate, and is exactness-preserving: the captured cell is evaluated at
+``run`` time, so ``partial_eval(p).run(x) == p.run(x)`` for all ``x``, and only the form
+changes.
 """
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ def iter_programs(top: Program) -> list[Program]:
 
 @dataclass(frozen=True)
 class ProgramRow:
-    """Per-program slice of an :class:`IRReport`."""
+    """Per-program row of an :class:`IRReport`."""
 
     name: str
     n_stmts: int
@@ -186,8 +186,8 @@ def _prov_kind(program: Program, gen: str) -> str:
     """Return the provenance kind of a generator as seen by this program's env.
 
     A generator not declared in ``program.env`` reports ``"extern"``: a free symbol the
-    program receives a binding for at run time, typically a geometry vertex or DoF atom
-    living in the geometry's own env. ``"extern"`` therefore reads as "still symbolic
+    program receives a binding for at run time, typically a vertex or parameter atom
+    living in the input's own env. ``"extern"`` therefore reads as "still symbolic
     over an outside input", the opposite of ``"stmt_out"``.
     """
     p = program.env._provenance.get(gen)

@@ -1,33 +1,40 @@
 """Batched execution of a :class:`~polyarray.ir.Program` over a leading batch axis.
 
-``batched_run(program, values)`` evaluates ``program`` for a whole BATCH of inputs at once — each entry of
-``values`` carries a leading batch axis of length ``B`` — reproducing ``[program.run(values[b]) for b in
-range(B)]`` in ONE vectorized pass, but without the Python-per-call / per-Stmt interpreter overhead that
-dominates when a program is tiny and run many times (a per-quadrature-point loop).
+:func:`batched_run` evaluates a program for a whole batch of inputs in one vectorized
+pass: each entry of ``values`` carries a leading batch axis of length ``B``, and the
+result is ``[program.run(values[b]) for b in range(B)]`` computed together, without the
+per-call and per-statement interpreter overhead that dominates when a tiny program runs
+once per sample point.
 
-Two lanes, mirroring :meth:`Program.run`:
+Evaluation follows the two lanes of :meth:`Program.run`::
 
-* **Cell lane** — a program's symbolic ``RationalFunction`` cells are polynomials over per-element input
-  atoms.  The batch axis stays IMPLICIT: each atom is bound to its ``(B,)`` slice and ``eval_numeric_fast``
-  broadcasts, so a cell of declared shape ``s`` evaluates to ``(B, *s)``.  (Shapes are NOT rewritten — that
-  would rename atoms and break the cells.)
-* **Stmt lane** — each op is applied with the batch as leading axis 0.  Dispatch is by ``isinstance``
-  over polyarray's own op vocabulary: einsum ellipsis-batches, ``numpy`` linalg batches over leading
-  axes, axis ops shift by one.  A front-end op is not one of these and falls to the generic branch,
-  which runs it unbatched or declines — never mistaking it for the builtin of the same name.
+    values[name]  (B, *decl_shape)
+        │
+        ├─ cell lane   each atom bound to its (B,) slice; a cell of shape s → (B, *s)
+        └─ stmt lane   each op applied with the batch on leading axis 0
 
-Agreement with the per-element loop is EXACT for the structural and elementwise ops (reshape, scale,
-add, slice, axis length — verified ``assert_array_equal`` in ``tests/test_batch.py``), but NOT exact in
-general.  ``EinsumStmtOp`` batches by rewriting the spec with an ellipsis and passes ``optimize=``, so
-numpy may choose a different contraction ORDER than the unbatched call; ``np.linalg`` likewise takes a
-stacked path rather than a per-matrix one.  Both re-associate floating-point arithmetic.
+In the cell lane a program's symbolic :class:`~polyarray.rational.RationalFunction` cells
+are polynomials over per-element input atoms, and the batch axis stays implicit: each atom
+is bound to its ``(B,)`` slice and ``eval_numeric_fast`` broadcasts, so a cell of declared
+shape ``s`` evaluates to ``(B, *s)``. The declared shapes are left untouched, since
+rewriting them would rename the atoms and break the cells.
 
-Measured on a high-degree interpolation residual: 2D agrees exactly; 3D differs by max|Δ| =
-1.0e-13 on values of magnitude ~1.4e2, i.e. ~1 ulp relative. Agreement is therefore to
-rounding, not to the bit — a claim of bit-identity holds only for the exact ops above.
+In the stmt lane each op is applied with the batch as leading axis 0, dispatched by
+``isinstance`` over polyarray's own op vocabulary: einsum ellipsis-batches, ``numpy``
+linalg batches over the leading axes, and axis ops shift by one. An op outside that
+vocabulary is a front-end op and falls to the generic branch, which runs it unbatched or
+declines, rather than treating it as the builtin of the same name.
 
-Raises :class:`NotImplementedError` for any op without a batch rule (or a sub-Program / dynamic
-construct it does not handle) so the caller can fall back to the per-element loop.
+Agreement with the per-element loop is exact for the structural and elementwise ops —
+reshape, scale, add, slice, axis length, verified by ``assert_array_equal`` in
+``tests/test_batch.py`` — but not in general. :class:`~polyarray.ir.EinsumStmtOp` batches
+by rewriting its spec with an ellipsis and passing ``optimize=``, so numpy may choose a
+different contraction order than the unbatched call, and ``np.linalg`` takes a stacked
+path rather than a per-matrix one; both re-associate floating-point arithmetic. Agreement
+is therefore to rounding, and bit-identity holds only for the exact ops named above.
+
+Raises :class:`NotImplementedError` for any op without a batch rule, or a sub-program or
+dynamic construct it does not handle, so the caller can fall back to the per-element loop.
 """
 from __future__ import annotations
 
@@ -47,7 +54,7 @@ __all__ = ["batched_run", "BatchUnsupported"]
 
 
 class BatchUnsupported(NotImplementedError):
-    """An op / construct in the program has no batch rule — fall back to the per-element loop."""
+    """Signals that a program op or construct has no batch rule, so the caller must fall back to the per-element loop."""
 
 
 def _batched_einsum_spec(spec: str) -> str:
@@ -92,7 +99,7 @@ def _apply(fn: StmtOp, ins: list[tuple[np.ndarray, bool]]) -> tuple[np.ndarray, 
         return np.asarray(vals[i], dtype=float)
 
     def _shift[T: (int, tuple[int, ...], list[int])](ax: T) -> T:
-        """Re-express an axis index as seen from a batched operand: one extra leading axis.
+        """Re-express an axis index as seen from a batched operand, which carries one extra leading axis.
 
         Negative indices already count from the end and so need no shift; shifting one
         would silently transpose the wrong pair of axes rather than fail.

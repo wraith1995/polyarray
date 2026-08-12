@@ -1,13 +1,11 @@
-"""Integer-valued IR atom.
+"""The integer-valued IR atom.
 
-:class:`IntAtom` is an opaque integer-valued symbolic input — distinct
-from :class:`RationalFunction`, which carries real rational polynomials.
-Its only operation is to be the scrutinee of a :func:`Interpreter.select_x`
-typed switch.
-
-Used by the orientation-aware sampler API so that a symbolic orientation value
-can branch the emitted IR over the canonical orientation order of an
-entity type at run time, without participating in any rational arithmetic.
+An :class:`IntAtom` is an opaque integer-valued symbolic input whose only operation is to
+be the scrutinee of a :func:`Interpreter.select_x` typed switch. It stands alongside
+:class:`RationalFunction`, the atom that carries real rational polynomials, and takes no
+part in rational arithmetic. A selector-driven API uses it so that a symbolic integer
+selector value branches the emitted IR over the canonical order of the selector's domain
+at run time.
 """
 from __future__ import annotations
 
@@ -16,13 +14,12 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class IntAtom:
-    """Integer-valued IR atom.
+    """An integer-valued IR atom bound by name and confined to a small integer domain.
 
-    ``name`` is the binding key the runtime uses to look up the atom's
-    concrete integer value at evaluation time.  ``domain`` is the range
-    of admissible values — typically ``range(len(automorphism_group))``
-    for an orientation atom.  The dataclass is frozen so it hashes by
-    value, making it usable as a dictionary key alongside concrete ints.
+    The ``name`` is the key the runtime binds the atom's concrete integer value under at
+    evaluation time, and the ``domain`` is the range of admissible values — typically
+    ``range(n)`` for a selector over ``n`` cases. The dataclass is frozen, so it hashes by
+    value and serves as a dictionary key alongside concrete ints.
     """
 
     name: str

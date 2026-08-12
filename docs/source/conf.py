@@ -25,8 +25,17 @@ extensions = [
     "sphinx.ext.intersphinx",
     "sphinx.ext.viewcode",
     "sphinx.ext.todo",
+    "sphinx.ext.doctest",
     "numpydoc",
+    "myst_parser",
 ]
+
+# Markdown narrative pages (public_api, docstring_style, mypy_notes) render
+# through MyST alongside the reStructuredText ones.
+source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
+
+# The examples page is written as doctests, so ``make -C docs doctest`` runs the
+# narrative and fails if the API drifts from what the docs claim.
 
 # The narrative pages left for the maintainer mark their gaps with ``todo``;
 # show them, so an unwritten section is visible in the built docs.
@@ -44,6 +53,11 @@ autodoc_default_options = {
     "member-order": "bysource",
 }
 autodoc_typehints = "description"
+
+# A frozen dataclass with several fields (e.g. SimplifyBudget) renders as one
+# long signature line; wrap any signature past this width to one parameter per
+# line so the reference stays readable.
+python_maximum_signature_line_length = 72
 autodoc_type_aliases = {
     "Cell": "polyarray.ir.Cell",
     "Ref": "polyarray.ir.Ref",
@@ -72,3 +86,32 @@ html_title = "polyarray"
 # Nothing is mocked: the workspace venv holds the whole stack, and mocking a
 # module sympy probes for at import time breaks the build rather than helping.
 autodoc_mock_imports: list[str] = []
+
+
+# Internal structural-typing Protocols used only for isinstance dispatch — not
+# part of the documented surface.
+_INTERNAL_PROTOCOLS = {"VmapClosure", "NestedVmapClosure"}
+
+
+def _skip_member(app, what, name, obj, skip, options):
+    """Keep the reference to the public surface.
+
+    Private members (leading underscore) are internal; a module-level type alias
+    (e.g. ``Monom = tuple[int, ...]``) renders as a class whose ``tuple``
+    signature autodoc cannot format, so it belongs inline in the module
+    docstring rather than as its own stub; and the internal dispatch Protocols
+    are implementation detail.
+    """
+    import types
+
+    if name.startswith("_"):
+        return True
+    if name in _INTERNAL_PROTOCOLS:
+        return True
+    if isinstance(obj, types.GenericAlias):
+        return True
+    return skip
+
+
+def setup(app):
+    app.connect("autodoc-skip-member", _skip_member)

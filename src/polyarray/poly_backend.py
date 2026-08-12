@@ -1,24 +1,29 @@
-"""Polynomial-arithmetic backend abstraction.
+"""A uniform polynomial protocol over interchangeable arithmetic backends.
 
-The chartlib symbolic interpreter stores rational functions as
-``num / den`` where ``num`` and ``den`` are sparse multivariate
-polynomials over a coefficient field.  Two backends are wired here:
+A rational function is stored as ``num / den``, where ``num`` and ``den`` are
+sparse multivariate polynomials over a coefficient field. Each backend exposes the
+same duck-typed :class:`Ring` and :class:`Poly` pair, so
+:class:`~polyarray.rational.RationalFunction` runs against one interface while the
+underlying engine stays interchangeable::
 
-* ``"sympy"`` — :class:`sympy.polys.rings.PolyElement` over
-  :data:`sympy.RR` (53-bit ``mpf`` coefficients).  Pure Python; the
-  reference implementation.
+    RationalFunction
+       │ works against
+       ▼
+    Ring ──builds──▶ Poly           the backend-neutral protocol
+       ▲
+       │ exactly one backend is active
+       ├─ sympy       PolyElement over RR, the pure-Python reference
+       ├─ flint       fmpq_mpoly (python-flint), exact rationals, fastest
+       ├─ native_py   a dict-of-monomials engine (poly_native_py)
+       └─ native_cpp  a Cython extension over the same protocol
 
-* ``"flint"`` — :class:`flint.fmpq_mpoly` from ``python-flint``
-  (FLINT C library, exact rational coefficients).  Roughly two orders of
-  magnitude faster at multivariate multiplication, and an order of magnitude
-  faster at ring construction, at realistic generator counts.
-
-The backend is selected by the :data:`BACKEND` global (default
-``"sympy"``).  Set the ``CHARTLIB_POLY_BACKEND`` environment variable
-to ``"flint"`` to switch.
-
-Both backends provide a uniform :class:`Poly` and :class:`Ring` duck-typed
-protocol, which :class:`~polyarray.rational.RationalFunction` works against.
+The active backend is chosen by the ``CHARTLIB_POLY_BACKEND`` environment variable,
+resolved into :data:`BACKEND_NAME`; when it is unset the sparse flint backend is
+preferred, falling back to sympy when python-flint is absent. The sympy backend
+carries 53-bit ``mpf`` coefficients over :data:`sympy.RR`, while flint carries exact
+rationals and is substantially faster at multivariate multiplication and ring
+construction. The native backends take their coefficient type from
+``CHARTLIB_POLY_COEFF``.
 """
 from __future__ import annotations
 
@@ -366,6 +371,8 @@ class _FlintRing:
 
 
 class _FlintPoly:
+    """A flint ``fmpq_mpoly`` with a back-reference to its :class:`_FlintRing`."""
+
     __slots__ = ("_p", "_ring")
 
     def __init__(self, p: _fmpq_mpoly, ring: _FlintRing) -> None:
@@ -630,35 +637,30 @@ else:
 def clear_ring_caches() -> dict[str, int]:
     """Drop all cached polynomial rings, returning the pre-clear sizes.
 
-    The ring caches (:data:`_FLINT_RING_CACHE`, :data:`_SYMPY_RING_CACHE`)
-    are keyed by generator-name tuple and provide heavy within-build
-    reuse (a single symbolic sample re-requests the same union rings
-    hundreds of times).  But the key space is unbounded across distinct
-    builds: every new cell / degree / frame / derivative-order combination
-    introduces fresh generator names, so a long-lived process that runs
-    many distinct builds accumulates one cached ring (plus its pinned
-    flint context and cached one/zero/gens wrappers) per distinct key.
+    The ring caches :data:`_FLINT_RING_CACHE` and :data:`_SYMPY_RING_CACHE` are
+    keyed by generator-name tuple and give heavy reuse within one build, where
+    the same union rings are re-requested hundreds of times. Their key space is
+    unbounded across builds: each distinct build introduces fresh generator
+    names, so a long-lived process accumulates one cached ring — with its pinned
+    flint context and its cached one, zero, and generator wrappers — per distinct
+    key.
 
-    This function releases that accumulation at a build boundary.  Cached
-    rings are referenced by identity only inside a single build, so
-    clearing between builds is safe: any still-live polynomial keeps its
-    own ring alive via its back-reference, and the next build simply
-    re-populates the cache.  Returns ``{"flint": n, "sympy": m,
-    "flint_ctx": k}`` giving the number of entries dropped (useful for
-    instrumentation).
+    Calling this at a build boundary releases that accumulation. A cached ring is
+    referenced by identity only within a single build, so clearing between builds
+    is safe: any still-live polynomial keeps its own ring alive through its
+    back-reference, and the next build repopulates the cache. The returned mapping
+    ``{"flint": n, "sympy": m, "flint_ctx": k}`` gives the number of entries
+    dropped from each cache.
 
-    ``flint_ctx`` covers python-flint's *own* global context-intern cache
-    (:attr:`fmpq_mpoly_ctx._ctx_cache`).  ``fmpq_mpoly_ctx.get`` interns
-    every context it builds by ``(names, ordering)`` and never evicts.
-    Because :data:`_FLINT_RING_CACHE`'s key space is unbounded across
-    builds (every fresh generator name spawns a fresh context), that
-    intern table grows without bound, and each cached context pins its
-    polynomial arena — the multi-GB live data the IR's per-statement
-    ``SymArray.cells`` once referenced.  Dropping only :data:`_FLINT_RING_CACHE`
-    frees nothing: flint's ``_ctx_cache`` keeps every context (hence every
-    ring and its polys) alive on its own.  We therefore clear it here too.
-    Live polynomials keep their context alive directly, so this stays safe
-    at a build boundary.
+    ``flint_ctx`` covers python-flint's own global context-intern cache,
+    :attr:`fmpq_mpoly_ctx._ctx_cache`. ``fmpq_mpoly_ctx.get`` interns every context
+    it builds under ``(names, ordering)`` and never evicts, so as the ring-cache
+    key space grows without bound that intern table does too, each cached context
+    pinning its polynomial arena. Dropping only :data:`_FLINT_RING_CACHE` would
+    free nothing, because ``_ctx_cache`` keeps every context — and thus every ring
+    and its polynomials — alive on its own; this function clears it as well. Live
+    polynomials keep their context alive directly, so this too is safe at a build
+    boundary.
     """
     sizes = {"flint": len(_FLINT_RING_CACHE), "sympy": len(_SYMPY_RING_CACHE)}
     _FLINT_RING_CACHE.clear()
@@ -678,7 +680,7 @@ def clear_ring_caches() -> dict[str, int]:
 
 
 def coeff_zero(poly: _SympyPoly | _FlintPoly) -> bool:
-    """Structural-zero test for a backend Poly."""
+    """Report whether a backend polynomial is structurally zero."""
     return poly.is_zero
 
 

@@ -1,23 +1,32 @@
 # polyarray
 
-Standalone symbolic-numeric array IR — `Program` / `Stmt` / `SymArray` /
-`RationalFunction` plus all polynomial backends (sympy, native_py,
-native_value, and the Cython C++ `native_cpp` backends) and the
-`analyze` / `partial_eval` IR passes.
+[![CI](https://github.com/wraith1995/polyarray/actions/workflows/ci.yml/badge.svg)](https://github.com/wraith1995/polyarray/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://wraith1995.github.io/polyarray/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.13%2B-blue)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-Extracted faithfully from chartlib's `_symbolic` core; see `VENDORED.md`
-for provenance and the exact (import-path-only) edits. The committed
-public surface is enumerated in `PUBLIC_API.md`.
+A symbolic-numeric array IR. A `Program` is an ordered list of statements over
+`SymArray` values whose cells are exact rational functions, plain floats, or
+references to the output of a deferred op. Computation that stays symbolic lives in
+the cells as rational functions; computation deferred to a numeric or opaque
+operation becomes a statement — so one program expresses symbolic and numeric work
+together. A program executes as plain Python, and the same IR renders back to NumPy
+source or compiles to a batched PyTorch kernel.
+
+- **Docs:** <https://wraith1995.github.io/polyarray/>
+- **Public API:** <https://wraith1995.github.io/polyarray/public_api.html>
+- **Docstring style:** <https://wraith1995.github.io/polyarray/docstring_style.html>
 
 ## Install
 
 ```sh
-pip install -e .            # pure-Python backends work immediately
+pip install -e .            # the pure-Python backends work immediately
 make cython                 # optional: build the native_cpp .so backends in place
 ```
 
-`python-flint` (optional, `pip install -e '.[flint]'`) enables the fast
-exact-rational `flint` backend, auto-detected at import.
+`python-flint` (optional, `pip install -e '.[flint]'`) enables the fast exact-rational
+`flint` backend, which is auto-detected at import and falls back to `sympy` when absent.
 
 ## Use
 
@@ -28,4 +37,19 @@ from polyarray import Program, SymInput, Provenance
 prog = Program("m", inputs=[SymInput("A", (2, 2), Provenance("vertex", "A", (), "A"))])
 prog.add_output("det", prog.input("A").det().cells)
 prog.run({"A": np.eye(2)})   # -> {"det": array(1.0)}
+```
+
+The polynomial ring behind a `RationalFunction` has four implementations — `sympy`,
+`flint`, the pure-Python `native_py`, and the Cython/C++ `native_cpp` — selected at
+import by the `CHARTLIB_POLY_BACKEND` environment variable, defaulting to `flint` when
+python-flint is installed and `sympy` otherwise.
+
+## Development
+
+```sh
+pip install -e ".[dev]"     # tests, ruff, mypy
+pytest                      # run the suite (parallel by default)
+ruff check src              # docstring + annotation lint
+mypy                        # static types
+pip install -e ".[docs]" && sphinx-build -W -b html docs/source docs/build/html   # build the docs
 ```

@@ -1,22 +1,22 @@
-"""`SimplifyBudget` — the post-build control surface for the `simplify` pass.
+"""The post-build control surface for the ``simplify`` pass.
 
-Where ``simplify.specialize`` runs the *unconditional floor* (numeric folding +
-dead-stmt elimination), this module adds
-the **discretionary band**: a frozen :class:`SimplifyBudget` policy and a
-post-pass :func:`_apply_budget` that moderates how far the residual *symbolic*
-structure is collapsed (toward numeric atoms) or kept/exposed (legible symbols).
+Where ``simplify.specialize`` runs the unconditional floor (numeric folding +
+dead-stmt elimination), this module adds the discretionary band: a frozen
+:class:`SimplifyBudget` policy and a post-pass :func:`_apply_budget` that moderates
+how far the residual *symbolic* structure is collapsed (toward numeric atoms) or
+kept/exposed (legible symbols).
 
-Every branch is **exactness-preserving** — collapse / intermediate-extraction
+Every branch is exactness-preserving — collapse and intermediate-extraction
 capture a cell for run-time evaluation via an :class:`IdentityOp` Stmt (the same
 primitive ``forward.partial_eval`` and ``freeze_array`` use), so for all budgets
 ``B`` and inputs ``x``::
 
     specialize(p, budget=B).run(x) == p.run(x)         # form changes, value never does
 
-Structural decisions only (monomial mass / denominator degree / provenance kind)
-— never the numeric *value* of a cell.  The input program is never mutated; we
-operate on the fresh program ``specialize`` already built and only ever append
-fresh capture Stmts / rebuild output cells.
+It moderates only structural decisions (monomial mass / denominator degree /
+provenance kind), never the numeric *value* of a cell. The input program is never
+mutated; the pass operates on the fresh program ``specialize`` already built and
+only ever appends fresh capture Stmts or rebuilds output cells.
 """
 from __future__ import annotations
 
@@ -37,32 +37,37 @@ from .rational import RationalFunction, _total_degree
 class SimplifyBudget:
     """Post-build policy moderating the ``simplify`` collapse <-> expose band.
 
-    Knobs:
+    A frozen policy read by :func:`_apply_budget`. Its knobs sit on a band whose two ends
+    pull the residual symbolic structure opposite ways, with two settings standing outside
+    it::
 
-    * ``max_cell_mass`` — per-cell monomial ceiling.  A symbolic output cell
-      whose ``_cell_size`` mass exceeds this is *collapsed* to a fresh atom via
-      an :class:`IdentityOp` Stmt.  ``None`` disables per-cell collapse;
-      ``0`` collapses every symbolic cell.  This subsumes
-      ``forward.partial_eval``'s ``max_cell_size``.
-    * ``total_mass`` — whole-program ceiling.  If the program's total symbolic
-      output mass exceeds this, the heaviest cells are greedily collapsed until
-      it is under budget (a global complement to the per-cell ceiling).
-    * ``expose`` — re-expansion policy (``"never"`` / ``"if_under_budget"`` /
-      ``"always"``).  The genuine inverse of ``partial_eval`` — re-expanding a
-      deferred *numeric* Stmt back to symbolic — is not implemented, so all
-      three modes do no re-expansion; the two non-default ones are a
-      best-effort no-op rather than an error.  Denominator extraction below is
-      the implemented "expose more symbols" lever.
-    * ``den_degree_max`` — a cell whose *denominator* total degree exceeds this
-      is extracted as a fresh **named intermediate** symbol (clean / capture),
-      exposing a symbol rather than collapsing to a number.
-    * ``keep_provenance`` — never collapse / extract a cell while it still
-      carries a generator of one of these provenance kinds (e.g.
-      ``{"vertex","coeff"}``).  The post-build analogue of "keep the
-      parameterization".
-    * ``inherit_freeze`` — read the source ``Program.budget`` freeze threshold
-      to cap post-processing growth consistently with how the program was built.
-      It never relaxes exactness.
+        collapse  <───────────────────────────────>  expose
+        (toward numeric atoms)             (toward legible symbols)
+        max_cell_mass, total_mass          den_degree_max, expose
+
+        keep_provenance   protects a cell from either end
+        inherit_freeze    ties post-processing growth to how it was built
+
+    On the collapse side, ``max_cell_mass`` is a per-cell monomial ceiling: a symbolic output
+    cell whose ``_cell_size`` mass exceeds it is collapsed to a fresh atom via an
+    :class:`IdentityOp` Stmt, where ``None`` disables per-cell collapse and ``0`` collapses
+    every symbolic cell (subsuming ``forward.partial_eval``'s ``max_cell_size``).
+    ``total_mass`` is the whole-program complement: when the program's total symbolic output
+    mass exceeds it, the heaviest cells are greedily collapsed until it is under budget.
+
+    On the expose side, ``den_degree_max`` extracts a cell whose *denominator* total degree
+    exceeds it as a fresh *named intermediate* symbol (clean / capture), exposing a symbol
+    rather than collapsing to a number. ``expose`` is a re-expansion policy (``"never"`` /
+    ``"if_under_budget"`` / ``"always"``); the genuine inverse of ``partial_eval``,
+    re-expanding a deferred numeric Stmt back to symbolic, is not implemented, so all three
+    modes do no re-expansion and the two non-default ones are a best-effort no-op rather than
+    an error — denominator extraction is the implemented "expose more symbols" lever.
+
+    ``keep_provenance`` stands outside the band: a cell is never collapsed nor extracted while
+    it still carries a generator of one of these provenance kinds (e.g. ``{"vertex", "coeff"}``),
+    the post-build analogue of "keep the parameterization". ``inherit_freeze`` reads the source
+    ``Program.budget`` freeze threshold to cap post-processing growth consistently with how the
+    program was built, and never relaxes exactness.
     """
 
     # --- collapse side (mass ceilings) ---
@@ -244,7 +249,7 @@ def _capture(
 def _apply_budget(program: Program, budget: SimplifyBudget) -> Program:
     """Apply ``budget`` as a post-pass to an already numeric-folded program.
 
-    Operates on the program's **output** cells: the numeric-folded floor is assumed to
+    Operates on the program's output cells: the numeric-folded floor is assumed to
     have already run, so any remaining :class:`RationalFunction` cell is genuinely
     symbolic. Two passes:
 
