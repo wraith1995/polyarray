@@ -33,10 +33,10 @@ class Program:
 @dataclass(frozen=True)
 class SymInput:
     name: str
-    # A shape entry may be a runtime DimAtom (a dynamic input axis, e.g. an
-    # FFS-typed Grassmann input a : Λᵏ). A dynamic SymInput is allocated as a
-    # single bulk SymArray (no per-cell atoms); its DimAtom axes are bound from
-    # the provided array's shape at Program.run time. Static inputs unchanged.
+    # A shape entry may be a runtime DimAtom (a dynamic input axis whose size
+    # is a runtime rank). A dynamic SymInput is allocated as a single bulk
+    # SymArray (no per-cell atoms); its DimAtom axes are bound from the provided
+    # array's shape at Program.run time.
     shape: tuple[int | DimAtom, ...]
     provenance: Provenance | Callable[[tuple[int, ...]], Provenance]
 
@@ -54,12 +54,12 @@ class OutSpec:
     shape: tuple[int | DimAtom, ...] = ()
 
 @dataclass(frozen=True)
-class DimAtom:                   # a runtime array dimension (e.g. SVD rank δ_f)
-    name: str                    # provenance, e.g. "rank:Alt"
+class DimAtom:                   # a runtime array dimension (e.g. an SVD rank)
+    name: str                    # provenance, e.g. "rank:svd"
     # A tagged, hashable tuple identifying the run-time origin (the
     # dim_bindings key):
-    #   ("stmt", stmt_idx, out_idx)  — a prior Stmt output (Stage B)
-    #   ("in",   input_name, axis)   — a dynamic SymInput axis (Stage C)
+    #   ("stmt", stmt_idx, out_idx)  — a prior Stmt output
+    #   ("in",   input_name, axis)   — a dynamic SymInput axis
     # Compat: a bare (stmt_idx, out_idx) 2-tuple is normalised to the
     # ("stmt", ...) form. Build input-axis atoms via DimAtom.from_input.
     source: tuple[Any, ...]
@@ -70,7 +70,7 @@ def is_dynamic(shape: tuple[int | DimAtom, ...]) -> bool
     # True iff any shape entry is a DimAtom (a runtime dimension).  An
     # OutSpec/output with a dynamic shape is always emitted bulk, its axis
     # sizes resolved at Program.run time.  Fully-concrete shapes are not
-    # dynamic, so static-shape programs are byte-identical.
+    # dynamic, so static-shape programs are unaffected.
 
 class SymbolEnv:                 # owned by Program; shared across cells
     ...
@@ -165,7 +165,7 @@ mypy names. `tests/test_op_union.py` checks every one of those mirrors against t
 @dataclass(frozen=True)
 class SvdOp:                     # -> (U, S, Vh, rank); 4-output
     rcond: float | None = None   # rank threshold (np.linalg.matrix_rank rule)
-    full_matrices: bool = False  # rank is the thresholded numerical rank (δ_f)
+    full_matrices: bool = False  # rank is the thresholded numerical rank
 
 @dataclass(frozen=True)
 class GSvdOp:                    # metric-aware GSVD of A:V->W; -> (U, UI, V, VI, S, rank); 6-output
@@ -370,12 +370,12 @@ def bind_inputs(program, bind) -> Program   # = specialize(bind=...)
     # inputs all resolve numeric, dropping it; folds `known` into surviving refs /
     # outputs; descends partially-numeric sub-Program / CallOp bodies.
     # Dynamic dims: a Stmt that CREATES a runtime δ (DimAtom) — SvdOp/GSvdOp/QrOp/
-    # pinv/FFS/… — is folded UNIFORMLY when its inputs are all numeric (a value-
+    # pinv/… — is folded UNIFORMLY when its inputs are all numeric (a value-
     # invariant map with a statically-knowable rank). The δ it creates is resolved
     # from the concrete folded-output shape and SUBSTITUTED (→ concrete int) across
     # every remaining shape (later Stmt outputs, bulk handles, input refs), so no
     # dynamic δ lingers downstream. A δ from a Stmt with a symbolic input is NOT
-    # folded — it survives unchanged (conservative; static path byte-identical).
+    # folded — it survives unchanged (conservative).
 
 def partial_eval_numeric(program: Program, *, probes: int = 3, seed: int = 0,
                          rtol: float = 1e-9, atol: float = 1e-12,
@@ -387,7 +387,7 @@ class NonExactFoldWarning(UserWarning)
 class NonDeterministicFoldWarning(NonExactFoldWarning)
     # Fold every Stmt whose outputs are INVARIANT under the symbolic inputs —
     # strictly stronger than the dataflow fold_numeric: collapses e.g. A·inv(A) ≡ I
-    # and a metric-free grass_dof whose symbolic Jacobian input provably cancels.
+    # and one whose symbolic input provably cancels.
     # The _symarray form also folds the cells (invariant atom -> numeric cell).
     # `mode` selects HOW invariance is certified (default: env
     # POLYARRAY_PARTIAL_EVAL_MODE, else "hybrid"; the parameter always wins):
@@ -536,8 +536,8 @@ supplied by the caller, never imported by polyarray):
 - `numpy_source.to_numpy_source(program, func_name="f", op_renderers=None)` —
   a standalone numpy `.py` source string. The emitted function takes one
   parameter per program input, one per `IntAtom`, and one per **free feed atom**
-  (a cell generator bound by neither an input nor a statement output — savo's
-  per-cell vertex atoms in a mid-pipeline program are the case; appended last in
+  (a cell generator bound by neither an input nor a statement output — for
+  example per-cell vertex atoms in a mid-pipeline program; appended last in
   sorted generator-name order, and threaded into sub-`Program`/`vmap` bodies that
   are open over them). Front-end Stmt ops emit via a `__numpy_source__(self,
   args) -> str` hook on the op class — the same shape as pyab's
@@ -556,7 +556,7 @@ supplied by the caller, never imported by polyarray):
   `SmallQrOpts(max_dim=4)` intercepts small fixed-size `QrOp` as unrolled scalar
   Householder QR (LAPACK sign convention) instead of a `linalg.qr` call. The
   full op vocabulary lowers, including `SvdOp`/`GSvdOp` (composite cholesky/svd/
-  solve + FFS split — the data-dependent rank runs eager, i.e. a `@torch.compile`
+  solve + rank split — the data-dependent rank runs eager, i.e. a `@torch.compile`
   fusion boundary, not a hard failure), `WhileOp` (→ `torch.while_loop`, cond/body
   must be sub-Programs) and nested (multi-var) `vmap` (→ nested `torch.vmap`). A
   `Program` op with no lowering raises `NotImplementedError` (extend via

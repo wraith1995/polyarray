@@ -3,8 +3,7 @@
 # cython: wraparound=False
 # cython: cdivision=True
 # cython: initializedcheck=False
-"""Cython native polynomial backend — mpf instantiation
-(Track B of ``plans/archive/poly_native_backend.md`` §3, B3 slice).
+"""Cython native polynomial backend — mpf instantiation.
 
 Coefficients are stored as a Python list of :class:`mpmath.mpf`
 objects.  C arithmetic can't apply to coefficients (mpmath ops dispatch
@@ -17,7 +16,7 @@ to Python callbacks), so the Cython win here is limited to:
 
 The double engine is duplicated rather than parameterised because
 Cython fused types don't compose well with ``cdef class`` methods
-(plan §3.2 rationale).
+rationale.
 """
 from __future__ import annotations
 

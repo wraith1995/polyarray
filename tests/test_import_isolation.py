@@ -1,4 +1,4 @@
-"""Import isolation: polyarray must not pull in chartlib (plan §7)."""
+"""Import isolation: polyarray must not pull in chartlib."""
 from __future__ import annotations
 
 import sys

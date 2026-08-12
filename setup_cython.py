@@ -1,5 +1,5 @@
 """Standalone Cython build script for the ``native_cpp`` polynomial
-backend (Track B of ``plans/poly_native_backend.md``).
+backend.
 
 Intentionally separate from ``pyproject.toml``'s build-backend
 (``uv_build``) so the pure-Python install path stays simple.  Invoke
