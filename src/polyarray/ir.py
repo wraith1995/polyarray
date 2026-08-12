@@ -1,26 +1,37 @@
-"""Imperative IR: descriptors, registry, ``SymArray``, ``Program``, ``Stmt``, ``Ref``.
+"""The imperative IR: programs of statements over symbolic-numeric arrays.
 
-This module is the single home for everything program-scoped in the
-symbolic interpreter:
+A :class:`Program` is an ordered list of imperative :class:`Stmt` statements over
+:class:`SymArray` values, with named :class:`SymInput` inputs and named outputs::
 
-Metadata / registry
-    :class:`Provenance`, :class:`SymInput`, :class:`SymbolEnv`,
-    :func:`allocate_input`, :func:`cells_sparsity`.  Value-free
-    descriptors plus the global generator-name table.
+    Program
+      ├─ inputs   named SymInputs
+      ├─ body     an ordered list of Stmts,  each  fn(Ref, …) → SymArray, …
+      └─ outputs  named SymArrays
 
-Live values
-    :class:`SymArray` — wraps an ``ndarray`` of
-    ``RationalFunction | float`` cells plus a back-reference to its
-    owning :class:`Program`.  Quacks like a numpy ndarray for read
-    access; knows how to extend its program by emitting a :class:`Stmt`.
-    It is the single value type: a live symbolic array is always a
-    :class:`SymArray`.
+    SymArray  =  a numpy array of cells  |  a single bulk tensor
+      cell    =  RationalFunction (exact)  |  float (numeric)  |  Ref (a prior output)
 
-IR structure
-    :class:`InputRef`, :class:`OutputRef`, :class:`Const`,
-    :class:`RationalRef`, :class:`Ref`, :class:`Stmt`,
-    :class:`Program`.  The :meth:`Program.run` plain-Python evaluator
-    plus :meth:`Program.copy` for sub-interpreter spawning.
+A :class:`SymArray` is the one value type, and it takes one of two forms. Usually
+it is a numpy array of cells, where each cell is an exact
+:class:`~polyarray.rational.RationalFunction`, a plain float, or a :class:`Ref`
+that names the output of an earlier statement. Otherwise it is a single *bulk*
+tensor: the whole output of one statement, held undivided so that it costs one
+run-time binding rather than a rational function and a ring for every cell.
+
+These two forms carry two lanes in one program. Computation that stays symbolic
+lives in the cells as exact rational functions, while computation deferred to a
+numeric or opaque operation becomes a :class:`Stmt` whose result the consuming
+cells name through a :class:`Ref`. A single :class:`Program` therefore expresses
+symbolic and numeric work together.
+
+Every :class:`SymArray` also carries a reference to its owning program, so an
+operation on it — a matmul, a determinant, an einsum — extends that program in
+place, rewriting cells where the result is closed-form and appending a
+:class:`Stmt` where it is not. :class:`SymbolEnv` is the program's registry of
+generator names, and :class:`Provenance` records where each generator originates.
+
+A program runs as plain Python: :meth:`Program.run` binds the inputs by name,
+evaluates the statements in order, and returns the named outputs as numpy arrays.
 """
 from __future__ import annotations
 
@@ -508,23 +519,23 @@ class RationalRef:
 
 @dataclass(frozen=True)
 class BulkOut:
-    """Handle for a :class:`Stmt` output kept as one whole numeric tensor.
+    """Handle for a :class:`Stmt` output carried as one whole tensor.
 
-    A *bulk* output is NOT scattered into per-cell atom RationalFunctions:
-    at :meth:`Program.run` time the producing Stmt's numeric result is
-    bound under a single name, and the owning :class:`SymArray` evaluates
-    to that whole tensor directly.  This avoids minting one RF + one ring
-    per cell for tensors that are only consumed in bulk (terminal outputs,
-    or anything not dissected per-cell).
+    A *bulk* output stays a single numeric tensor: at :meth:`Program.run` time
+    the producing statement's result is bound under one name, and the owning
+    :class:`SymArray` evaluates directly to that tensor. One name and one binding
+    stand in for the rational function and ring that a per-cell output mints for
+    every cell, which is the right form for a tensor consumed whole — a terminal
+    output, or any array read as a block rather than cell by cell.
 
-    A consumer that needs per-cell symbolic structure (an einsum / rational
-    arithmetic) calls :func:`unpack`, which emits an unpack Stmt converting
-    the bulk tensor into the usual per-cell atom array.
+    To read per-cell symbolic structure from it — for an einsum or rational
+    arithmetic — a consumer calls :func:`unpack`, which appends a statement that
+    expands the bulk tensor into the usual per-cell array of atom rational
+    functions.
 
-    ``name`` is the run-time binding key; ``shape`` is the tensor shape.
-    For a *dynamic* bulk output ``shape`` may carry
-    :class:`DimAtom` entries (the symbolic shape); the concrete axis sizes
-    are resolved at :meth:`Program.run` time.
+    ``name`` is the run-time binding key and ``shape`` is the tensor shape; for a
+    *dynamic* bulk output ``shape`` may contain :class:`DimAtom` entries whose
+    concrete axis sizes are resolved at :meth:`Program.run` time.
     """
 
     name: str
@@ -2530,8 +2541,9 @@ StmtFn: TypeAlias = Union[
     IdentityOp, AssertOp, SwitchOp, CallOp, WhileOp,
 ]
 
-#: The same vocabulary as a runtime ``isinstance`` tuple — derived from :data:`StmtFn`,
-#: so the two can never drift.
+#: The op classes named by :data:`StmtFn`, collected into a tuple for
+#: :func:`isinstance` checks. It is computed from the union, so it lists exactly
+#: those classes and no others.
 STMT_FN_OPS: tuple[type, ...] = get_args(StmtFn)
 
 #: Everything a :attr:`Stmt.fn` may hold: one of polyarray's own ops, a nested
