@@ -1,4 +1,4 @@
-"""Golden programs built by hand and executed via ``Program.run`` (plan §7).
+"""Golden programs built by hand and executed via ``Program.run``.
 
 Each test constructs a small :class:`Program` directly (no sampler /
 interpreter) and asserts ``program.run`` matches an independent

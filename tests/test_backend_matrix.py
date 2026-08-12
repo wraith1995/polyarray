@@ -1,5 +1,5 @@
 """Backend matrix: run a representative golden program under each
-available poly backend and assert matching results (plan §6/§7).
+available poly backend and assert matching results.
 
 The backend is fixed at *import time* of ``polyarray.poly_backend`` from
 the ``CHARTLIB_POLY_BACKEND`` / ``CHARTLIB_POLY_COEFF`` environment

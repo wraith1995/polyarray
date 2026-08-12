@@ -3,8 +3,7 @@
 # cython: wraparound=False
 # cython: cdivision=True
 # cython: initializedcheck=False
-"""Cython native polynomial backend — double instantiation
-(Track B of ``plans/archive/poly_native_backend.md`` §3).
+"""Cython native polynomial backend — double instantiation.
 
 Storage: two parallel numpy arrays per polynomial — ``_exps`` of shape
 ``(T, G)`` int32 holding term exponents, ``_coeffs`` of shape ``(T,)``
@@ -17,7 +16,7 @@ boundary methods (``cancel``, ``as_expr``, ``terms``/``monoms``) stay
 in Python-readable Cython for clarity.
 
 Slice B1 only ships ``double``; ``mpf`` and ``quad`` are separate
-``.pyx`` modules per the plan §3.2.
+``.pyx`` modules.
 """
 from __future__ import annotations
 
@@ -360,7 +359,7 @@ cdef class CppPoly_double:
                 return q, ring._one
             return self, o
 
-        # Case C: heavier — safety net (per plan §1.5).
+        # Case C: heavier — safety net.
         return self, o
 
     def as_expr(self):

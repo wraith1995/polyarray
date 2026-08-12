@@ -95,7 +95,7 @@ archs = ["x86_64", "aarch64"]
 [tool.cibuildwheel.macos]
 archs = ["arm64", "x86_64"]
 
-# mypy — chartLib's config is the model (fem CLAUDE.md rule 3); run: .venv/bin/mypy
+# mypy — run: .venv/bin/mypy
 [tool.mypy]
 python_version = "3.13"
 files = ["src"]
