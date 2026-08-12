@@ -61,7 +61,6 @@ contract — additions need it updated).
 
 `src/polyarray/`: `ir.py` (Program/SymArray/Stmt/ops/SymbolicBudget), `rational.py`,
 `simplify.py`, `forward.py`, `sparsity.py`, `budget.py`, `numpy_source.py`,
-`poly_backend.py` + native backends. Design docs: `plans/00-simplify-design.md`
-(Numeric ⊏ Symbolic ⊏ Opaque lattice), `plans/01-budget-moderated-simplification.md`.
+`poly_backend.py` + native backends.
 Tests: `pytest -n auto` in this repo's `.venv`. mypy: configured in pyproject (chartLib-model flags); baseline 52 errors (2026-07-03) — shrink, don't grow. Audit: `python3 savo/audit/workspace/run_audits.py
 --repos polyarray` (from `fem/`; adjust if top-level checkout).
