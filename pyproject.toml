@@ -1,20 +1,35 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "Cython>=3.0", "numpy>=2.0"]
+requires = ["setuptools>=77", "wheel", "Cython>=3.0", "numpy>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "polyarray"
 version = "0.1.0"
-description = "Standalone symbolic-numeric array IR (Program/Stmt/SymArray/RationalFunction + poly backends), extracted from chartlib."
+description = "A symbolic-numeric array IR: Program/Stmt/SymArray/RationalFunction over pluggable polynomial backends."
 readme = "README.md"
 requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Thea Collin", email = "teoc@mit.edu" },
+]
+keywords = ["symbolic", "numeric", "polynomial", "rational-function", "ir", "computer-algebra", "tensor"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Typing :: Typed",
 ]
 dependencies = [
     "numpy>=2.0",
     "sympy>=1.13",
 ]
+
+[project.urls]
+Repository = "https://github.com/wraith1995/polyarray"
+Documentation = "https://wraith1995.github.io/polyarray/"
 
 [project.optional-dependencies]
 # python-flint enables the fast exact-rational "flint" backend; it is
@@ -26,6 +41,12 @@ dev = [
     "pytest-xdist>=3.5",
     "pytest-timeout>=2.1",
     "mypy>=1.13",
+    "ruff>=0.6",
+]
+docs = [
+    "sphinx>=8.0",
+    "numpydoc>=1.8",
+    "alabaster>=1.0",
 ]
 
 [tool.pytest.ini_options]
