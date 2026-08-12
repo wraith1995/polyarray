@@ -87,24 +87,40 @@ determinant stayed symbolic. The same measurement primitives back the
    >>> analyze(prog).n_defer
    0
 
-Exploiting structure: a symbolic inverse
-----------------------------------------
+Discovering sparsity
+--------------------
 
-``symbolic_inverse`` is the sparsity-aware inverse. Given a matrix that is
-structurally block-triangular, it inverts block by block with a Schur procedure,
-so the result is a small rational function in each cell and the zero block is
-preserved rather than filled in. Here the matrix is a symbolic input with its
-top-right entry marked a structural zero by ``mask_zeros`` -- the same sparsity
-the inverse then exploits.
+polyarray reads the structural-zero pattern of a matrix -- the cells it can
+prove are zero -- rather than being told where they are. Here a symbolic input
+is restricted to its lower triangle (a Hadamard product with a lower-triangular
+pattern of ones and zeros), so the entries above the diagonal become exact
+zeros. ``sound_sparsity_mask`` recovers that pattern: a ``0`` entry is a cell
+proved zero.
 
 .. doctest::
 
    >>> import numpy as np
-   >>> from polyarray import Program, SymInput, Provenance, mask_zeros, symbolic_inverse
+   >>> from polyarray import Program, SymInput, Provenance, sound_sparsity_mask
    >>> prog = Program("m", inputs=[SymInput("A", (2, 2), Provenance("vertex", "A", (), "A"))])
-   >>> mask = np.array([[True, False], [True, True]])   # the top-right entry is zero
-   >>> tri = mask_zeros(prog.input("A"), mask)
-   >>> inv = symbolic_inverse(tri)
+   >>> lower = np.tril(np.ones((2, 2)))                 # keep the lower triangle
+   >>> tri = prog.input("A").einsum("ij,ij->ij", lower)
+   >>> tri.cells[0, 1]                                  # the dropped entry is an exact zero
+   RationalFunction(0)
+   >>> sound_sparsity_mask(tri).astype(int).tolist()
+   [[1, 0], [1, 1]]
+
+Exploiting structure: a symbolic inverse
+----------------------------------------
+
+``symbolic_inverse`` is the sparsity-aware inverse. It resolves that same
+structural-zero pattern itself -- no mask is supplied -- and inverts the matrix
+block by block with a Schur procedure, so each cell is a small rational function
+and the zero above the diagonal is preserved rather than filled in.
+
+.. doctest::
+
+   >>> from polyarray import symbolic_inverse
+   >>> inv = symbolic_inverse(tri)          # reuses ``tri`` from above; no mask
    >>> print(inv.cells[0, 0])
    1/A_0_0
    >>> print(inv.cells[0, 1])
