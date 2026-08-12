@@ -26,9 +26,11 @@ are the template.
    where the result is closed-form and appending a `Stmt` where it is not,"
    not "IR structure: `Stmt`, `Program`."
 
-6. **A small diagram where it helps.** When a structure is easier shown than
-   told — a module overview, a containment, a pipeline — a short ASCII diagram in
-   a `::` literal block earns its space.
+6. **Reach for a diagram.** Whenever the thing being described has a natural
+   spatial or relational shape — a containment, a pipeline, a layout, a state
+   machine, a before/after — add a short ASCII diagram in a `::` literal block.
+   Default to including one when it fits the context; showing the shape beats
+   spelling it out in a paragraph.
 
 7. **Present tense, current behavior only.** No history, migration, roadmap, or
    provenance: no "used to", "replaces the former", "byte-identical", no plan /
