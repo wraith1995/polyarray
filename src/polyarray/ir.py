@@ -339,13 +339,13 @@ class SymbolicBudget:
       multi-operand symbolic einsum offloads to a numeric Stmt. ``None`` selects the
       module ``CHARTLIB_EINSUM_BAG_THRESHOLD`` default of 64, the env-aware
       behaviour; budget zero sets it huge so the einsum never offloads.
-    * ``defer_phi_jet``, when True, offloads the single-operand derivative-expansion
-      einsum (``runtime_einsum``) — its object-dtype LHS goes to a numeric Stmt.
-      False keeps the contraction symbolic, so the parameterization built from the
+    * ``defer_phi_jet``, when True, offloads the single-operand einsum
+      (``runtime_einsum``) — its object-dtype LHS goes to a numeric Stmt.
+      False keeps the contraction symbolic, so the symbolic expression built from the
       input atoms comes through.
-    * ``defer_covariant``, when True, collapses the order-≥1 derivative chain into one
-      numeric Stmt. False keeps it symbolic, which is heavier because of the
-      high-order blow-up, so it is opt-in even at budget zero
+    * ``defer_covariant``, when True, collapses a chain of deferred contractions into
+      one numeric Stmt. False keeps it symbolic, which is heavier because that chain
+      grows quickly in high dimensions, so it is opt-in even at budget zero
       (``build_big_symbols(retain_covariant=...)``).
     * ``freeze``, when True, lets :func:`freeze_array` cap cell complexity by
       capturing big cells as fresh atoms. False disables that and retains the cells.
@@ -406,12 +406,13 @@ class SymbolicBudget:
 
         It turns off the single-operand offload, raises the multi-operand einsum
         threshold so contractions stay symbolic, and disables :func:`freeze_array`, so
-        the parameterization built from the input atoms comes through as big symbols
+        the symbolic expression built from the input atoms comes through as big symbols
         rather than numeric Stmts.
 
-        ``retain_covariant`` (default False) additionally keeps the order-≥1
-        derivative chain symbolic. It is not needed merely to see the
-        parameterization, and it invites the 3-D high-order blow-up, so it is opt-in.
+        ``retain_covariant`` (default False) additionally keeps the deferred
+        contraction chain symbolic. It is not needed merely to surface the symbolic
+        expression, and it invites high-order growth in operand size on 3-D cells, so
+        it is opt-in.
         ``surface_frame`` defaults to track ``retain_covariant``, surfacing the frame
         only when the derivative chain is retained. Any extra ``overrides`` are
         forwarded to the constructor.
@@ -599,7 +600,7 @@ class DimAtom:
     making that shape *dynamic*: the axis size is resolved at run time from
     the bound value of its source.
 
-    * ``name`` — provenance, e.g. ``"rank:Alt"``.
+    * ``name`` — provenance, e.g. ``"rank:svd"``.
     * ``source`` — a *tagged* hashable tuple identifying the run-time origin
       of the dimension and used as the ``dim_bindings`` key:
 
@@ -1432,18 +1433,24 @@ class GSvdOp:
     factors are the horizontal concatenations ``[U, UI]`` and ``[V, VI]``.
 
     **Construction.**  Whiten ``A`` by the Cholesky factors of the two
-    metrics (``M_W = Lw Lwᵀ``, ``M_V = Rw Rwᵀ``)::
+    metrics (``M_W = Lw Lwᵀ``, ``M_V = Rw Rwᵀ``):
+
+    .. code-block:: text
 
         Aw = Lwᵀ · A · Rw⁻ᵀ            # both spaces now orthonormal
         Ũ, S, Ṽᵀ = svd(Aw)            # ordinary SVD in white coords
 
-    then de-whiten the factors back into the metrics::
+    then de-whiten the factors back into the metrics:
+
+    .. code-block:: text
 
         [U|UI] = Lw⁻ᵀ · Ũ             # ⇒ ([U|UI])ᵀ M_W ([U|UI]) = I
         [V|VI] = Rw⁻ᵀ · Ṽ             # ⇒ ([V|VI])ᵀ M_V ([V|VI]) = I
 
     **Reconstruction identity** (note the trailing ``M_V`` — the dual
-    pairing makes the coordinates contravariant)::
+    pairing makes the coordinates contravariant):
+
+    .. code-block:: text
 
         A = U · diag(S[:rank]) · Vᵀ · M_V
           = [U|UI] · Sfull · [V|VI]ᵀ · M_V        # full form
@@ -1644,7 +1651,7 @@ class DynZerosOp:
 
 @dataclass(frozen=True)
 class DynEyeTensorOp:
-    """The vmap identity of a multi-axis dimension binder, a matrix or tensor seed.
+    """It builds the vmap identity of a multi-axis dimension binder as a matrix or tensor seed.
 
     Emits ``np.eye(∏dᵢ).reshape(∏dᵢ, d₀, d₁, …)``, with each ``dᵢ`` read from
     ``refs[i].shape[axes[i]]``.
@@ -1755,7 +1762,7 @@ class HStackOp:
 
 @dataclass(frozen=True)
 class ColStackOp:
-    """Stack 1-D coordinate vectors as the columns of a matrix (the ``ListBasis`` matrix)."""
+    """Stack 1-D coordinate vectors as the columns of a matrix."""
 
     def __call__(self, *cols: np.ndarray) -> np.ndarray:
         """Evaluate the op on concrete numeric operands."""
@@ -1881,7 +1888,7 @@ class LastColsOp:
 class ProjectOp:
     """``Pᵀ @ v`` — project ambient coords onto the orthonormal sub-basis (drop comp).
 
-    ``v`` may be a multi-axis ambient tensor (e.g. ``V⊗ᵏ`` stored ``(n,…,n)``); it is
+    ``v`` may be a multi-axis ambient tensor ``(n, …, n)``; it is
     raveled to the ambient (column) coordinate before the projection.
     """
 
@@ -1895,7 +1902,7 @@ class EmbedOp:
     """``P @ vsub`` — pad sub-coords into the ambient (zeros in the complement).
 
     The ambient result is reshaped to the ambient space's multi-axis layout
-    (``shape``), e.g. ``V⊗ᵏ`` ⇒ ``(n,…,n)``.
+    (``shape``), a multi-axis ambient tensor ``(n, …, n)``.
     """
 
     shape: tuple[int, ...] = ()
@@ -3129,7 +3136,9 @@ def _stmt_out_label(prefix: str, out_name: str, idx: tuple[int, ...]) -> str:
 
 @dataclass
 class Stmt:
-    """An imperative IR statement: a call whose returns become named SymArrays::
+    """An imperative IR statement: a call whose returns become named SymArrays.
+
+    Its shape is::
 
         in_ (Refs)  ->  fn(...)  ->  out (SymArrays of fresh atom RFs)
 
@@ -3915,9 +3924,9 @@ def vmap(
     ``in_axes`` and ``out_axes`` may be a single int (broadcast to
     every input / output) or a per-input / per-output tuple.  An
     in-axis entry of ``None`` means "broadcast as-is" — the same
-    array is fed to every iteration without slicing (used to share a
-    static input like vertex coordinates across all M points while
-    only ξ varies).  If ``body`` has exactly one output, the callable
+    array is fed to every iteration without slicing (used to share one
+    static operand across all M rows while only the batched operand
+    varies).  If ``body`` has exactly one output, the callable
     returns a bare ndarray; otherwise it returns a tuple in
     body-output insertion order.
     """

@@ -23,7 +23,7 @@ makes a constant-input chain — an SVD/QR/pinv fed by a constant matrix — deg
 Two ops carry richer handling than a flat category. ``DetOp`` is a polynomial of its
 entries, so an ``(n, n)`` operand of degree ``d`` gives degree ``≤ n·d`` (a sum of n-fold
 entry products), falling back to ``inf`` on an unknown or dynamic operand shape. ``CallOp``
-is not opaque: its vmap/llam wrapper body Program is unwrapped
+is not opaque: its vmap wrapper body Program is unwrapped
 (:func:`polyarray.forward._body_of`) and recursed into, seeding its inputs by position.
 Anything else on a seed-dependent operand is ``inf`` (Inv/Pinv/Solve/Sqrt/Svd/…, genuinely
 rational or algebraic in the operand).

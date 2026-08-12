@@ -1,22 +1,22 @@
-"""`SimplifyBudget` — the post-build control surface for the `simplify` pass.
+"""The post-build control surface for the ``simplify`` pass.
 
-Where ``simplify.specialize`` runs the *unconditional floor* (numeric folding +
-dead-stmt elimination), this module adds
-the **discretionary band**: a frozen :class:`SimplifyBudget` policy and a
-post-pass :func:`_apply_budget` that moderates how far the residual *symbolic*
-structure is collapsed (toward numeric atoms) or kept/exposed (legible symbols).
+Where ``simplify.specialize`` runs the unconditional floor (numeric folding +
+dead-stmt elimination), this module adds the discretionary band: a frozen
+:class:`SimplifyBudget` policy and a post-pass :func:`_apply_budget` that moderates
+how far the residual *symbolic* structure is collapsed (toward numeric atoms) or
+kept/exposed (legible symbols).
 
-Every branch is **exactness-preserving** — collapse / intermediate-extraction
+Every branch is exactness-preserving — collapse and intermediate-extraction
 capture a cell for run-time evaluation via an :class:`IdentityOp` Stmt (the same
 primitive ``forward.partial_eval`` and ``freeze_array`` use), so for all budgets
 ``B`` and inputs ``x``::
 
     specialize(p, budget=B).run(x) == p.run(x)         # form changes, value never does
 
-Structural decisions only (monomial mass / denominator degree / provenance kind)
-— never the numeric *value* of a cell.  The input program is never mutated; we
-operate on the fresh program ``specialize`` already built and only ever append
-fresh capture Stmts / rebuild output cells.
+It moderates only structural decisions (monomial mass / denominator degree /
+provenance kind), never the numeric *value* of a cell. The input program is never
+mutated; the pass operates on the fresh program ``specialize`` already built and
+only ever appends fresh capture Stmts or rebuilds output cells.
 """
 from __future__ import annotations
 
@@ -249,7 +249,7 @@ def _capture(
 def _apply_budget(program: Program, budget: SimplifyBudget) -> Program:
     """Apply ``budget`` as a post-pass to an already numeric-folded program.
 
-    Operates on the program's **output** cells: the numeric-folded floor is assumed to
+    Operates on the program's output cells: the numeric-folded floor is assumed to
     have already run, so any remaining :class:`RationalFunction` cell is genuinely
     symbolic. Two passes:
 

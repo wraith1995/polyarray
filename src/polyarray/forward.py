@@ -95,7 +95,7 @@ def iter_programs(top: Program) -> list[Program]:
 
 @dataclass(frozen=True)
 class ProgramRow:
-    """Per-program slice of an :class:`IRReport`."""
+    """Per-program row of an :class:`IRReport`."""
 
     name: str
     n_stmts: int

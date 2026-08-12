@@ -16,9 +16,8 @@ implementations:
 
 * ``sympy`` — :class:`sympy.polys.rings.PolyElement` over :data:`sympy.RR`
   (53-bit mpmath floats).
-* ``flint`` — :class:`flint.fmpq_mpoly` over exact rationals, roughly 210× faster at
-  multivariate multiplication and 30× faster at ring construction on realistic generator
-  counts.
+* ``flint`` — :class:`flint.fmpq_mpoly` carrying exact rationals and substantially faster
+  at multivariate multiplication and ring construction.
 
 The backend is chosen at import time by ``CHARTLIB_POLY_BACKEND={sympy,flint}``, and
 when that is unset it is ``flint`` if python-flint is installed and ``sympy`` otherwise.
@@ -784,8 +783,8 @@ class RationalFunction:
     def clean(self, tol: float = 0.0) -> RationalFunction:
         """Cancel common factors of numerator and denominator.
 
-        ``tol`` is reserved for a future numeric-zeroing pass and today only short-circuits
-        no-op calls. The cancellation uses the backend's ``cancel`` — ``PolyElement.cancel``
+        ``tol`` currently only short-circuits no-op calls. The cancellation uses the
+        backend's ``cancel`` — ``PolyElement.cancel``
         on sympy, gcd-based exact division on flint — which suffices to drop a common gcd,
         never :func:`sympy.simplify`. This is a boundary operation and must not run in inner
         loops.

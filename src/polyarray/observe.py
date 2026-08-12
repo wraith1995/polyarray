@@ -20,7 +20,7 @@ Every number comes from the analysis polyarray already owns
 
 This lives in polyarray because polyarray owns those primitives and the pyab→torch dump
 hand-off, and because polyarray is a dependency of every layer that wants to be observed, so
-instrumentation never inverts the stack. The lower algebra and geometry layers are deliberately
+instrumentation never inverts the stack. The layers below polyarray are deliberately
 uninstrumented and must not import this module.
 
 The level is read from ``FEM_OBSERVE`` (default ``warn``), and each level adds to the one below
@@ -326,7 +326,7 @@ def _one(_name: str) -> int:
 
 
 def _degree_of(program: Program, seed: Mapping[str, float] | None) -> float | None:
-    """The polynomial degree of ``program``'s outputs, measured in its symbolic atoms.
+    """Return the polynomial degree of ``program``'s outputs, measured in its symbolic atoms.
 
     The default scores every declared input AND every stray generator as degree 1, which makes
     the number a consistent monotone signal across stages without this module needing any
@@ -556,11 +556,10 @@ def _analyze(program: Program) -> IRReport:
 class Snapshot:
     """One observed stage: what it was, what it produced, and how long it took.
 
-    A stage that runs inside a loop is rolled up. ``single_compile`` runs once per enumerated
-    match, so its ``sample`` and ``represent`` boundaries fire hundreds of times in one assembly;
+    A stage that runs inside a loop is rolled up. Such a stage fires many times in one run, and
     every recording of the same stage name at the same depth accumulates into this one Snapshot
-    rather than appending a new row. Without that, a large compile would produce an 800-row table
-    and 800 dump directories, which is a log flood rather than observability.
+    rather than appending a new row. Without that roll-up the report would carry one row and one
+    dump directory per occurrence, which is a log flood rather than observability.
 
     Under roll-up, :attr:`m` is the measurement of the largest measured occurrence, the one that
     matters for a blow-up; :attr:`elapsed_s` is cumulative over every occurrence; :attr:`count` is
@@ -746,8 +745,8 @@ class CompileTrace:
         """Whether the ``occurrence``-th run of a stage gets measured, or only counted and timed.
 
         Measuring is O(program size) — a full ``forward.analyze`` plus a degree walk — and the
-        instrumented boundaries sit inside hot loops. A high-degree element calls ``bind-field``
-        about 1000 times, each against a program that has grown since the last call, so the
+        instrumented boundaries sit inside hot loops. A hot loop can re-measure a growing program
+        many times, each pass against a larger program than the last, so the
         analysis cache cannot help and measuring every occurrence would make the default level far
         slower than no instrumentation at all.
 

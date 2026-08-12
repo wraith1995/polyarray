@@ -1,10 +1,12 @@
-"""``symbolic_inverse`` — the recursive block-triangular Schur inverse of a :class:`SymArray`.
+"""``symbolic_inverse`` computes the recursive block-triangular Schur inverse of a :class:`SymArray`.
 
 The dense :meth:`SymArray.inverse` (cofactor ≤ ``naive_inverse_max_size``, else a numeric ``InvOp`` Stmt)
 blows up on a *structurally sparse* symbolic matrix — a 6×6 whose off-diagonal block is structurally zero
 still pays the 720-term cofactor determinant, and a larger one falls to a numeric Stmt instead of a
 ``RationalFunction`` inverse. This module exploits the sparsity: when the matrix is (after a row reordering)
-block lower-triangular, the Schur recursion::
+block lower-triangular, the Schur recursion
+
+.. code-block:: text
 
     [A 0; C D]⁻¹ = [A⁻¹ 0; −D⁻¹·C·A⁻¹  D⁻¹]
 
@@ -630,7 +632,7 @@ def symbolic_inverse(matrix: SymArray | np.ndarray, *, mask: np.ndarray | None =
     makes the split less aggressive, never wrong.
 
     ``program`` is the shared ``Program`` the block-triangular inverse is grounded onto, so that a symbolic
-    inverse lowers through a value kernel compiled from that shared program rather than leaving Stmts
+    inverse lowers as part of the kernel compiled from that shared program rather than leaving Stmts
     stranded on an ephemeral by-product program. When ``matrix`` already rides ``program`` (or ``program``
     is ``None``, or ``matrix`` is numeric / program-less) this is a no-op and the Stmts emit into
     ``matrix``'s own program. Otherwise the block-split mask is resolved on ``matrix``'s own program first —

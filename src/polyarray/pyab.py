@@ -855,7 +855,7 @@ def _helper_fingerprint(core: ModuleType, params: tuple[PyExprs, ...],
 #: A fingerprint exists only to intern a helper, so — exactly as with the ``RecursionError`` guard
 #: above — it must never be the thing that makes a compile fail or hang. That guard bounds depth;
 #: this one bounds size. A helper whose body fits the budget fingerprints in milliseconds, while one
-#: an order of magnitude past it takes minutes and gigabytes, which is a hang, not a slow path.
+#: well past it grows superlinearly into an effective hang, not a slow path.
 #: Refusing costs a duplicate helper; not refusing costs the build.
 _FP_MAX_NODES = 2_000_000
 
@@ -1059,7 +1059,7 @@ class _Lowerer:
         """Bind one statement output, either as a stacked tensor Var or as a scalar grid.
 
         A plain payload binds to one stacked tensor ``Var``; a :class:`_ScalarGrid` payload
-        binds to a grid of per-cell scalar ``Var``s with no tensor buffer.
+        binds to a grid of per-cell scalar Vars with no tensor buffer.
         """
         if isinstance(payload, _ScalarGrid):
             self._bind_grid(stmt_idx, out_idx, bound, payload.grid, base)
@@ -2802,7 +2802,7 @@ def as_function_def(
     name: str = "f",
     opts: LowerOpts | None = None,
 ) -> tuple[PyStmts, ...]:
-    """Emit ``program`` as PyAB statements: helper ``def``s + one ``def name``.
+    """Emit ``program`` as PyAB statements: helper defs + one ``def name``.
 
     The returned tuple is ready to hand to a PyAB backend ``compile``.  The
     entrypoint takes one array parameter per program input (named by the input

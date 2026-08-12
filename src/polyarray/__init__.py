@@ -11,7 +11,7 @@ prior result::
       cell    =  RationalFunction (exact)  |  float (numeric)  |  Ref (prior output)
 
 The package is the single source of truth for this IR together with its polynomial
-backends (sympy, native_py, native_value, cython cpp) and the ``analyze`` and
+backends (sympy, flint, native_py, native_cpp) and the ``analyze`` and
 ``partial_eval`` passes over programs.
 
 The IR is executable as-is: build a :class:`Program` and call

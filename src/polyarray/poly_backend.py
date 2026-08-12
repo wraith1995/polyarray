@@ -21,9 +21,8 @@ The active backend is chosen by the ``CHARTLIB_POLY_BACKEND`` environment variab
 resolved into :data:`BACKEND_NAME`; when it is unset the sparse flint backend is
 preferred, falling back to sympy when python-flint is absent. The sympy backend
 carries 53-bit ``mpf`` coefficients over :data:`sympy.RR`, while flint carries exact
-rationals and runs roughly two orders of magnitude faster at multivariate
-multiplication and an order of magnitude faster at ring construction, at realistic
-generator counts. The native backends take their coefficient type from
+rationals and is substantially faster at multivariate multiplication and ring
+construction. The native backends take their coefficient type from
 ``CHARTLIB_POLY_COEFF``.
 """
 from __future__ import annotations
@@ -372,6 +371,8 @@ class _FlintRing:
 
 
 class _FlintPoly:
+    """A flint ``fmpq_mpoly`` with a back-reference to its :class:`_FlintRing`."""
+
     __slots__ = ("_p", "_ring")
 
     def __init__(self, p: _fmpq_mpoly, ring: _FlintRing) -> None:
