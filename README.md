@@ -15,8 +15,8 @@ together. A program executes as plain Python, and the same IR renders back to Nu
 source or compiles to a batched PyTorch kernel.
 
 - **Docs:** <https://wraith1995.github.io/polyarray/>
-- **Public API:** [`PUBLIC_API.md`](PUBLIC_API.md)
-- **Docstring style:** [`DOCSTRINGS.md`](DOCSTRINGS.md)
+- **Public API:** <https://wraith1995.github.io/polyarray/public_api.html>
+- **Docstring style:** <https://wraith1995.github.io/polyarray/docstring_style.html>
 
 ## Install
 

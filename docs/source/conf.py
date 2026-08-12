@@ -27,7 +27,12 @@ extensions = [
     "sphinx.ext.todo",
     "sphinx.ext.doctest",
     "numpydoc",
+    "myst_parser",
 ]
+
+# Markdown narrative pages (public_api, docstring_style, mypy_notes) render
+# through MyST alongside the reStructuredText ones.
+source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 
 # The examples page is written as doctests, so ``make -C docs doctest`` runs the
 # narrative and fails if the API drifts from what the docs claim.

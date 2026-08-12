@@ -3,7 +3,7 @@
 Symbolic-numeric array IR: a `Program` of `Stmt`s over `SymArray`s whose cells are
 **RationalFunctions | floats | Refs to opaque ops**. The lowering target for grassmann and
 the value substrate for chartlib's symbolic geometry. Stack rules: `../../PHILOSOPHY.md`
-(or `fem/PHILOSOPHY.md`). Authoritative API surface: **`PUBLIC_API.md`** (committed
+(or `fem/PHILOSOPHY.md`). Authoritative API surface: **`docs/source/public_api.md`** (committed
 contract — additions need it updated).
 
 ## Capability inventory — CHECK HERE BEFORE WRITING ANYTHING
@@ -36,7 +36,7 @@ contract — additions need it updated).
 - Op vocabulary is the **56** frozen `Stmt.fn` dataclasses in `ir.py` (incl. `GSvdOp` with
   its documented reconstruction contract, `IdentityOp` = capture/freeze), named by the
   closed union **`ir.StmtFn`**. New ops are rare events: add to `StmtFn`, then run mypy —
-  every `match` closed by `assert_never` will name itself. Also update `PUBLIC_API.md`,
+  every `match` closed by `assert_never` will name itself. Also update `docs/source/public_api.md`,
   `__init__` exports, `degree.DEFAULT_DEGREE_KINDS`, and the pyab / `to_numpy_source`
   render lanes; `tests/test_op_union.py` checks each mirror.
 - **Never dispatch over ops with a bare isinstance ladder.** `Stmt.fn` is half-open: handle
@@ -55,7 +55,7 @@ contract — additions need it updated).
   `~/.claude/bin/runjob`.
 - `specialize(sparsity=)` is a no-op passthrough (API parity) — use
   `sparsity.propagate_sparsity` directly.
-- `Program.fingerprint()` intentionally does not exist (PUBLIC_API.md "Not included").
+- `Program.fingerprint()` intentionally does not exist (docs/source/public_api.md "Not included").
 
 ## Layout & tests
 

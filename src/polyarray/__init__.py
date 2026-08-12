@@ -15,8 +15,8 @@ backends (sympy, flint, native_py, native_cpp) and the ``analyze`` and
 ``partial_eval`` passes over programs.
 
 The IR is executable as-is: build a :class:`Program` and call
-``program.run({name: array})`` to get back ``{name: ndarray}``. See ``PUBLIC_API.md`` for
-the committed surface.
+``program.run({name: array})`` to get back ``{name: ndarray}``. See the public API
+reference for the committed surface.
 """
 from __future__ import annotations
 
