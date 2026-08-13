@@ -23,8 +23,9 @@ import grassmann as G  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Renderers for grassmann's own Stmt ops (kept out of polyarray itself).
-# Demonstrates the ``op_renderers`` extension point.
+# Renderers for a consumer's own Stmt ops, supplied here to exercise the
+# ``op_renderers`` extension point. This test uses grassmann as a concrete
+# consumer and skips when it is not installed.
 # ---------------------------------------------------------------------------
 
 def _const_op(op, a):
