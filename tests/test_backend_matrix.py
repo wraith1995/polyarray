@@ -3,7 +3,7 @@ available poly backend and assert matching results.
 
 The backend is fixed at *import time* of ``polyarray.poly_backend`` from
 the ``CHARTLIB_POLY_BACKEND`` / ``CHARTLIB_POLY_COEFF`` environment
-variables (preserved verbatim from chartlib). To exercise multiple
+variables. To exercise multiple
 backends in one test run we launch a fresh subprocess per backend, each
 running the same rational-lane program (symbolic 2x2 inverse, which goes
 through the poly ring) and printing the result. The parent compares.
