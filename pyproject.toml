@@ -73,7 +73,7 @@ where = ["src"]
 # ship the compiled .so files. Pure-Python source install / editable dev
 # can instead use `make cython`.
 [tool.setuptools.package-data]
-polyarray = ["*.pyx"]
+polyarray = ["*.pyx", "py.typed"]
 
 # ---------------------------------------------------------------------------
 # cibuildwheel — build binary wheels with the Cython cpp backends precompiled
