@@ -246,6 +246,7 @@ class DynEyeOp:                  # eye(ref.shape[axis]) — runtime identity siz
     axis: int = 1
 @dataclass(frozen=True)
 class DynZerosOp:                # zeros((refs[i].shape[axes[i]], …)) — a symbolic ℝⁿ zero
+class DynReshapeOp:              # refs[0].reshape(refs[1+i].shape[axes[i]], …) — dynamic un-fuse
     axes: tuple[int, ...]
 @dataclass(frozen=True)
 class DynEyeTensorOp:            # eye(∏dᵢ).reshape(∏dᵢ, d₀, …) — multi-axis DimVar seed identity

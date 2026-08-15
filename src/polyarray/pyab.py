@@ -94,6 +94,7 @@ from .ir import (
     DynBlockRepeatOp,
     DynEyeOp,
     DynEyeTensorOp,
+    DynReshapeOp,
     DynZerosOp,
     EinsumOp,
     EinsumStmtOp,
@@ -391,6 +392,21 @@ def _render_dyn_zeros(op: DynZerosOp, builder: StmtBuilder, args: list[PyExprs],
     return [c.ZerosExpr(shape=shape, dtype=low._dtype_f64())]
 
 
+def _render_dyn_reshape(op: DynReshapeOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
+    """Emit ``args[0].reshape((d₀, …))`` where each ``dᵢ`` is a runtime axis of ``args[1+i]``."""
+    c = low.core
+    shape = []
+    ri = 0
+    for kind, val in op.spec:
+        if kind == 0:
+            shape.append(c.IntLit(value=int(val)))
+        elif kind == 1:
+            shape.append(_axis_len(low, args[1 + ri], int(val))); ri += 1
+        else:
+            shape.append(c.IntLit(value=-1))
+    return [c.ReshapeExpr(a=args[0], shape=tuple(shape))]
+
+
 def _render_dyn_eye_tensor(op: DynEyeTensorOp, builder: StmtBuilder, args: list[PyExprs], low: _Lowerer) -> list[PyExprs]:
     """Emit ``eye(∏dᵢ).reshape(∏dᵢ, d₀, …)`` where each ``dᵢ`` is a runtime axis of ``refs[i]``."""
     c = low.core
@@ -659,6 +675,7 @@ _ARRAY_OP_LOWERINGS: dict[type, OpLowering] = {
     DynBlockRepeatOp: _render_dyn_block_repeat,
     DynEyeOp: _render_dyn_eye,
     DynZerosOp: _render_dyn_zeros,
+    DynReshapeOp: _render_dyn_reshape,
     DynEyeTensorOp: _render_dyn_eye_tensor,
     ProdShapeOp: _render_prod_shape,
     SumShapeOp: _render_sum_shape,

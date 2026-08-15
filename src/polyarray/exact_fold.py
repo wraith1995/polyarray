@@ -81,6 +81,7 @@ from .ir import (
     DynBlockRepeatOp,
     DynEyeOp,
     DynEyeTensorOp,
+    DynReshapeOp,
     DynZerosOp,
     EinsumOp,
     EinsumStmtOp,
@@ -957,7 +958,7 @@ def _zero_absorbing(fn: StmtFn) -> bool:
               | BlockRepeatOp() | DynBlockRepeatOp():
         # Sums and assemblies: a zero SUMMAND / block leaves the other entries untouched.
         return False
-      case TransposeOp() | MoveaxisOp() | ReshapeOp() | IdentityOp() | FirstColsOp() \
+      case TransposeOp() | MoveaxisOp() | ReshapeOp() | DynReshapeOp() | IdentityOp() | FirstColsOp() \
               | LastColsOp():
         # Pure rearrangements. A zero operand does give a zero result, but they are UNARY (a
         # slice's second operand is a rank, not a factor), so there is never another operand to
@@ -1128,6 +1129,17 @@ def _sym_apply_builtin(
         return [np.moveaxis(np.asarray(args[0]), fn.source, fn.destination)]
       case ReshapeOp():
         return [np.asarray(args[0]).reshape(fn.shape)]
+      case DynReshapeOp():
+        _sh: list[int] = []
+        _ri = 0
+        for _k, _v in fn.spec:
+            if _k == 0:
+                _sh.append(int(_v))
+            elif _k == 1:
+                _sh.append(int(np.asarray(args[1 + _ri]).shape[_v])); _ri += 1
+            else:
+                _sh.append(-1)
+        return [np.asarray(args[0]).reshape(tuple(_sh))]
       case IdentityOp():
         return [np.asarray(args[0])]
       case AddOp():

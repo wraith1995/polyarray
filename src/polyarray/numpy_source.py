@@ -97,6 +97,7 @@ from .ir import (
     DynBlockRepeatOp,
     DynEyeOp,
     DynEyeTensorOp,
+    DynReshapeOp,
     DynZerosOp,
     EinsumOp,
     EinsumStmtOp,
@@ -896,6 +897,19 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
         dims = ", ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
         return f"np.zeros(({dims},))"
 
+    def dyn_reshape(op: DynReshapeOp, a: list[str]) -> str:
+        parts = []
+        ri = 0
+        for kind, val in op.spec:
+            if kind == 0:
+                parts.append(str(int(val)))
+            elif kind == 1:
+                parts.append(f"int(np.asarray({a[1 + ri]}).shape[{val}])"); ri += 1
+            else:
+                parts.append("-1")
+        dims = ", ".join(parts)
+        return f"np.asarray({a[0]}, dtype=float).reshape(({dims},))"
+
     def dyn_eye_tensor(op: DynEyeTensorOp, a: list[str]) -> str:
         dims = ", ".join(f"int(np.asarray({a[i]}).shape[{ax}])" for i, ax in enumerate(op.axes))
         return f"(lambda _d: np.eye(int(np.prod(_d))).reshape(int(np.prod(_d)), *_d))([{dims}])"
@@ -1025,6 +1039,7 @@ def _builtin_renderers() -> dict[type, OpRenderer]:
         DynBlockRepeatOp: dyn_block_repeat,
         DynEyeOp: dyn_eye,
         DynZerosOp: dyn_zeros,
+        DynReshapeOp: dyn_reshape,
         DynEyeTensorOp: dyn_eye_tensor,
         ProdShapeOp: prod_shape,
         SumShapeOp: sum_shape,

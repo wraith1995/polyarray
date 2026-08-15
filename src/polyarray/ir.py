@@ -1650,6 +1650,35 @@ class DynZerosOp:
 
 
 @dataclass(frozen=True)
+class DynReshapeOp:
+    """``refs[0].reshape(target)`` where each target axis is resolved at run from ``spec``.
+
+    The dynamic counterpart of :class:`ReshapeOp` (whose target shape is static) — un-fuses one
+    fused symbolic axis into several per-factor axes, sizing them off source-input shapes the way
+    :class:`DynZerosOp` does. ``refs[0]`` is the array; ``refs[1:]`` are the source arrays for the
+    *read* axes, consumed in order. Each ``spec`` entry ``(kind, value)`` is one output axis:
+    ``kind=0`` a static ``value``; ``kind=1`` read ``refs[next].shape[value]``; ``kind=2`` numpy
+    ``-1`` (infer — at most one, for a product/computed dim).
+    """
+
+    spec: tuple[tuple[int, int], ...]
+
+    def __call__(self, arr: np.ndarray, *refs: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Evaluate the op on concrete numeric operands."""
+        shape: list[int] = []
+        ri = 0
+        for kind, val in self.spec:
+            if kind == 0:
+                shape.append(int(val))
+            elif kind == 1:
+                shape.append(int(np.asarray(refs[ri]).shape[val]))
+                ri += 1
+            else:
+                shape.append(-1)
+        return np.asarray(arr, dtype=float).reshape(tuple(shape))
+
+
+@dataclass(frozen=True)
 class DynEyeTensorOp:
     """It builds the vmap identity of a multi-axis dimension binder as a matrix or tensor seed.
 
@@ -2548,7 +2577,7 @@ StmtFn: TypeAlias = Union[
     BlockDiagOp, BlockRepeatOp, DynBlockRepeatOp, KronOp, KronFreeOp,
     FirstColsOp, LastColsOp, ProjectOp, EmbedOp,
     # constants / shape-derived sizes (DimAtom sources)
-    ConstOp, EyeOp, DynEyeOp, DynZerosOp, DynEyeTensorOp, ProdShapeOp, SumShapeOp,
+    ConstOp, EyeOp, DynEyeOp, DynZerosOp, DynReshapeOp, DynEyeTensorOp, ProdShapeOp, SumShapeOp,
     SumDimOp, ProdDimOp, ScaleAxisDimOp, MulAxisDimOp, CompRankOp,
     # capture / guard / control flow
     IdentityOp, AssertOp, SwitchOp, CallOp, WhileOp,
@@ -4142,6 +4171,7 @@ __all__ = [
     "DynBlockRepeatOp",
     "DynEyeOp",
     "DynEyeTensorOp",
+    "DynReshapeOp",
     "DynZerosOp",
     "EmbedOp",
     "EyeOp",
