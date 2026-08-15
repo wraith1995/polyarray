@@ -62,6 +62,7 @@ from .ir import (
     DynBlockRepeatOp,
     DynEyeOp,
     DynEyeTensorOp,
+    DynReshapeOp,
     DynZerosOp,
     EinsumOp,
     EinsumStmtOp,
@@ -476,7 +477,7 @@ def _apply_builtin_op(
       # above, which IS modeled).  These are the real precision gaps in this pass:
       # `ReshapeOp` and `TransposeOp` in particular sit on ordinary lowering paths and
       # currently erase a mask that was fully known one statement earlier.
-      case TransposeOp() | ReshapeOp() | HStackOp() | ColStackOp() | ConcatOp() \
+      case TransposeOp() | ReshapeOp() | DynReshapeOp() | HStackOp() | ColStackOp() | ConcatOp() \
               | AddOp() | ScaleOp() | ScaleByOp() | BlockDiagOp() | BlockRepeatOp() \
               | DynBlockRepeatOp() | KronOp() | KronFreeOp() | FirstColsOp() \
               | LastColsOp() | ProjectOp() | EmbedOp():
