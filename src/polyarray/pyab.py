@@ -91,6 +91,7 @@ from .ir import (
     Const,
     ConstOp,
     DetOp,
+    DimAtom,
     DynBlockRepeatOp,
     DynEyeOp,
     DynEyeTensorOp,
@@ -116,11 +117,13 @@ from .ir import (
     MulAxisDimOp,
     NestedVmapClosure,
     OutputRef,
+    OutSpec,
     PinvOp,
     ProdDimOp,
     ProdShapeOp,
     Program,
     ProjectOp,
+    Provenance,
     QrOp,
     RankOp,
     RationalRef,
@@ -142,6 +145,7 @@ from .ir import (
     SwitchOp,
     SymArray,
     SymArrayRef,
+    SymInput,
     TensordotOp,
     TransposeOp,
     WhileOp,
@@ -2667,6 +2671,343 @@ def collapse_vmap(program: Program, *, probe_batch: int = 4, seed: int = 12345) 
     return new, collapsed
 
 
+# ---------------------------------------------------------------------------
+# General (nested / multi-op / broadcast-axis) vmap batching interpreter
+# ---------------------------------------------------------------------------
+#
+# ``collapse_vmap`` above handles the case a whole vmap body is ONE leading-batch
+# op.  This interpreter handles the general case a body is a CHAIN of batchable
+# ops (einsums, static reshapes, identity/assert passthroughs, axis lengths,
+# leading-batch linalg) and/or contains FURTHER nested vmaps — the shape savo's
+# value block takes: ``vmap(Q)`` over ``vmap(N_u)`` over ``vmap(N_v)`` over the
+# grassmann per-point body.  It rewrites the whole nest to ONE ``CallOp`` of a
+# batched sub-Program whose ops carry the batch axes explicitly, so the backend
+# lowers batched einsums rather than nested ``torch.vmap`` — which is what the
+# nested torch.vmap makes expensive to trace.
+#
+# The transform is a JAX-style batching pass with PER-OPERAND batch axes: every
+# value carries a subset of the global batch axes as leading dims (ascending
+# axis-id order), and each einsum prepends ONLY its own operands' batch letters
+# to their terms and the UNION to the output — so ``np.einsum`` shares an operand
+# that lacks an axis across it (the broadcast an ``in_axes=None`` operand needs).
+# It BAILS (leaving the vmap untouched → the working torch.vmap path) on any op
+# it does not know how to batch, so it is additive and safe: it only ever REMOVES
+# a vmap it can prove (a random-probe numeric check) equal to the batched form.
+
+_BATCH_POOL = "BNZYXWVUTSRQPOMLKJIHGFEDCA"     # uppercase; grassmann einsum specs use lowercase
+
+
+class _BatchBail(Exception):
+    """Raised internally when a body cannot be batched; the vmap is left as-is."""
+
+
+def _static_dim(x: int | DimAtom) -> int:
+    """A concrete ``int`` axis size; bail on a dynamic (``DimAtom``) axis.
+
+    A batched static reshape needs concrete batch sizes, so a runtime-sized axis is left to the
+    working ``torch.vmap`` path rather than batched here.
+    """
+    if isinstance(x, int):
+        return x
+    raise _BatchBail("dynamic (DimAtom) batch axis")
+
+
+class _AxisPool:
+    """Allocates global batch axes: an ascending id, a fixed size, and a fresh einsum letter.
+
+    ``avoid`` is the set of einsum letters already used ANYWHERE in the nest, so a batch
+    letter never collides with a contraction index.  Running out of free letters bails.
+    """
+
+    def __init__(self, avoid: set[str]) -> None:
+        self._avail = [c for c in _BATCH_POOL if c not in avoid]
+        self.size: dict[int, int] = {}
+        self.letter: dict[int, str] = {}
+        self._n = 0
+
+    def new(self, size: int) -> int:
+        if self._n >= len(self._avail):
+            raise _BatchBail("out of batch letters")
+        aid = self._n
+        self._n += 1
+        self.size[aid] = int(size)
+        self.letter[aid] = self._avail[aid]
+        return aid
+
+    def dims(self, axes: tuple[int, ...]) -> tuple[int, ...]:
+        return tuple(self.size[a] for a in axes)
+
+    def letters(self, axes: tuple[int, ...]) -> str:
+        return "".join(self.letter[a] for a in axes)
+
+
+def _collect_einsum_letters(fn: StmtOp, acc: set[str]) -> None:
+    """Union the core (contraction) letters of every einsum in the nest under ``fn``."""
+    body = _vmap_body_of(fn)
+    if body is not None:
+        for s in body.statements:
+            if s.fn is not None:
+                _collect_einsum_letters(s.fn, acc)
+        return
+    if isinstance(fn, CallOp) and isinstance(fn.fn, Program):
+        for s in fn.fn.statements:
+            if s.fn is not None:
+                _collect_einsum_letters(s.fn, acc)
+        return
+    if isinstance(fn, EinsumStmtOp):
+        acc.update(ch for ch in fn.spec if ch not in ",-> ")
+
+
+def _batch_einsum_spec(spec: str, operand_axes: list[tuple[int, ...]],
+                       out_axes: tuple[int, ...], pool: _AxisPool) -> str:
+    """Prepend each operand's own batch letters to its term, the union to the output.
+
+    An operand lacking an axis's letter is SHARED across that axis by ``np.einsum`` — the
+    broadcast a partially-batched operand needs.
+    """
+    lhs, _, rhs = spec.partition("->")
+    terms = [t.strip() for t in lhs.split(",")]
+    if len(terms) != len(operand_axes):
+        raise _BatchBail("einsum operand/term count mismatch")
+    new_terms = [pool.letters(ax) + t for t, ax in zip(terms, operand_axes)]
+    return f"{','.join(new_terms)}->{pool.letters(out_axes)}{rhs.strip()}"
+
+
+# Single-operand ops that batch over ANY number of leading dims unchanged.
+_LEADING_BATCH_OPS = (DetOp, InvOp, PinvOp, SqrtOp, AbsOp, SignOp)
+
+
+def _batch_builtin(fn: StmtOp, operand_axes: list[tuple[int, ...]], pool: _AxisPool,
+                   old_outs: Sequence[SymArray]) -> tuple[StmtOp, list[int], list[OutSpec],
+                                                          list[tuple[int, ...]]]:
+    """Batch a single builtin op.
+
+    Returns ``(new_fn, operand_indices, out_specs, per-output batch axes)`` where
+    ``operand_indices`` selects (and orders) which of the statement's operands the batched op
+    takes.  Raises :class:`_BatchBail` for any op not known to batch cleanly.
+    """
+    n = len(operand_axes)
+    allops = list(range(n))
+    union = tuple(sorted(set().union(*operand_axes))) if operand_axes else ()
+
+    def _spec(name: str, base_shape: tuple[int | DimAtom, ...], axes: tuple[int, ...]) -> OutSpec:
+        return OutSpec(name, (*pool.dims(axes), *tuple(base_shape)))
+
+    if isinstance(fn, EinsumStmtOp):
+        spec = _batch_einsum_spec(fn.spec, operand_axes, union, pool)
+        outs = [_spec(getattr(o, "name", "result") or "result", o.shape, union) for o in old_outs]
+        return EinsumStmtOp(spec=spec, optimize=fn.optimize), allops, outs, [union] * len(old_outs)
+
+    if isinstance(fn, ReshapeOp):
+        ax = operand_axes[0]
+        new_shape = (*pool.dims(ax), *tuple(fn.shape))
+        return ReshapeOp(shape=new_shape), [0], [OutSpec("r", new_shape)], [ax]
+
+    if isinstance(fn, (IdentityOp, AssertOp)):
+        # AssertOp is a value-passthrough of its first operand; its checks read the
+        # per-slice shape, which the prepended batch dims would break — drop the check,
+        # keep the passthrough (the numeric verify + downstream tests are the guard).
+        ax = operand_axes[0]
+        return IdentityOp(), [0], [_spec("id", old_outs[0].shape, ax)], [ax]
+
+    if isinstance(fn, AxisLenOp):
+        ax = operand_axes[0]
+        new_axis = (fn.axis + len(ax)) if (ax and fn.axis >= 0) else fn.axis
+        return AxisLenOp(axis=new_axis), [0], [OutSpec("n", ())], [()]  # a length is an unbatched scalar
+
+    if isinstance(fn, _LEADING_BATCH_OPS):
+        outs = [_spec("o", o.shape, union) for o in old_outs]
+        return fn, allops, outs, [union] * len(old_outs)
+
+    if isinstance(fn, SolveOp):
+        if any(ax != union for ax in operand_axes):
+            raise _BatchBail("solve with mismatched operand batch axes")
+        outs = [_spec("o", o.shape, union) for o in old_outs]
+        return fn, allops, outs, [union] * len(old_outs)
+
+    raise _BatchBail(f"cannot batch op {type(fn).__name__}")
+
+
+def _batch_program(body: Program, input_axes: tuple[tuple[int, ...], ...],
+                   pool: _AxisPool) -> tuple[Program, list[tuple[int, ...]]]:
+    """Build a batched copy of ``body``; each input carries ``input_axes[i]`` as leading dims.
+
+    Returns ``(batched_program, per-output batch axes)``.  Raises :class:`_BatchBail` on any
+    op / ref it cannot batch, so the caller can leave the original vmap in place.
+    """
+    new_inputs = [
+        SymInput(name=inp.name, shape=(*pool.dims(ax), *tuple(inp.shape)), provenance=inp.provenance)
+        for inp, ax in zip(body.inputs, input_axes)
+    ]
+    bp = Program(name=f"batched_{body.name}", inputs=tuple(new_inputs))
+    # id(old cell array) -> (new SymArray on bp, its batch axes)
+    idx: dict[int, tuple[SymArray, tuple[int, ...]]] = {}
+    for inp, ax in zip(body.inputs, input_axes):
+        old = body.input_arrays[inp.name]
+        idx[id(old._cells)] = (bp.input(inp.name), ax)
+
+    def resolve(ref: Ref) -> tuple[SymArray, tuple[int, ...]]:
+        if isinstance(ref, SymArrayRef):
+            hit = idx.get(id(ref._cells))
+            if hit is not None:
+                return hit
+            arr = np.asarray(ref._cells)
+            if arr.dtype.kind != "f":                       # a symbolic ref we cannot trace: bail
+                raise _BatchBail("unresolved symbolic operand")
+            return SymArray(arr, program=bp), ()            # a numeric constant operand
+        raise _BatchBail(f"cannot batch ref {type(ref).__name__}")
+
+    for stmt in body.statements:
+        if stmt.fn is None:
+            raise _BatchBail("fn=None splice")
+        ins = [resolve(r) for r in stmt.in_]
+        operands = [o for o, _ in ins]
+        oper_axes = [ax for _, ax in ins]
+        nested = _vmap_body_of(stmt.fn)
+        if nested is not None:
+            new_outs, out_axes = _batch_nested(stmt, ins, pool, bp)
+        elif isinstance(stmt.fn, CallOp) and isinstance(stmt.fn.fn, Program):
+            sub_bp, sub_out = _batch_program(stmt.fn.fn, tuple(oper_axes), pool)
+            specs = [OutSpec("o", tuple(v.shape)) for v in sub_bp.outputs.values()]
+            new_outs = bp.emit_stmt(CallOp(fn=sub_bp), operands, specs, note=stmt.note, bulk=True)
+            out_axes = list(sub_out)
+        else:
+            new_fn, oper_idx, specs, out_axes = _batch_builtin(stmt.fn, oper_axes, pool, stmt.out)
+            new_outs = bp.emit_stmt(new_fn, [operands[i] for i in oper_idx], specs,
+                                    note=stmt.note, bulk=True)
+        for old_o, new_o, ax in zip(stmt.out, new_outs, out_axes):
+            idx[id(old_o._cells)] = (new_o, ax)
+
+    out_axes_list: list[tuple[int, ...]] = []
+    for name, osa in body.outputs.items():
+        hit = idx.get(id(osa._cells))
+        if hit is None:
+            raise _BatchBail("output not produced")
+        bp.add_output(name, hit[0])
+        out_axes_list.append(hit[1])
+    return bp, out_axes_list
+
+
+def _batch_nested(stmt: Stmt, ins: list[tuple[SymArray, tuple[int, ...]]], pool: _AxisPool,
+                  bp: Program) -> tuple[tuple[SymArray, ...], list[tuple[int, ...]]]:
+    """Batch a vmap-closure Stmt over its inner axis, ON TOP of the outer batch already carried."""
+    inner = _vmap_body_of(stmt.fn)
+    in_axes = getattr(stmt.fn, "_in_axes", None)
+    out_axes = getattr(stmt.fn, "_out_axes", None)
+    if inner is None or in_axes is None or out_axes is None:
+        raise _BatchBail("opaque vmap closure")
+    if getattr(stmt.fn, "_nested_n_vars", None) is not None:
+        raise _BatchBail("multi-var nested closure")
+    if any(a not in (0, None) for a in in_axes) or any(a != 0 for a in out_axes):
+        raise _BatchBail("non-leading vmap axis")
+    # inner batch size M = the vmapped axis of an in_axes==0 operand (its first NON-outer dim)
+    m = None
+    for (sa, ax), iax in zip(ins, in_axes):
+        if iax == 0:
+            m = _static_dim(tuple(sa.shape)[len(ax)])
+            break
+    if m is None:
+        raise _BatchBail("nested vmap with no batched operand")
+    new_axis = pool.new(m)
+    inner_input_axes = tuple(
+        (ax + (new_axis,)) if iax == 0 else ax for (sa, ax), iax in zip(ins, in_axes)
+    )
+    sub_bp, sub_out = _batch_program(inner, inner_input_axes, pool)
+    operands = [sa for sa, _ in ins]
+    # The vmap ADDED its axis to ``stmt.out``; in the batched form that axis is a BATCH axis and
+    # is already present in ``sub_bp``'s output shape (sub_bp carries every batch axis, this one
+    # included).  Read the CallOp's spec straight off sub_bp's ACTUAL output shape — reconstructing
+    # from ``stmt.out`` / ``inner.outputs`` double-counts the vmap axes a deeper nest folded in.
+    specs = [OutSpec("o", tuple(v.shape)) for v in sub_bp.outputs.values()]
+    outs = bp.emit_stmt(CallOp(fn=sub_bp), operands, specs, note=stmt.note, bulk=True)
+    return outs, list(sub_out)
+
+
+def _verify_batch(fn: StmtOp, bp: Program, *, seed: int) -> bool:
+    """Numerically check the original nested vmap ``fn`` equals the batched program ``bp``.
+
+    ``bp``'s inputs carry the SAME shapes the top vmap's operands do (the outer batch as a
+    leading dim), so one probe set drives both.  ``fn`` is always a ``vmap`` closure here (a plain
+    callable); the cast records that the ``Program``/``None`` arms of ``StmtOp`` never reach it.
+    """
+    vmap_fn = cast("Callable[..., Any]", fn)
+    rng = np.random.default_rng(seed)
+    probes: dict[str, np.ndarray] = {}
+    args: list[np.ndarray] = []
+    for inp in bp.inputs:
+        shp = tuple(_static_dim(s) for s in inp.shape)
+        a = rng.standard_normal(shp)
+        if len(shp) >= 2 and shp[-1] == shp[-2]:
+            a = a + shp[-1] * np.eye(shp[-1])              # well-condition inv/solve probes
+        probes[inp.name] = a
+        args.append(a)
+    try:
+        got_v = np.asarray(vmap_fn(*args), dtype=float)
+        got_b = np.asarray(next(iter(bp.run(probes).values())), dtype=float)
+    except Exception:                                       # noqa: BLE001 — any failure ⇒ don't collapse
+        return False
+    return got_v.shape == got_b.shape and bool(np.allclose(got_v, got_b, rtol=1e-9, atol=1e-11))
+
+
+def collapse_general_vmap(program: Program, *, seed: int = 12345) -> tuple[Program, list[str]]:
+    """Collapse nested / multi-op / broadcast-axis vmaps this file's :func:`collapse_vmap` leaves.
+
+    For each remaining top-level ``vmap`` Stmt (``in_axes ∈ {0, None}``, ``out_axes`` all 0)
+    whose whole nest batches cleanly, replace it with a ``CallOp`` of the batched sub-Program —
+    but only after a random-probe numeric check equals the original vmap.  Additive: a vmap that
+    does not batch (an op we cannot handle, a dynamic axis, ...) is left untouched, so the backend
+    lowers it as ``torch.vmap`` exactly as before.
+    """
+    new = program.copy()
+    collapsed: list[str] = []
+    for stmt in new.statements:
+        fn = stmt.fn
+        body = _vmap_body_of(fn)
+        if body is None or getattr(fn, "_nested_n_vars", None) is not None:
+            continue
+        in_axes = getattr(fn, "_in_axes", None)
+        out_axes = getattr(fn, "_out_axes", None)
+        if in_axes is None or out_axes is None:
+            continue
+        if any(a not in (0, None) for a in in_axes) or any(a != 0 for a in out_axes):
+            continue
+        # infer the outer batch size M from an in_axes==0 operand's leading dim
+        m = None
+        for ref, iax in zip(stmt.in_, in_axes):
+            if iax != 0:
+                continue
+            src = ref if isinstance(ref, SymArrayRef) else None
+            if src is None:
+                break
+            shp = src._bulk.shape if src._bulk is not None else np.asarray(src._cells).shape
+            if shp:
+                try:
+                    m = _static_dim(shp[0])
+                except _BatchBail:
+                    m = None
+            break
+        if m is None:
+            continue
+        try:
+            avoid: set[str] = set()
+            _collect_einsum_letters(fn, avoid)
+            pool = _AxisPool(avoid)
+            ax0 = pool.new(m)
+            input_axes = tuple((ax0,) if a == 0 else () for a in in_axes)
+            bp, _out_axes = _batch_program(body, input_axes, pool)
+        except Exception:                                   # noqa: BLE001
+            # ADDITIVE / SAFE: any failure (a _BatchBail bail-out, or an unforeseen shape/op the
+            # interpreter mishandles) leaves the vmap untouched, so the backend lowers it as the
+            # working ``torch.vmap`` exactly as before — the transform can only ever REMOVE a vmap
+            # it built AND numerically verified, never break a compile that worked.
+            continue
+        if not _verify_batch(fn, bp, seed=seed):
+            continue
+        stmt.fn = CallOp(fn=bp)
+        collapsed.append(f"nested:{body.name}")
+    return new, collapsed
+
+
 def prepare(program: Program, *, opts: LowerOpts | None = None) -> tuple[Program, PrepReport]:
     """Apply backend-prep simplifications; return ``(program, report)``.
 
@@ -2682,7 +3023,8 @@ def prepare(program: Program, *, opts: LowerOpts | None = None) -> tuple[Program
     report: dict[str, Any] = {"collapsed_vmap": []}
     if opts.collapse_vmap:
         program, collapsed = collapse_vmap(program)
-        report["collapsed_vmap"] = collapsed
+        program, collapsed_general = collapse_general_vmap(program)
+        report["collapsed_vmap"] = collapsed + collapsed_general
     return program, report
 
 
