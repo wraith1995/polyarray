@@ -564,11 +564,17 @@ supplied by the caller, never imported by polyarray):
   before lowering; opt out via `LowerOpts(collapse_vmap=/simplify_gsvd=False)`)
   eliminates avoidable work: `pyab.collapse_vmap` replaces a `vmap` over a single
   leading-batch op (det/inv/pinv/solve/sqrt/abs/sign/einsum) with the batched op
-  applied directly — **numerically verified equivalent on a probe before
-  rewriting** (so e.g. numpy-2.0 vector-`solve`, which no longer batches, is left
-  alone); and identity metrics fold out of a `GSvdOp` (collapsing it toward a
-  plain SVD). Both are semantics-preserving and also speed up `Program.run` /
-  `to_numpy_source`.
+  applied directly, and `pyab.collapse_general_vmap` extends this to a whole
+  `vmap` NEST whose body is a chain of batchable ops (einsum / static reshape /
+  identity / assert-passthrough / axis-length / leading-batch linalg) and/or
+  further nested vmaps — a JAX-style per-operand batching pass that rewrites the
+  nest to one `CallOp` of a batched sub-Program (batched einsums, not nested
+  `torch.vmap`), with `in_axes=None` operands shared via einsum index-sharing —
+  both **numerically verified equivalent on a probe before rewriting** (so e.g.
+  numpy-2.0 vector-`solve`, which no longer batches, is left alone) and additive
+  (any op / dynamic axis it cannot batch leaves the vmap untouched); and identity
+  metrics fold out of a `GSvdOp` (collapsing it toward a plain SVD). All are
+  semantics-preserving and also speed up `Program.run` / `to_numpy_source`.
 
 ## Not included
 
