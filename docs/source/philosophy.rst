@@ -16,6 +16,7 @@ especially one with complex meaningful numerical constants, we might partially e
 a rational function form. For small programs, we can use this to detect structal sparsity or reduce computation, 
 but we risk expoding the size of the program.  
 
+We offer the following features:
 
 * An array IR that follows NumPy. It supplies the usual elementwise and
   linear-algebra operations (``matmul``, ``matvec``, ``einsum``, ``transpose``,
