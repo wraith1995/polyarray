@@ -27,9 +27,14 @@ symbolically, and lower the whole program to a NumPy function:
    >>> print(inv.cells[1, 0])
    -A_1_0/(A_0_0*A_1_1)
    >>> _ = prog.add_output("inv", inv.cells)
-   >>> src = to_numpy_source(prog, func_name="inv2x2")   # lower the whole program to NumPy
-   >>> "def inv2x2(A):" in src
-   True
+   >>> print(to_numpy_source(prog, func_name="inv2x2"))  # lower the whole program to NumPy
+   import numpy as np
+   <BLANKLINE>
+   def inv2x2(A):
+       """Generated from polyarray Program 'inv' by to_numpy_source."""
+       inv = np.array([[((1.0) / ((A[0, 0]))), 0.0], [((-(A[1, 0])) / ((A[0, 0])*(A[1, 1]))), ((1.0) / ((A[1, 1])))]], dtype=float)
+       return inv
+   <BLANKLINE>
 
 Each cell of the inverse is an exact rational function, and the zero above the
 diagonal survives rather than being filled in, so the structure is now explicit
@@ -42,6 +47,16 @@ that limits how many array operations are converted to rational functions. To sy
 especially one with complex meaningful numerical constants, we might partially evaluate part of the program to produce
 a rational function form. For small programs, we can use this to detect structural sparsity or reduce computation,
 but we risk exploding the size of the program.
+
+How big is that in the dumb case? Invert a dense ``n x n`` matrix of distinct
+symbols by Cramer's rule. The determinant is a sum over all ``n!`` permutations
+-- ``n!`` monomials, each a product of ``n`` symbols -- and every one of the
+``n^2`` inverse entries is an ``(n-1) x (n-1)`` cofactor of ``(n-1)!`` terms over
+that shared determinant, so the inverse runs to on the order of ``n * n!``
+monomials in all. The determinant alone is ``2`` terms at ``n = 2``, ``120`` at
+``n = 5``, and about ``3.6`` million at ``n = 10`` -- already far past the size
+of the ``10 x 10`` array it inverts. This factorial growth is what the budget is
+there to avoid.
 
 We offer the following features:
 
