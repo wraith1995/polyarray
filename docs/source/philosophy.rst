@@ -9,15 +9,32 @@ we can represent complex computations elegantly and utilize high-performance arr
 such as Jax or PyTorch. If you want to symbolically simplify part of a program using a computer algebra
 system and then lower the whole thing to an array language, this is your tool.
 
-For instance, suppose you assemble a small matrix from a handful of symbolic
-parameters and invert it. Numerically this is just arithmetic; carried
-symbolically, each entry of the inverse becomes a rational function of those
-parameters, and that form makes structure visible -- which entries vanish for
-*every* value of the parameters, or that a block decouples -- structure a later
-numeric pass can exploit. But the symbolic form is also what grows: the
-determinant alone is a sum over permutations, and the exact inverse of even a
-modest matrix can dwarf the program that produced it. The representation that
-exposes the structure is the very one that threatens to explode.
+For instance, build a small matrix of symbolic parameters, invert it
+symbolically, and lower the whole program to a NumPy function:
+
+.. doctest::
+
+   >>> import numpy as np
+   >>> from polyarray import Program, SymInput, Provenance, symbolic_inverse, to_numpy_source
+   >>> prog = Program("inv", inputs=[SymInput("A", (2, 2), Provenance("vertex", "A", (), "A"))])
+   >>> lower = np.tril(np.ones((2, 2)))                 # keep the lower triangle
+   >>> A = prog.input("A").einsum("ij,ij->ij", lower)   # zero the entries above the diagonal
+   >>> inv = symbolic_inverse(A)                         # invert it symbolically
+   >>> print(inv.cells[0, 0])                            # each cell is a rational function
+   1/A_0_0
+   >>> print(inv.cells[0, 1])                            # the structural zero is preserved
+   0
+   >>> print(inv.cells[1, 0])
+   -A_1_0/(A_0_0*A_1_1)
+   >>> _ = prog.add_output("inv", inv.cells)
+   >>> src = to_numpy_source(prog, func_name="inv2x2")   # lower the whole program to NumPy
+   >>> "def inv2x2(A):" in src
+   True
+
+Each cell of the inverse is an exact rational function, and the zero above the
+diagonal survives rather than being filled in, so the structure is now explicit
+in the program. That same symbolic form is what can grow: a rational inverse of
+a larger matrix quickly dwarfs the program that produced it.
 
 Since CAS computations and representations can be quite expensive, Polyarray provides tools to balance
 the utility against the expense. In particular, Polyarray parametrizes symbolic computation with a budget
