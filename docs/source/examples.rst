@@ -2,7 +2,7 @@ Examples
 ========
 
 The following are short, runnable illustrations of the ideas in
-:doc:`philosophy`. Every block is a doctest: the code and the output shown below
+:doc:`use_case`. Every block is a doctest: the code and the output shown below
 it are checked by ``make -C docs doctest``, so this page fails the build if the
 API drifts from what it claims.
 

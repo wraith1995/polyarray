@@ -14,6 +14,14 @@ operation becomes a statement — so one program expresses symbolic and numeric 
 together. A program executes as plain Python, and the same IR renders back to NumPy
 source or compiles to a batched PyTorch kernel.
 
+**If you want to symbolically simplify part of a program with a computer algebra
+system and then lower the whole thing to an array language (NumPy, PyTorch), this
+is the tool.** Symbolic representations can explode — a dense `n × n` symbolic
+inverse by Cramer's rule runs to `n · n!` monomials — so polyarray parametrizes
+how much of a computation is kept symbolic with a `SymbolicBudget`, trading
+simplification power against size.
+
+- **Use case:** <https://wraith1995.github.io/polyarray/use_case.html>
 - **Docs:** <https://wraith1995.github.io/polyarray/>
 - **Public API:** <https://wraith1995.github.io/polyarray/public_api.html>
 - **Docstring style:** <https://wraith1995.github.io/polyarray/docstring_style.html>
