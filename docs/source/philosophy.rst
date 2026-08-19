@@ -1,12 +1,21 @@
-Philosophy
+Use Case 
 ==========
 
-Polyarray is an IR toolkit for programs that sit between tensor programming, in
-the machine-learning sense, and tensor programming, in the computer algebra sense. We want a representation that
-is expressive, that executes efficiently, that reuses existing tensor-programming
-software such as JAX or PyTorch, and that can nonetheless be analyzed and
-simplified symbolically in the way one would in a system like SymPy. No single
-existing tool occupies this middle ground, so polyarray provides the following.
+Polyarray is a compiler IR that represents Numpy/JAX/PyTorch style array programs with 
+both a traditional array language IR and an expression language of rational functions.
+By representing parts of programs with rational functions, we can symbolically simplify
+programs using computer algebra techniques. By maintaining a traditional array langauge IR,
+we can represent complex computations elegantly and utilize high performance array language targets
+such as Jax or PyTorch. If you want to symbolically simplify part of a program using a computer algebra
+system and then lower the whole thing to an array language, this is your tool. 
+
+Since CAS computations and representations can be quite expensive, Polyarray provides tools to balance
+the utility against the expense. In particular, Polyarray paramertizes symbolic computations with a budget
+that limits how much array operations are converted to rational functions. To symbolically simplify a program,
+especially one with complex meaningful numerical constants, we might partially evaluate part of the program to produce
+a rational function form. For small programs, we can use this to detect structal sparsity or reduce computation, 
+but we risk expoding the size of the program.  
+
 
 * An array IR that follows NumPy. It supplies the usual elementwise and
   linear-algebra operations (``matmul``, ``matvec``, ``einsum``, ``transpose``,
