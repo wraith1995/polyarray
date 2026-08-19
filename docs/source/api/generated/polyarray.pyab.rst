@@ -17,6 +17,7 @@
    
       as_function_def
       call_lowered
+      collapse_general_vmap
       collapse_vmap
       compile_numpy
       compile_torch

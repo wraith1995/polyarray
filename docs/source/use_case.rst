@@ -36,9 +36,10 @@ symbolically, and lower the whole program to a NumPy function:
        return inv
    <BLANKLINE>
 
-Every cell ``symbolic_inverse`` returns is an exact rational function -- here the
-zero above the diagonal is kept, not filled in -- and that rational form is also
-what grows without bound on a larger matrix.
+Every cell ``symbolic_inverse`` returns is an exact rational function. Consequently, since the program
+used a triangular mask, the output of the program preserves this structure. Though the above is quite simple,
+we note that inverting a dense ``n x n`` matrix of distinct symbols by Cramer's rule would produce ``n * n!``
+monomials, which quickly becomes infeasible to represent.
 
 Since CAS computations and representations can be quite expensive, Polyarray provides tools to balance
 the utility against the expense. In particular, Polyarray parametrizes symbolic computation with a budget
@@ -46,16 +47,6 @@ that limits how many array operations are converted to rational functions. To sy
 especially one with complex meaningful numerical constants, we might partially evaluate part of the program to produce
 a rational function form. For small programs, we can use this to detect structural sparsity or reduce computation,
 but we risk exploding the size of the program.
-
-How big is that in the dumb case? Invert a dense ``n x n`` matrix of distinct
-symbols by Cramer's rule. The determinant is a sum over all ``n!`` permutations
--- ``n!`` monomials, each a product of ``n`` symbols -- and every one of the
-``n^2`` inverse entries is an ``(n-1) x (n-1)`` cofactor of ``(n-1)!`` terms over
-that shared determinant, so the inverse runs to on the order of ``n * n!``
-monomials in all. The determinant alone is ``2`` terms at ``n = 2``, ``120`` at
-``n = 5``, and about ``3.6`` million at ``n = 10`` -- already far past the size
-of the ``10 x 10`` array it inverts. This factorial growth is what the budget is
-there to avoid.
 
 We offer the following features:
 
