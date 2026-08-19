@@ -19,7 +19,7 @@ symbolically, and lower the whole program to a NumPy function:
    >>> prog = Program("inv", inputs=[SymInput("A", (2, 2), Provenance("vertex", "A", (), "A"))])
    >>> lower = np.tril(np.ones((2, 2)))                 # keep the lower triangle
    >>> A = prog.input("A").einsum("ij,ij->ij", lower)   # zero the entries above the diagonal
-   >>> inv = symbolic_inverse(A)                         # invert it symbolically
+   >>> inv = symbolic_inverse(A)                         # invert it, in rational functions
    >>> print(inv.cells[0, 0])                            # each cell is a rational function
    1/A_0_0
    >>> print(inv.cells[0, 1])                            # the structural zero is preserved
@@ -36,10 +36,9 @@ symbolically, and lower the whole program to a NumPy function:
        return inv
    <BLANKLINE>
 
-Each cell of the inverse is an exact rational function, and the zero above the
-diagonal survives rather than being filled in, so the structure is now explicit
-in the program. That same symbolic form is what can grow: a rational inverse of
-a larger matrix quickly dwarfs the program that produced it.
+Every cell ``symbolic_inverse`` returns is an exact rational function -- here the
+zero above the diagonal is kept, not filled in -- and that rational form is also
+what grows without bound on a larger matrix.
 
 Since CAS computations and representations can be quite expensive, Polyarray provides tools to balance
 the utility against the expense. In particular, Polyarray parametrizes symbolic computation with a budget
