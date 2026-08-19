@@ -1,20 +1,30 @@
-Use Case 
-==========
+Use Case
+========
 
 Polyarray is a compiler IR that represents Numpy/JAX/PyTorch style array programs with 
 both a traditional array language IR and an expression language of rational functions.
 By representing parts of programs with rational functions, we can symbolically simplify
-programs using computer algebra techniques. By maintaining a traditional array langauge IR,
-we can represent complex computations elegantly and utilize high performance array language targets
+programs using computer algebra techniques. By maintaining a traditional array language IR,
+we can represent complex computations elegantly and utilize high-performance array language targets
 such as Jax or PyTorch. If you want to symbolically simplify part of a program using a computer algebra
-system and then lower the whole thing to an array language, this is your tool. 
+system and then lower the whole thing to an array language, this is your tool.
+
+For instance, suppose you assemble a small matrix from a handful of symbolic
+parameters and invert it. Numerically this is just arithmetic; carried
+symbolically, each entry of the inverse becomes a rational function of those
+parameters, and that form makes structure visible -- which entries vanish for
+*every* value of the parameters, or that a block decouples -- structure a later
+numeric pass can exploit. But the symbolic form is also what grows: the
+determinant alone is a sum over permutations, and the exact inverse of even a
+modest matrix can dwarf the program that produced it. The representation that
+exposes the structure is the very one that threatens to explode.
 
 Since CAS computations and representations can be quite expensive, Polyarray provides tools to balance
-the utility against the expense. In particular, Polyarray paramertizes symbolic computations with a budget
-that limits how much array operations are converted to rational functions. To symbolically simplify a program,
+the utility against the expense. In particular, Polyarray parametrizes symbolic computation with a budget
+that limits how many array operations are converted to rational functions. To symbolically simplify a program,
 especially one with complex meaningful numerical constants, we might partially evaluate part of the program to produce
-a rational function form. For small programs, we can use this to detect structal sparsity or reduce computation, 
-but we risk expoding the size of the program.  
+a rational function form. For small programs, we can use this to detect structural sparsity or reduce computation,
+but we risk exploding the size of the program.
 
 We offer the following features:
 
