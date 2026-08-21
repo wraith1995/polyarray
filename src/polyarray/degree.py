@@ -72,7 +72,7 @@ DEFAULT_DEGREE_KINDS: dict[type, str] = {
     _ir.BlockRepeatOp: DEG_PASS, _ir.ColStackOp: DEG_PASS, _ir.ConcatOp: DEG_PASS,
     _ir.DynBlockRepeatOp: DEG_PASS, _ir.FirstColsOp: DEG_PASS, _ir.HStackOp: DEG_PASS,
     _ir.IdentityOp: DEG_PASS, _ir.LastColsOp: DEG_PASS, _ir.MoveaxisOp: DEG_PASS,
-    _ir.ReshapeOp: DEG_PASS, _ir.ScaleOp: DEG_PASS, _ir.SwitchOp: DEG_PASS,
+    _ir.ReshapeOp: DEG_PASS, _ir.DynReshapeOp: DEG_PASS, _ir.ScaleOp: DEG_PASS, _ir.SwitchOp: DEG_PASS,
     _ir.TransposeOp: DEG_PASS,
     # multilinear — products / contractions (degree = SUM of operands)
     _ir.ComposeViaStdOp: DEG_MULT, _ir.EinsumOp: DEG_MULT, _ir.EinsumStmtOp: DEG_MULT,
