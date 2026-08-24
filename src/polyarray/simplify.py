@@ -31,6 +31,7 @@ still-symbolic operands.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -40,6 +41,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .ir import (
+    AssertOp,
     BulkOut,
     CallOp,
     Cell,
@@ -47,6 +49,7 @@ from .ir import (
     DimSource,
     DimAtom,
     InputRef,
+    IdentityOp,
     IntAtomRef,
     OutputRef,
     Program,
@@ -832,6 +835,46 @@ def fold_numeric(program: Program) -> Program:
 def bind_inputs(program: Program, bind: Mapping[str, npt.ArrayLike]) -> Program:
     """Replace inputs with concrete numeric arrays, then fold and drop them."""
     return specialize(program, bind=bind)
+
+
+def strip_asserts(program: Program) -> Program:
+    """Return ``program`` with every :class:`~polyarray.ir.AssertOp` replaced by a passthrough.
+
+    An ``AssertOp`` validates a predicate over its operands and returns its first input
+    unchanged, so downstream statements data-depend on it and its presence pins statement
+    order. Deleting it outright would break that chain; instead each is swapped for an
+    :class:`~polyarray.ir.IdentityOp` over its data operand, which preserves both the value and
+    the statement graph while dropping the run-time check. Nested bodies reachable positionally
+    — a raw sub-:class:`~polyarray.ir.Program` or a :class:`~polyarray.ir.CallOp` wrapping one —
+    are recursed into; ``vmap`` closures, ``WhileOp`` and opaque callables are left untouched.
+
+    The rewrite is value-preserving exactly when the asserts would have passed, which they must
+    on any input the original program accepts. It is meant for generated code you have already
+    validated — hot paths, benchmarks, deployment — where the checks are pure overhead. A
+    program with no asserts is returned unchanged (the same object).
+    """
+    changed = False
+    new_stmts: list[Stmt] = []
+    for s in program.statements:
+        fn = s.fn
+        if isinstance(fn, AssertOp):
+            new_stmts.append(dataclasses.replace(s, fn=IdentityOp(), in_=(s.in_[0],)))
+            changed = True
+            continue
+        info = _descent_body(fn)
+        if info is not None:
+            body, rewrap = info
+            stripped = strip_asserts(body)
+            if stripped is not body:
+                new_stmts.append(dataclasses.replace(s, fn=rewrap(stripped)))
+                changed = True
+                continue
+        new_stmts.append(s)
+    if not changed:
+        return program
+    out = program.copy()
+    out.statements = type(program.statements)(new_stmts)
+    return out
 
 
 def _read_stmt_outs(stmt: Stmt, bindings: Mapping[str, Any]) -> list[np.ndarray] | None:

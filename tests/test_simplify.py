@@ -13,8 +13,9 @@ from polyarray import (
     TensordotOp,
     bind_inputs,
     fold_numeric,
+    strip_asserts,
 )
-from polyarray.ir import OutputRef, Stmt
+from polyarray.ir import AssertOp, IdentityOp, OutputRef, Stmt
 
 
 def _prov(name: str):
@@ -24,6 +25,41 @@ def _prov(name: str):
 # ---------------------------------------------------------------------------
 # fold_numeric on a fully-symbolic program is an exact no-op (degrades to copy)
 # ---------------------------------------------------------------------------
+
+def test_strip_asserts_replaces_asserts_preserving_value() -> None:
+    prog = Program("a", inputs=[SymInput("A", (3, 3), _prov("A"))])
+    [Ac] = prog.emit_stmt(
+        AssertOp(kind="shape_eq", msg="A vs A"),
+        [prog.input("A"), prog.input("A")],
+        [OutSpec("Ac", (3, 3))],
+        bulk=False,
+    )
+    prog.add_output("Ac", Ac.cells)
+    assert any(isinstance(s.fn, AssertOp) for s in prog.statements)
+
+    stripped = strip_asserts(prog)
+    assert not any(isinstance(s.fn, AssertOp) for s in stripped.statements)
+    assert any(isinstance(s.fn, IdentityOp) for s in stripped.statements)
+
+    rng = np.random.default_rng(0)
+    vals = {"A": rng.standard_normal((3, 3))}
+    np.testing.assert_allclose(stripped.run(vals)["Ac"], prog.run(vals)["Ac"])
+
+
+def test_strip_asserts_noop_returns_same_object() -> None:
+    prog = Program(
+        "td",
+        inputs=[SymInput("A", (2, 3), _prov("A")), SymInput("B", (3, 4), _prov("B"))],
+    )
+    [C] = prog.emit_stmt(
+        TensordotOp.from_axes(([1], [0])),
+        [prog.input("A"), prog.input("B")],
+        [OutSpec("C", (2, 4))],
+        bulk=False,
+    )
+    prog.add_output("C", C.cells)
+    assert strip_asserts(prog) is prog
+
 
 def test_fold_numeric_symbolic_is_noop() -> None:
     prog = Program(

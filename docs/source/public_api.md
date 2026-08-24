@@ -367,6 +367,10 @@ def partial_eval(program: Program, *, max_cell_size: int) -> Program
 def specialize(program, *, bind=None, subs=None, budget=None) -> Program
 def fold_numeric(program) -> Program        # = specialize (empty bind)
 def bind_inputs(program, bind) -> Program   # = specialize(bind=...)
+def strip_asserts(program) -> Program       # replace every AssertOp with an IdentityOp
+    # passthrough (returns first operand), recursing into sub-Program / CallOp bodies.
+    # Value-preserving whenever the asserts would have passed; drops their run-time cost
+    # from already-validated / hot-path code. No-op (same object) if there are none.
     # Exactness-preserving partial evaluation (simplify.py): folds every Stmt whose
     # inputs all resolve numeric, dropping it; folds `known` into surviving refs /
     # outputs; descends partially-numeric sub-Program / CallOp bodies.

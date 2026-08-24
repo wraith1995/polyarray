@@ -105,7 +105,7 @@ from .int_atom import IntAtom
 
 # --- IR passes --------------------------------------------------------------
 from .forward import analyze, partial_eval
-from .simplify import specialize, fold_numeric, bind_inputs, partial_eval_numeric, partial_eval_numeric_symarray, substitute, evaluate_cone, dependency_cone, is_structurally_constant, NonExactFoldWarning, NonDeterministicFoldWarning, symarray_atoms
+from .simplify import specialize, fold_numeric, bind_inputs, strip_asserts, partial_eval_numeric, partial_eval_numeric_symarray, substitute, evaluate_cone, dependency_cone, is_structurally_constant, NonExactFoldWarning, NonDeterministicFoldWarning, symarray_atoms
 from .budget import SimplifyBudget
 from .sparsity import propagate_sparsity, block_zero_mask, SparsityReport
 from .degree import program_degree
@@ -202,6 +202,8 @@ __all__ = [
     # simplify workstream
     "specialize",
     "fold_numeric",
+    "bind_inputs",
+    "strip_asserts",
     "partial_eval_numeric",
     "partial_eval_numeric_symarray",
     "evaluate_cone",
@@ -210,7 +212,6 @@ __all__ = [
     "symarray_atoms",
     "NonExactFoldWarning",
     "NonDeterministicFoldWarning",
-    "bind_inputs",
     "substitute",
     "SimplifyBudget",
     "propagate_sparsity",
