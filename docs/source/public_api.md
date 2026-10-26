@@ -443,6 +443,24 @@ def evaluate_cone(program: Program, target: SymArray, values: Mapping) -> np.nda
     # Equals target.evaluate(values) whenever the full run would succeed.
     # (Program.build_runtime_bindings gained `only=<stmt indices>` for this lane.)
 
+def fuse_to_rational(program: Program, *, work_budget: int | None = None,
+                     max_sym_mass: int = exact_fold._MAX_SYM_MASS,
+                     wall_backstop: float | None = None) -> Program
+    # Fuse a FINITE program to statement-free rational-function outputs: symbolically
+    # execute every Stmt over exact RationalFunction cells (the exact_fold engine) and
+    # rebuild the program with each output a single closed-form RF over the inputs and
+    # NO statements — the whole computation collapsed to one rational function per cell.
+    # Exact (outputs equal the original's for every input), and, having no deferred
+    # contraction chain or constant-operator matrix, it lowers to only the operator's
+    # real arithmetic (grassmann ⋆(a∧b) over ℝ³ collapses to the cross product a×b).
+    # Only finite ops fold (the exterior / linear-algebra vocabulary over static, non-bulk
+    # operands); the first Stmt the exact lane cannot execute — QrOp/SvdOp/SqrtOp
+    # (algebraic-irrational), SwitchOp/WhileOp (control flow), a vmap closure, a dynamic
+    # shape, or a bulk/dynamic input — raises FusionError naming it, so a caller can fall
+    # back to ordinary lowering. work_budget/max_sym_mass/wall_backstop bound the exact
+    # work as in exact_partial_eval; a budget break also raises FusionError.
+class FusionError(Exception)   # raised by fuse_to_rational; names the first unfoldable Stmt
+
 def is_structurally_constant(program: Program, target: SymArray) -> bool
     # SOUND, sampling-free test that `target`'s value is a build-time constant:
     # True iff its dependency_cone is a CLOSED CONSTANT subprogram — no Stmt input is

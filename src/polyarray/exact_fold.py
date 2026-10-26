@@ -108,6 +108,7 @@ from .ir import (
     ProdShapeOp,
     Program,
     ProjectOp,
+    SymArray,
     QrOp,
     RankOp,
     RationalRef,
@@ -1838,3 +1839,92 @@ def exact_fold_cells(
     state.spent += meter.spent
     state.hit_wall_clock = state.hit_wall_clock or meter.hit_wall_clock
     return out if changed else cells
+
+
+class FusionError(Exception):
+    """A statement could not be executed symbolically, so the program does not fully fuse.
+
+    Raised by :func:`fuse_to_rational` naming the first offending statement — a
+    :class:`~polyarray.QrOp` / :class:`~polyarray.SvdOp` / :class:`~polyarray.SqrtOp`, control
+    flow, a ``vmap`` closure, a dynamic shape, or a bulk / dynamic input — so a caller can fall
+    back to ordinary lowering.
+    """
+
+
+def _fused_output(sa: SymArray, env: _Env, program: Program) -> np.ndarray:
+    """Resolve one program output to its fused value array (RF over the inputs, or numeric)."""
+    bulk = getattr(sa, "_bulk", None)
+    if bulk is not None:
+        v = env.bulk.get(bulk.name)
+        if v is None:
+            raise FusionError(f"bulk output {bulk.name!r} did not resolve to a closed form")
+        return np.asarray(v)
+    r = _resolve_cells(np.asarray(sa.cells), env, program)
+    if r is _OPAQUE:
+        raise FusionError("an output cell depends on an unresolved statement")
+    return np.asarray(r)
+
+
+def fuse_to_rational(
+    program: Program, *, work_budget: int | None = None, max_sym_mass: int = _MAX_SYM_MASS,
+    wall_backstop: float | None = None,
+) -> Program:
+    """Fuse a finite program to statement-free rational-function outputs.
+
+    Symbolically executes every statement over exact :class:`~polyarray.rational.RationalFunction`
+    cells — the :func:`exact_partial_eval` engine — then rebuilds the program with each output a
+    single closed-form rational function over the program inputs and **no statements**: the whole
+    computation collapsed to one rational function per output cell.  The rebuilt program is exact —
+    its outputs equal the original's for every input — and, having no deferred contraction chain
+    or constant-operator matrix, lowers to only the operator's real arithmetic (a grassmann
+    ``⋆(a∧b)`` over ℝ³ collapses to the cross product ``a×b``).
+
+    Only *finite* ops fold: the exterior / linear-algebra vocabulary over statically-shaped, non-bulk
+    operands.  The first statement the exact lane cannot execute — a ``QrOp`` / ``SvdOp`` / ``SqrtOp``
+    (algebraic-irrational), control flow (``SwitchOp`` / ``WhileOp``), a ``vmap`` closure, a dynamic
+    shape, or a bulk / dynamic input — raises :class:`FusionError` naming it, so a caller can fall
+    back to ordinary lowering.  ``work_budget`` / ``max_sym_mass`` / ``wall_backstop`` bound the
+    exact work exactly as in :func:`exact_partial_eval`; a budget break also raises
+    :class:`FusionError`.
+
+    Parameters
+    ----------
+    program
+        The program to fuse; it is not mutated.
+
+    Returns
+    -------
+    Program
+        A copy with the same inputs, no statements, and each output a fused rational function.
+    """
+    meter = _Meter(limit=_resolve_work_budget(work_budget),
+                   wall_deadline=_wall_deadline(wall_backstop))
+    env = _Env()
+    reason = _Reason()
+    for i, stmt in enumerate(program.statements):
+        reason.value = None
+        try:
+            ok = _exec_stmt(program, i, stmt, env, meter, 0, reason, max_sym_mass)
+        except _Exhausted as exc:
+            raise FusionError(
+                f"exact work budget exhausted at statement {i}: {_exhausted_note(exc, meter)}"
+            ) from exc
+        if not ok:
+            fn = type(stmt.fn).__name__ if stmt.fn is not None else "fn-less"
+            raise FusionError(f"statement {i} ({fn}) is not finitely foldable: {reason.take(fn)}")
+    # A non-bulk output cell references its producing statement's output atoms; make those atoms
+    # resolvable by mapping each single-atom statement-out cell to its computed value (bulk outputs
+    # are read straight from ``env.bulk`` instead).
+    for (i, k), val in list(env.outs.items()):
+        arr = np.asarray(val)
+        cells = np.asarray(program.statements[i].out[k].cells)
+        if cells.shape != arr.shape:
+            continue
+        for idx in (np.ndindex(*cells.shape) if cells.shape else [()]):
+            cell = cells[idx] if cells.shape else cells[()]
+            if isinstance(cell, RationalFunction) and len(cell.gens) == 1:
+                env.atom.setdefault(cell.gens[0], arr[idx] if arr.shape else arr[()])
+    fused = Program(f"{program.name}_fused", inputs=program.inputs)
+    for name, sa in program.outputs.items():
+        fused.add_output(name, SymArray(_fused_output(sa, env, program), program=fused))
+    return fused
