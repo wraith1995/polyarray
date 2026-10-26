@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,14 +35,19 @@ from .ir import Program
 from .rational import RationalFunction
 
 
+_Polynomials = list[list[tuple[float, tuple[int, ...]]]]
+_TermBags = list[list[list[float | list[int]]]]
+
+
 class CseError(Exception):
     """The program is not a finite polynomial (e.g. a non-constant denominator) — cannot CSE."""
 
 
 @dataclass
 class CseModule:
-    """A compiled CSE kernel: ``module.f`` is the batched callable (accepts ``(n_cells, dim)`` per
-    input), ``source`` the emitted straight-line code, ``flops`` its ``(mul, add/sub)`` count.
+    """A compiled CSE kernel.
+
+    ``module.f`` is the batched callable (accepts ``(n_cells, dim)`` per input), ``source`` the emitted straight-line code, ``flops`` its ``(mul, add/sub)`` count.
 
     Note: the CSE pass minimises the operation count and matches the hand-written kernel's FLOPs,
     but on a memory/dispatch-bound target that does not translate to speed — a structured
@@ -56,7 +62,7 @@ class CseModule:
     flops: tuple[int, int]
 
 
-def _output_polys(program: Program, tol: float):
+def _output_polys(program: Program, tol: float) -> tuple[_Polynomials, list[str]]:
     """Per output cell: ``[(coeff_float, sorted atom-index tuple)]`` over a shared atom list.
 
     Raises :class:`CseError` on a non-constant denominator or a non-``RationalFunction`` cell.
@@ -92,7 +98,7 @@ def _output_polys(program: Program, tol: float):
     return polys, atoms
 
 
-def _greedy_share(polys):
+def _greedy_share(polys: _Polynomials) -> tuple[list[tuple[int, int, int]], _TermBags]:
     """Greedy pairwise product sharing.  Returns ``(temps, termbags)``.
 
     ``temps`` are ``(id, leaf1, leaf2)`` in emit order; each output's ``termbags`` entry is a list
@@ -130,7 +136,7 @@ def _greedy_share(polys):
     return temps, termbags
 
 
-def _atom_resolver(program: Program):
+def _atom_resolver(program: Program) -> Callable[[str], str]:
     """Map a generator name → a torch subscript on its input.
 
     Each generator is named ``<input>_<i0>[_<i1>…]`` — one integer index per input axis — so a
@@ -154,7 +160,7 @@ def _atom_resolver(program: Program):
     return resolve
 
 
-def _emit_source(program: Program, atoms, polys) -> str:
+def _emit_source(program: Program, atoms: list[str], polys: _Polynomials) -> str:
     argnames = [i.name for i in program.inputs]
     resolve = _atom_resolver(program)
     temps, termbags = _greedy_share(polys)
@@ -165,9 +171,11 @@ def _emit_source(program: Program, atoms, polys) -> str:
         leaf[tid] = f"t{tid}"
 
     def sign_only(c: float, base: str, first: bool) -> str:
-        """Emit ``base`` with only its sign — magnitude carried elsewhere (a shared factor, or a
-        snapped ±1). This is also what discards the ~1e-10 √-normalisation residue on unit
-        coefficients, so it must never print the magnitude."""
+        """Emit ``base`` with only its sign.
+
+        The magnitude is carried by a shared factor or snapped to one. This discards
+        the ~1e-10 normalization residue on unit coefficients.
+        """
         if first:
             return f"-{base}" if c < 0 else base
         return f"{'-' if c < 0 else '+'} {base}"
@@ -206,7 +214,7 @@ def _count_flops(src: str) -> tuple[int, int]:
     return mul, add
 
 
-def _component_of(program: Program):
+def _component_of(program: Program) -> Callable[[str], tuple[str, int] | None]:
     """Map a generator name → ``(input name, component)`` for a vector input, else ``None``."""
     shapes = sorted(((i.name, tuple(i.shape)) for i in program.inputs),
                     key=lambda t: len(t[0]), reverse=True)
@@ -221,7 +229,7 @@ def _component_of(program: Program):
     return component
 
 
-def _emit_slots(program: Program, atoms, polys) -> tuple[str, tuple[int, int]] | None:
+def _emit_slots(program: Program, atoms: list[str], polys: _Polynomials) -> tuple[str, tuple[int, int]] | None:
     """Emit every output component at once over index arrays, or ``None`` when the shape forbids it.
 
     Applies when the outputs share one *term structure*: each output has the same number of

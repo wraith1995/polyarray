@@ -17,6 +17,7 @@ the greedy product sharing of :mod:`polyarray.cse` applied to each block.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import assert_never
 
@@ -41,7 +42,7 @@ def _depends_on_inputs(v: object) -> bool:
 
 
 def _stored_array(ref: Ref, env: ef._Env) -> np.ndarray | None:
-    """The env array a statement operand reads, when it is a statement result; else ``None``."""
+    """Return the stored array for a statement result, or ``None``."""
     match ref:
         case OutputRef():
             return env.outs.get((ref.stmt_idx, ref.out_idx))
@@ -124,7 +125,7 @@ def fuse_staged(program: Program) -> tuple[list[tuple[str, RationalFunction]], l
     return stages.defs, [c for o in outs for c in o]
 
 
-def _polys(cells: list[object], tol: float):
+def _polys(cells: list[object], tol: float) -> tuple[cse._Polynomials, list[str]]:
     atoms: list[str] = []
     seen: dict[str, int] = {}
 
@@ -147,7 +148,8 @@ def _polys(cells: list[object], tol: float):
     return polys, atoms
 
 
-def _emit_block(polys, atoms, leaf_src, lhs: list[str], prefix: str) -> list[str]:
+def _emit_block(polys: cse._Polynomials, atoms: list[str], leaf_src: Callable[[str], str],
+                lhs: list[str], prefix: str) -> list[str]:
     temps, bags = cse._greedy_share(polys)
     leaf = {i: leaf_src(atoms[i]) for i in range(len(atoms))}
     lines = []
