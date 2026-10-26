@@ -106,6 +106,8 @@ from .int_atom import IntAtom
 # --- IR passes --------------------------------------------------------------
 from .forward import analyze, partial_eval
 from .simplify import specialize, fold_numeric, bind_inputs, strip_asserts, partial_eval_numeric, partial_eval_numeric_symarray, substitute, evaluate_cone, dependency_cone, is_structurally_constant, NonExactFoldWarning, NonDeterministicFoldWarning, symarray_atoms
+from .exact_fold import fuse_to_rational, FusionError
+from . import cse
 from .budget import SimplifyBudget
 from .sparsity import propagate_sparsity, block_zero_mask, SparsityReport
 from .degree import program_degree
@@ -201,6 +203,8 @@ __all__ = [
     "vmap",
     # simplify workstream
     "specialize",
+    "fuse_to_rational",
+    "FusionError",
     "fold_numeric",
     "bind_inputs",
     "strip_asserts",
